@@ -1,4 +1,9 @@
-# 📁 handlers/error_handler.py - گرفتن خطاهای دقیق هنگام اجرای بات
+"""
+handlers/error_handler.py — Global errors / خطاهای سراسری
+
+EN: Logs traceback; optional user-facing error message.
+FA: ثبت خطا هنگام exception در هندلرها.
+"""
 
 from telegram import Update
 from telegram.ext import ContextTypes

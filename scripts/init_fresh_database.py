@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-دیتابیس خالی برای راه‌اندازی تازه (ثبت‌نام از اول).
-قبل از اجرا: ربات را متوقف کنید. فایل قبلی به‌صورت خودکار rename می‌شود.
+init_fresh_database.py — Reset SQLite / دیتابیس تازه
+
+EN: Backs up existing DB, runs ensure_schema(), sets ADVERT_ID_START sequence.
+FA: پشتیبان از eurobot.db قدیمی؛ دیتابیس خالی؛ شماره آگهی از ADVERT_ID_START.
 
   python scripts/init_fresh_database.py
-  python scripts/init_fresh_database.py --db /root/telegram_bot_project2/eurobot.db
+  python scripts/init_fresh_database.py --db /path/to/eurobot.db
 """
 
 from __future__ import annotations

@@ -1,4 +1,13 @@
-# پیشنهاد به آگهی: ورود از دکمهٔ کانال (offer_<rowid>)
+"""
+handlers/offers.py — Offers on ads / پیشنهاد به آگهی
+
+EN:
+  Gate (agree/custom), rate, country, description, preview, confirm;
+  owner accept/reject; channel post refresh; negotiation messages.
+
+FA:
+  گیت پیشنهاد، نرخ/کشور/توضیحات، تأیید؛ اقدام صاحب آگهی؛ به‌روزرسانی پست کانال.
+"""
 
 from __future__ import annotations
 

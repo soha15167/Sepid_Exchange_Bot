@@ -69,6 +69,13 @@ python scripts/init_fresh_database.py
 python main.py
 ```
 
+## مستندات کد / Code documentation
+
+راهنمای دو‌زبانه (فارسی + English) برای هر بخش:
+
+- **[docs/CODE_OVERVIEW.md](docs/CODE_OVERVIEW.md)** — معماری، نقشهٔ فایل‌ها، فلوها
+- Docstrings at the top of each `.py` module — توضیح کوتاه در ابتدای هر فایل
+
 ## ساختار پروژه
 
 ```

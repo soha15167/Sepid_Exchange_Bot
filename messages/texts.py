@@ -1,7 +1,11 @@
-# 📁 فایل messages/texts.py
-# این فایل تمام متن‌های ثابت ربات را ذخیره می‌کند تا در فایل‌های دیگر استفاده شوند
+"""
+messages/texts.py — Static copy / متن‌های ثابت
 
-# 🔸 پیام‌های ثبت‌نام
+EN: User-facing strings (welcome, terms, errors) — edit here for wording changes.
+FA: پیام‌های ثبت‌نام، قوانین و خطاها؛ برای تغییر متن از این فایل استفاده کنید.
+"""
+
+# --- Registration / ثبت‌نام ---
 WELCOME_MESSAGE = (
     "سلام 👋\n"
     "به ربات تبادل یورو خوش آمدید.\n"
@@ -33,16 +37,16 @@ STEPS_TEXT = (
     "3. شماره تماس و تایید آن"
 )
 
-# 🔸 پیام‌های عمومی
+# --- General / عمومی ---
 ERROR_MESSAGE = "❌ خطایی رخ داد. لطفاً دوباره تلاش کنید."
 CANCEL_MESSAGE = "⛔️ عملیات لغو شد."
 SUCCESS_MESSAGE = "✅ عملیات با موفقیت انجام شد."
 
-# 🔸 پیام‌های ادمین
+# --- Admin / ادمین ---
 ADMIN_WELCOME = "🔐 به پنل مدیریت خوش آمدید."
 NO_USERS_FOUND = "ℹ️ هیچ کاربری یافت نشد."
 
-# 🔸 پیام‌های آگهی و پیشنهاد
+# --- Adverts & offers / آگهی و پیشنهاد ---
 ADVERT_POSTED = "📢 آگهی با موفقیت ثبت شد."
 OFFER_SENT = "📬 پیشنهاد شما ارسال شد."
 OFFER_REJECTED = "❌ پیشنهاد شما رد شد."

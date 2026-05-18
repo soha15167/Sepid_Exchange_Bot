@@ -1,3 +1,10 @@
+"""
+handlers/exchange_flow.py — Euro-to-Euro exchange / معاوضه یورو به یورو
+
+EN: Delivery method, amount, countries/cities, description → channel (rate 0).
+FA: روش تحویل، مقدار، شهرها، توضیحات → آگهی معاوضه در کانال.
+"""
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode

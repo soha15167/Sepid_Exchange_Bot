@@ -1,4 +1,9 @@
-# مدیریت آگهی توسط صاحب آگهی — فهرست همهٔ آگهی‌ها؛ ویرایش/حذف فقط بدون پیشنهاد فعال
+"""
+handlers/user_adverts.py — My adverts / آگهی‌های من
+
+EN: List owner's ads; edit/delete when no active pending offers.
+FA: لیست آگهی‌های کاربر؛ ویرایش/حذف فقط بدون پیشنهاد فعال.
+"""
 
 from __future__ import annotations
 

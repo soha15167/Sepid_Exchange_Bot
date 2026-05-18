@@ -1,4 +1,9 @@
-# 📁 فایل handlers/services.py - هماهنگ با فلوهای جدید و انتخاب هوشمند روش پرداخت
+"""
+handlers/services.py — Main menu services / منوی خدمات
+
+EN: Entry to buy/sell euro, VPN placeholder, cancel; requires channel rules ack.
+FA: ثبت درخواست خدمات، خرید/فروش یورو؛ نیاز به مطالعهٔ قوانین کانال.
+"""
 
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from telegram.ext import ContextTypes

@@ -1,4 +1,9 @@
-"""قالب‌بندی مشترک متن آگهی کانال."""
+"""
+utils/channel_format.py — Channel post formatting / قالب متن کانال
+
+EN: RTL payment methods (2-col or pipe-separated); country label by ad type.
+FA: چیدمان روش‌های پرداخت؛ برچسب کشور برای خرید/فروش یا معاوضه.
+"""
 
 from __future__ import annotations
 

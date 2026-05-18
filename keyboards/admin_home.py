@@ -1,4 +1,9 @@
-# منوی اینلاین پنل ادمین — جدا از menus.py تا با هر دیپلوی دیده شود.
+"""
+keyboards/admin_home.py — Admin inline menu / منوی اینلاین ادمین
+
+EN: Admin dashboard button layout (separate file for clear deploy).
+FA: چیدمان دکمه‌های پنل مدیریت.
+"""
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 

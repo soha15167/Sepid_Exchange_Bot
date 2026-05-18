@@ -1,11 +1,23 @@
+"""
+models/enums.py — Conversation states / حالت‌های مکالمه
+
+EN:
+  `UserState` names are stored in `context.user_data["state"]` as strings
+  (e.g. UserState.OFFER_RATE.name). main.py routes messages by these values.
+
+FA:
+  هر مقدار enum نام مرحلهٔ فعلی کاربر است؛ main.py بر اساس آن هندلر را انتخاب می‌کند.
+"""
+
 from enum import Enum, auto
+
 
 class UserState(Enum):
     START = auto()
     MAIN_MENU = auto()
     SERVICE_SELECTION = auto()
 
-    # ثبت‌نام
+    # Registration / ثبت‌نام
     START_REGISTRATION = auto()
     TERMS = auto()
     STEPS_INFO = auto()
@@ -16,7 +28,7 @@ class UserState(Enum):
     PHONE = auto()
     VERIFYING_PHONE = auto()
 
-    # آگهی یورو (خرید/فروش)
+    # Euro buy/sell advert / آگهی خرید و فروش یورو
     EURO_BUY_SELL = auto()
     EURO_SERVICE_OPTIONS = auto()
     EURO_AMOUNT = auto()
@@ -29,7 +41,7 @@ class UserState(Enum):
     EURO_IRAN_CITY = auto()
     EURO_DEPOSIT_OPTION = auto()
 
-    # 💱 فلو معاوضه Euro به Euro
+    # Euro-to-Euro exchange / معاوضه Euro به Euro
     EXCHANGE_INIT = auto()
     EXCHANGE_INSTANT_TRANSFER = auto()
     EXCHANGE_AMOUNT = auto()
@@ -40,7 +52,7 @@ class UserState(Enum):
     EXCHANGE_CONFIRM = auto()
     EXCHANGE_CHOICE = auto()
 
-    # پیشنهاد
+    # Offer on channel ad / پیشنهاد روی آگهی
     OFFER_ADVERT_ID = auto()
     OFFER_COUNTER_EURO = auto()
     OFFER_RATE = auto()
@@ -51,11 +63,11 @@ class UserState(Enum):
     NEGOTIATION = auto()
     NEGOTIATION_GATE = auto()
 
-    # پنل کاربر
+    # End-user panel / پنل کاربر عادی
     USER_SETTINGS_VIEW = auto()
     USER_EDIT_OWN_ADVERT = auto()
 
-    # ادمین
+    # Admin panel / پنل ادمین
     ADMIN_MENU = auto()
     ADMIN_DELETE_USER_ID = auto()
     ADMIN_DELETE_CONFIRM = auto()
@@ -67,7 +79,7 @@ class UserState(Enum):
     ADMIN_ADD_USER_FIELD = auto()
     ADMIN_RESTRICT_USER_ID = auto()
     ADMIN_RESTRICT_DAYS = auto()
-    # نام قدیمی در برخی دیپلویها؛ همان مقدار ADMIN_RESTRICT_DAYS (برای importهای قدیمی و دیتابیس)
+    # Legacy alias / نام قدیمی — same as ADMIN_RESTRICT_DAYS
     ADMIN_RESTRICT_LEVEL = ADMIN_RESTRICT_DAYS
     ADMIN_LIST_ADVERTS = auto()
     ADMIN_EDIT_ADVERT_ID = auto()
@@ -91,7 +103,7 @@ class UserState(Enum):
     ADMIN_MANAGE_OFFER_EURO_INPUT = auto()
     ADMIN_FEE_ADVERT_ID = auto()
     ADMIN_FEE_VALUE = auto()
-    # پیشنهاد نمایشی توسط ادمین (نام نمایشی جدا؛ با یا بدون پیشنهاد قبلی روی آگهی)
+    # Admin proxy offer (demo) / پیشنهاد نمایشی ادمین
     ADMIN_PROXY_OFFER_ADVERT = auto()
     ADMIN_PROXY_OFFER_NAME = auto()
     ADMIN_PROXY_OFFER_RATE = auto()

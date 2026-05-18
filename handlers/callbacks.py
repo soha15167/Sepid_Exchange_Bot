@@ -1,4 +1,9 @@
-# 📁 callbacks.py - نسخه نهایی با جلوگیری قطعی از خطای edit_message و اجرای درست فلو معاوضه
+"""
+handlers/callbacks.py — Payment method picker / انتخاب روش پرداخت
+
+EN: Multi-select IBAN/PayPal/Wise/Revolut or Euro exchange; then euro/exchange flow.
+FA: انتخاب روش‌های پرداخت/دریافت یا معاوضه؛ سپس ادامهٔ ثبت آگهی.
+"""
 
 from telegram import Update
 from telegram.ext import ContextTypes

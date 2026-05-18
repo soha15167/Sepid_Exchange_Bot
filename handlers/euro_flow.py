@@ -1,3 +1,10 @@
+"""
+handlers/euro_flow.py — Buy/sell euro (Toman rate) / خرید و فروش یورو
+
+EN: Amount, rate, description, country, instant transfer → channel post.
+FA: مقدار، نرخ تومان، توضیحات، کشور، واریز آنی → انتشار در کانال.
+"""
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode

@@ -1,3 +1,10 @@
+"""
+utils/telegram_utils.py — Telegram UI helpers / کمک‌تابع تلگرام
+
+EN: Safe delete, main menu anchor, registration flow messages, callback normalize.
+FA: حذف پیام، جایگزینی منو، شروع ثبت‌نام، نرمال‌سازی callback_data.
+"""
+
 from __future__ import annotations
 
 from telegram import Message, ReplyKeyboardRemove

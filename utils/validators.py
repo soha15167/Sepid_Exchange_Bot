@@ -1,4 +1,10 @@
-# 📁 فایل validators.py (بررسی اعتبار ایمیل و شماره)
+"""
+utils/validators.py — Input validation / اعتبارسنجی ورودی
+
+EN: Email and international phone format checks for registration.
+FA: بررسی فرمت ایمیل و شماره موبایل در ثبت‌نام.
+"""
+
 import re
 
 def is_valid_email(email):

@@ -1,4 +1,9 @@
-# 📁 handlers/exchange_debug_handler.py - فایل کامل برای بررسی Inline Keyboard Expected
+"""
+handlers/exchange_debug_handler.py — Debug helper / ابزار دیباگ
+
+EN: Development helper for inline keyboard issues (optional).
+FA: کمک‌دیباگ برای دکمه‌های اینلاین (توسعه).
+"""
 
 from telegram import Update
 from telegram.ext import ContextTypes

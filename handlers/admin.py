@@ -1,3 +1,14 @@
+"""
+handlers/admin.py — Admin panel / پنل مدیریت
+
+EN:
+  Users CRUD, restrictions, advert list/edit/delete, offer management,
+  proxy offers, fee override, bot on/off, channel post refresh.
+
+FA:
+  مدیریت کاربران، آگهی‌ها، پیشنهادها، محدودیت، کارمزد دستی، خاموش/روشن ربات.
+"""
+
 from __future__ import annotations
 
 import asyncio

@@ -1,4 +1,9 @@
-# قوانین کانال و نمایش نرخ کارمزد (منوی اصلی)
+"""
+handlers/channel_info.py — Rules & fees / قوانین و کارمزد
+
+EN: Static HTML for channel rules and fee tiers; sets channel_rules_ack flag.
+FA: متن قوانین و جدول کارمزد؛ علامت‌گذاری مطالعهٔ قوانین توسط کاربر.
+"""
 
 from __future__ import annotations
 

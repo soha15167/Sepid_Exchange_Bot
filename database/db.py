@@ -1,9 +1,21 @@
+"""
+database/db.py — SQLite layer / لایهٔ دیتابیس
+
+EN:
+  Schema creation & light migrations (`ensure_schema`), users, euro_adverts,
+  advert_offers, negotiation lines. Channel ad number = table `rowid`.
+
+FA:
+  ساخت جدول‌ها، migration ستون‌های جدید، CRUD کاربر/آگهی/پیشنهاد.
+  «شماره آگهی» در کانال = `rowid` جدول euro_adverts.
+"""
+
 import sqlite3
 import time
 from config.settings import DB_PATH
 from contextlib import contextmanager
 
-# --- schema helpers ---
+# --- Schema helpers / کمک‌تابع‌های ساختار ---
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     cur = conn.cursor()
     rows = cur.execute(f"PRAGMA table_info({table})").fetchall()
@@ -12,8 +24,8 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
 
 def ensure_schema() -> None:
     """
-    Best-effort lightweight migration.
-    Adds columns used by newer features if they don't exist.
+    EN: Create tables if missing; ALTER TABLE for new columns; set ad ID sequence.
+    FA: ساخت جدول‌ها؛ افزودن ستون‌های جدید؛ تنظیم شمارندهٔ آگهی (ADVERT_ID_START).
     """
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
@@ -1712,9 +1724,9 @@ def save_user(user_id, full_name, last_name, email, address, phone_number, displ
         """, (user_id, full_name, last_name, email, address, phone_number, display_name, username))
         conn.commit()
 
-# ✅ تابع اتصال امن به دیتابیس با context manager
 @contextmanager
 def get_db():
+    """EN: SQLite connection with auto-commit. FA: اتصال با commit خودکار."""
     conn = sqlite3.connect(DB_PATH)
     try:
         yield conn

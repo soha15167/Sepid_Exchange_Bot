@@ -1,4 +1,10 @@
-# 📁 فایل registration.py (با بررسی یکتایی telegram_id در ثبت‌نام)
+"""
+handlers/registration.py — User signup / ثبت‌نام کاربر
+
+EN: ConversationHandler — name, display name, email, address, phone, SMS code.
+FA: فلو چندمرحله‌ای تا ذخیره در جدول users؛ نام نمایشی یکتا در آگهی.
+"""
+
 from telegram import Update, ReplyKeyboardRemove
 from telegram.ext import (
     ContextTypes,

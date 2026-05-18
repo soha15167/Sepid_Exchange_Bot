@@ -1,4 +1,9 @@
-# ✅ فایل جدید: handlers/start_flow.py
+"""
+handlers/start_flow.py — Welcome & terms / خوش‌آمد و قوانین
+
+EN: `/start`, auto registration intro + terms, accept/decline callbacks.
+FA: شروع ربات، نمایش قوانین، پذیرش/رد؛ ورود به ثبت‌نام پس از پذیرش.
+"""
 
 from telegram import Update
 from telegram.constants import ParseMode

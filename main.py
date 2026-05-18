@@ -1,3 +1,16 @@
+"""
+main.py — Application entry / نقطهٔ ورود برنامه
+
+EN:
+  Builds the python-telegram-bot Application, runs DB migrations, registers all
+  handlers (commands, callbacks, text routers). Group -1 runs access gates;
+  group 0 routes euro/offer flows by UserState.
+
+FA:
+  ساخت Application، اجرای ensure_schema، ثبت هندلرها. گروه −۱ محدودیت و
+  ثبت‌نام؛ روتر متن بر اساس state کاربر (آگهی، پیشنهاد، ادمین).
+"""
+
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     filters, ContextTypes,
@@ -119,8 +132,11 @@ def is_exchange_state(state):
     ]
 
 
-# مسیریابی مرحله‌ای براساس state
 async def euro_flow_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    EN: Routes TEXT messages by UserState (euro, exchange, offer, admin, negotiation).
+    FA: هدایت پیام متنی بر اساس state کاربر.
+    """
     u = update.effective_user
     if u and u.id in set(ADMIN_IDS or []):
         try:
@@ -309,8 +325,8 @@ async def show_main_menu_command(update: Update, context: ContextTypes.DEFAULT_T
         pass
 
 
-# اجرای اصلی
 def main():
+    """EN: Build app, register handlers, run polling. FA: راه‌اندازی و polling."""
     try:
         # Ensure Unicode logs/messages work on Windows consoles.
         sys.stdout.reconfigure(encoding="utf-8")
@@ -324,13 +340,13 @@ def main():
         pass
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # کاربران محدودشده (قبل از بقیهٔ هندلرها)
+    # Group -1: access gates / گیت محدودیت و ثبت‌نام
     application.add_handler(MessageHandler(filters.ALL, restricted_user_gate), group=-1)
     application.add_handler(CallbackQueryHandler(restricted_user_gate), group=-1)
     application.add_handler(MessageHandler(filters.ALL, unregistered_user_gate), group=-1)
     application.add_handler(CallbackQueryHandler(unregistered_user_gate), group=-1)
 
-    # قوانین و شروع
+    # Commands & registration / دستورات و ثبت‌نام
     application.add_handler(CommandHandler("start", handle_welcome))
     application.add_handler(CommandHandler("menu", show_main_menu_command))
     application.add_handler(CommandHandler("admin", admin_entry))
@@ -341,7 +357,7 @@ def main():
     application.add_handler(registration_handler)
     application.add_handler(CallbackQueryHandler(handle_terms_response, pattern="^terms_decline$"))
 
-    # مشاهده پروفایل و خدمات (فقط اینلاین)
+    # Main menu callbacks / منوی اصلی (اینلاین)
     application.add_handler(CallbackQueryHandler(show_user_profile, pattern="^main_profile$"))
     # Inline main menu entry
     application.add_handler(CallbackQueryHandler(show_services_menu, pattern="^main_services$"))

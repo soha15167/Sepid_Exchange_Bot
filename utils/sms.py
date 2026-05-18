@@ -1,5 +1,9 @@
-# 📁 فایل utils/sms.py
-# ارسال پیامک با Twilio برای تأیید شماره تماس کاربران
+"""
+utils/sms.py — SMS verification / تأیید پیامکی
+
+EN: Twilio client — send OTP, generate code for registration.
+FA: ارسال کد تأیید ثبت‌نام با Twilio.
+"""
 
 import random
 from config.settings import TWILIO_SID, TWILIO_TOKEN, TWILIO_FROM

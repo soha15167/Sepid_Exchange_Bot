@@ -1,4 +1,9 @@
-"""محدودیت دسترسی: فقط ثبت آگهی/خدمات مسدود؛ پروفایل و دستورهای پایه مجاز."""
+"""
+handlers/access_gate.py — Access control / کنترل دسترسی
+
+EN: Blocks restricted users; redirects unregistered users to signup flow.
+FA: کاربر محدودشده و ثبت‌نام‌نشده را از منو/خدمات بازمی‌دارد.
+"""
 
 import re
 

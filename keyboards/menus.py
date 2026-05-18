@@ -1,4 +1,9 @@
-# 📁 keyboards/menus.py - نسخه نهایی
+"""
+keyboards/menus.py — UI keyboards / صفحه‌کلیدها
+
+EN: Reply & inline keyboards — main menu, payment methods, registration, cancel.
+FA: دکمه‌های منو، انتخاب روش پرداخت، ثبت‌نام، انصراف.
+"""
 
 import unicodedata
 
