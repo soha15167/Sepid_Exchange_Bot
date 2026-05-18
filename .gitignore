@@ -1,0 +1,46 @@
+# Secrets & local config
+.env
+.env.*
+!.env.sepid.example
+
+# Database (production data stays on server only)
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+venv/
+venvvenv/
+.venv/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs & runtime
+*.log
+user_data.json
+
+# Local debug / temp
+_test*
+_t*.db
+_dump_schema.py
+_tmp_inspect_db.py
+_schema_euro.txt
+
+# Cursor assets (screenshots from chat)
+assets/

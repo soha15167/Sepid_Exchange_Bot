@@ -1,0 +1,26 @@
+---
+description: قالب ثابت دستور scp برای انتقال فایل‌های تغییرکرده به سرور
+alwaysApply: true
+---
+
+# انتقال به سرور (SCP)
+
+وقتی کاربر خواست «دستور انتقال»، `scp`، دیپلوی فایل، یا لیست کپی به سرور — **بدون پرسیدن دوباره** از این قالب استفاده کن:
+
+- **مسیر محلی (ویندوز):** `C:\Users\Sohei\Desktop\Desktop\telegram_bot_project2`
+- **سرور:** `root@49.13.132.230`
+- **ریشهٔ روی سرور:** `/root/telegram_bot_project2`
+
+هر فایل **یک خط**؛ مسیرهای محلی و ریموت داخل **دابل‌کوتیشن**:
+
+```text
+scp "C:\Users\Sohei\Desktop\Desktop\telegram_bot_project2\<مسیر_نسبی_با_بک‌اسلش>" "root@49.13.132.230:/root/telegram_bot_project2/<پوشه_مقصد_با_اسلش_پایانی>"
+```
+
+مثال (همان سبک کاربر):
+
+```text
+scp "C:\Users\Sohei\Desktop\Desktop\telegram_bot_project2\handlers\offers.py" "root@49.13.132.230:/root/telegram_bot_project2/handlers/"
+```
+
+بعد از تغییرات کد، اگر فقط فایل‌های مشخص را فرستاد، **همان فایل‌های واقعاً دست‌خورده در آن کار/PR** را لیست کن؛ در غیر این صورت مجموعهٔ منطقی همان فیچر را پیشنهاد بده.
