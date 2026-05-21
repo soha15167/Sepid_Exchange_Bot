@@ -12,12 +12,27 @@ FA:
 """
 
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    filters, ContextTypes,
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    JobQueue,
+    filters,
+    ContextTypes,
 )
-from telegram import Update, BotCommand
+from telegram import BotCommand, BotCommandScopeChat, Update
+import logging
 import sys
-from config.settings import BOT_TOKEN, ADMIN_IDS
+from datetime import time
+from zoneinfo import ZoneInfo
+
+from config.settings import (
+    ADMIN_IDS,
+    BONBAST_DAILY_HOUR,
+    BONBAST_DAILY_MINUTE,
+    BONBAST_DAILY_POST_ENABLED,
+    BOT_TOKEN,
+)
 from state import user_data_store
 from utils.telegram_utils import (
     send_or_replace_main_menu,
@@ -49,9 +64,11 @@ from handlers.exchange_flow import (
     handle_confirm_exchange
 )
 from handlers.start_flow import handle_welcome, show_terms, handle_terms_response
+from handlers.channel_gate import handle_channel_member_ack
 from handlers.admin import (
     admin_entry,
     admin_router,
+    admin_add_user_otp_callback,
     admin_cancel_callback,
     admin_delete_advert_confirm_callback,
     admin_delete_user_confirm_callback,
@@ -270,10 +287,100 @@ async def show_user_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# پیام شروع ربات
+logger = logging.getLogger(__name__)
+
+
+def _create_application() -> Application:
+    """
+    EN: Build Application with explicit JobQueue (systemd sometimes misses PTB extras).
+    FA: ساخت Application با JobQueue صریح — در برخی سرورها job-queue خودکار فعال نمی‌شود.
+    """
+    builder = Application.builder().token(BOT_TOKEN)
+    try:
+        builder = builder.job_queue(JobQueue())
+    except Exception as exc:
+        logger.warning("JobQueue not attached at startup: %s", exc)
+    app = builder.build()
+    if app.job_queue:
+        logger.info("JobQueue ready (python=%s)", sys.executable)
+    else:
+        logger.warning(
+            "JobQueue unavailable — run: python3 -m pip install "
+            "'python-telegram-bot[job-queue]==20.7'"
+        )
+    return app
+
+
 async def auto_start_notify(application: Application):
     bot_info = await application.bot.get_me()
     print(f"✅ ربات آماده‌ست: @{bot_info.username}")
+
+
+def _setup_bonbast_daily_job(application: Application) -> None:
+    """EN: Schedule 12:00 Iran daily Bonbast post. FA: زمان‌بندی پست روزانه نرخ."""
+    if not BONBAST_DAILY_POST_ENABLED:
+        return
+    if not application.job_queue:
+        logger.warning(
+            "JobQueue unavailable — pip install 'python-telegram-bot[job-queue]'. "
+            "Bonbast daily post disabled."
+        )
+        return
+    from handlers.bonbast_daily import post_daily_bonbast_rates
+
+    when = time(
+        hour=BONBAST_DAILY_HOUR,
+        minute=BONBAST_DAILY_MINUTE,
+        tzinfo=ZoneInfo("Asia/Tehran"),
+    )
+    application.job_queue.run_daily(
+        post_daily_bonbast_rates,
+        time=when,
+        name="bonbast_daily_rates",
+    )
+    logger.info(
+        "Bonbast daily rates scheduled at %02d:%02d Asia/Tehran",
+        BONBAST_DAILY_HOUR,
+        BONBAST_DAILY_MINUTE,
+    )
+
+
+async def _set_bot_command_menus(bot) -> None:
+    """EN: Public commands for all; admin extras (admin, post_rates) per ADMIN_IDS."""
+    public_cmds = [
+        BotCommand("start", "شروع و ثبت‌نام"),
+        BotCommand("menu", "نمایش منوی اصلی"),
+    ]
+    admin_cmds = public_cmds + [
+        BotCommand("admin", "پنل مدیریت"),
+        BotCommand("post_rates", "ارسال نرخ بن‌بست در کانال"),
+    ]
+    await bot.set_my_commands(public_cmds)
+    for admin_id in set(ADMIN_IDS or []):
+        if not admin_id:
+            continue
+        try:
+            await bot.set_my_commands(
+                admin_cmds, scope=BotCommandScopeChat(chat_id=int(admin_id))
+            )
+        except Exception:
+            logger.warning("set_my_commands failed for admin %s", admin_id)
+
+
+async def admin_post_bonbast_rates_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """EN: /post_rates — admin test post. FA: ارسال فوری نرخ برای تست."""
+    if not update.message or not update.effective_user:
+        return
+    if update.effective_user.id not in set(ADMIN_IDS or []):
+        return
+    from handlers.bonbast_daily import post_bonbast_rates_now
+
+    status = await update.message.reply_text("⏳ در حال دریافت نرخ از bonbast…")
+    try:
+        await post_bonbast_rates_now(context.bot)
+        await status.edit_text("✅ نرخ ارز در کانال منتشر شد.")
+    except Exception as exc:
+        await status.edit_text(f"❌ خطا در دریافت/ارسال نرخ: {exc}")
 
 
 async def show_main_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -338,7 +445,7 @@ def main():
         ensure_schema()
     except Exception:
         pass
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = _create_application()
 
     # Group -1: access gates / گیت محدودیت و ثبت‌نام
     application.add_handler(MessageHandler(filters.ALL, restricted_user_gate), group=-1)
@@ -351,9 +458,10 @@ def main():
     application.add_handler(CommandHandler("menu", show_main_menu_command))
     application.add_handler(CommandHandler("admin", admin_entry))
     application.add_handler(CommandHandler("neg_ad", admin_neg_ad_command))
+    application.add_handler(CommandHandler("post_rates", admin_post_bonbast_rates_cmd))
     # Inline start/terms (prevents user-message spam)
-    application.add_handler(CallbackQueryHandler(show_terms, pattern="^start_begin$"))
-    # terms_accept باید قبل از سایر callbackها به ConversationHandler ثبت‌نام برسد
+    application.add_handler(CallbackQueryHandler(handle_channel_member_ack, pattern="^ch_member_ok$"))
+    # terms_accept / start_begin → registration_handler
     application.add_handler(registration_handler)
     application.add_handler(CallbackQueryHandler(handle_terms_response, pattern="^terms_decline$"))
 
@@ -395,6 +503,12 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_service_operation_callback, pattern="^service_op_"))
     application.add_handler(CallbackQueryHandler(handle_inline_cancel_callback, pattern="^inline_cancel$"))
     application.add_handler(CallbackQueryHandler(admin_dashboard_callback, pattern=r"^adm\|"))
+    application.add_handler(
+        CallbackQueryHandler(
+            admin_add_user_otp_callback,
+            pattern=r"^admin_add_otp_(resend|show)$",
+        )
+    )
     application.add_handler(CallbackQueryHandler(admin_cancel_callback, pattern="^admin_cancel$"))
     application.add_handler(CallbackQueryHandler(admin_delete_advert_confirm_callback, pattern="^admin_del_adv_yes_"))
     application.add_handler(CallbackQueryHandler(admin_delete_user_confirm_callback, pattern="^admin_del_user_yes_"))
@@ -437,16 +551,11 @@ def main():
     # بعد از شروع
     async def post_init(app):
         await auto_start_notify(app)
+        _setup_bonbast_daily_job(app)
         try:
-            await app.bot.set_my_commands(
-                [
-                    BotCommand("start", "شروع و ثبت‌نام"),
-                    BotCommand("menu", "نمایش منوی اصلی"),
-                    BotCommand("admin", "پنل مدیریت"),
-                ]
-            )
+            await _set_bot_command_menus(app.bot)
         except Exception:
-            pass
+            logger.exception("set_my_commands failed")
 
     application.post_init = post_init
     application.run_polling()

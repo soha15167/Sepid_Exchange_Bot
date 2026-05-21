@@ -76,7 +76,12 @@ from handlers.offers import (
 )
 from messages import texts
 from models.enums import UserState
-from utils.sms import send_verification_sms, generate_sms_code
+from utils.sms import (
+    generate_sms_code,
+    is_otp_code_valid,
+    try_send_verification_sms,
+    uses_twilio_verify,
+)
 from utils.validators import is_valid_phone, is_valid_email
 from utils.telegram_utils import (
     remember_cleanup_id,
@@ -237,6 +242,17 @@ _EDIT_FIELD_LABEL_TO_FIELD = {
 
 def _inline_cancel() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ انصراف", callback_data="admin_cancel")]])
+
+
+def _admin_add_user_otp_keyboard() -> InlineKeyboardMarkup:
+    """پس از وارد کردن شماره در «افزودن کاربر» — پیامک یا نمایش کد؛ انصراف → منوی ادمین."""
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔄 ارسال مجدد پیامک", callback_data="admin_add_otp_resend")],
+            [InlineKeyboardButton("🔐 نمایش کد در چت", callback_data="admin_add_otp_show")],
+            [InlineKeyboardButton("❌ انصراف", callback_data="admin_cancel")],
+        ]
+    )
 
 def _inline_advert_edit_done() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -628,6 +644,15 @@ def _advert_country_display_line(account_country_raw, advert: dict | None = None
     return format_country_display_line(account_country_raw, advert, html=True)
 
 
+def _channel_ad_footer(advert: dict, *, euro_exchange_no_rate: bool = False) -> str:
+    from utils.channel_format import format_channel_ad_footer
+
+    return format_channel_ad_footer(
+        bot_username=advert.get("bot_username"),
+        euro_exchange_no_rate=euro_exchange_no_rate,
+    )
+
+
 def _build_channel_ad_text(advert: dict) -> str:
     """
     Build channel text from euro_adverts row.
@@ -676,8 +701,8 @@ def _build_channel_ad_text(advert: dict) -> str:
             f"\u200f🏙️ <b>شهر ایران:</b> {city_ir}\n\n"
             f"📦 <b>روش دریافت/تحویل:</b> {method}\n"
             f"{instant_line}"
-            f"📄 <b>توضیحات:</b> {desc}\n\n"
-            f"🤖 <b>ربات:</b> @{(advert.get('bot_username') or '')}\n"
+            f"📄 <b>توضیحات:</b> {desc}"
+            f"{_channel_ad_footer(advert, euro_exchange_no_rate=True)}"
         )
 
     if is_hybrid_exchange:
@@ -710,8 +735,8 @@ def _build_channel_ad_text(advert: dict) -> str:
             f"{rtl_city_ir_line}\n\n"
             f"📦 <b>{door_label}:</b> {method}\n"
             f"{instant_line}"
-            f"📄 <b>توضیحات:</b> {desc}\n\n"
-            f"🤖 <b>ربات:</b> @{(advert.get('bot_username') or '')}\n"
+            f"📄 <b>توضیحات:</b> {desc}"
+            f"{_channel_ad_footer(advert, euro_exchange_no_rate=True)}"
         )
 
     # buy/sell (نرخ تومان)
@@ -721,11 +746,6 @@ def _build_channel_ad_text(advert: dict) -> str:
     methods_block = f"💳 <b>{methods_label}:</b>\n{_format_methods_list_rtl(methods_list)}\n\n"
     instant_line = f"⚡ <b>امکان واریز آنی:</b> {instant_transfer}\n" if (instant_transfer and operation != "خرید") else ""
 
-    try:
-        rate_i = int(rate) if rate is not None and str(rate).strip() != "" else 0
-    except (TypeError, ValueError):
-        rate_i = 0
-
     amt_int = None
     try:
         amt_int = int(amount) if amount is not None else None
@@ -733,6 +753,11 @@ def _build_channel_ad_text(advert: dict) -> str:
         amt_int = None
 
     ctry_line = _advert_country_display_line(advert.get("account_country"), advert)
+
+    try:
+        rate_i = int(rate) if rate is not None and str(rate).strip() != "" else 0
+    except (TypeError, ValueError):
+        rate_i = 0
 
     return (
         f"📋 <b><a href=\"{real_link}\">آگهی شماره {advert_id}</a></b>\n\n"
@@ -744,8 +769,8 @@ def _build_channel_ad_text(advert: dict) -> str:
         f"🧾 <b>کارمزد (هر طرف):</b> {format_fee_eur(amt_int, fee_ov)}\n\n"
         f"{ctry_line}"
         f"{instant_line}"
-        f"📄 <b>توضیحات:</b> {desc}\n\n"
-        f"🤖 <b>ربات:</b> @{(advert.get('bot_username') or '')}\n"
+        f"📄 <b>توضیحات:</b> {desc}"
+        f"{_channel_ad_footer(advert)}"
     )
 
 
@@ -812,6 +837,79 @@ async def admin_neg_ad_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(
             err, reply_markup=admin_panel_back_keyboard()
         )
+
+
+async def admin_add_user_otp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """افزودن کاربر ادمین — مرحلهٔ کد بعد از شماره (پیامک / نمایش کد)."""
+    query = update.callback_query
+    if not query or not query.message:
+        return
+    uid = query.from_user.id
+    if not _is_admin(uid):
+        return
+    new_user = context.user_data.get("new_user") or {}
+    if new_user.get("_step") != "verify_code":
+        try:
+            await query.answer("این دکمه فقط هنگام تأیید شمارهٔ کاربر جدید است.", show_alert=True)
+        except Exception:
+            pass
+        return
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    phone = (new_user.get("phone_number") or "").strip()
+    code = str(new_user.get("sms_code") or generate_sms_code())
+    new_user["sms_code"] = code
+    context.user_data["new_user"] = new_user
+    chat_id = query.message.chat_id
+    data = query.data or ""
+
+    if data == "admin_add_otp_resend":
+        if try_send_verification_sms(phone, code):
+            new_user["otp_verify_twilio"] = uses_twilio_verify()
+            context.user_data["new_user"] = new_user
+            text = "📨 پیامک دوباره ارسال شد.\nلطفاً کدی که کاربر دریافت کرد را وارد کنید:"
+        else:
+            new_user["otp_verify_twilio"] = False
+            context.user_data["new_user"] = new_user
+            text = (
+                "⚠️ پیامک ارسال نشد.\n"
+                "«نمایش کد در چت» را بزنید یا کد را از پیام قبلی وارد کنید."
+            )
+        try:
+            await query.edit_message_text(text, reply_markup=_admin_add_user_otp_keyboard())
+        except Exception:
+            await context.bot.send_message(
+                chat_id=chat_id, text=text, reply_markup=_admin_add_user_otp_keyboard()
+            )
+        return
+
+    if data == "admin_add_otp_show":
+        if new_user.get("otp_verify_twilio"):
+            text = (
+                "ℹ️ با <b>Twilio Verify</b> کد فقط به خط موبایل کاربر پیامک می‌شود.\n"
+                "از کاربر بخواهید کد را بگوید و همان را در ربات وارد کنید."
+            )
+        else:
+            text = (
+                f"🔐 کد تأیید (برای وارد کردن در ربات): <code>{code}</code>\n\n"
+                "این کد را اینجا تایپ کنید تا کاربر ذخیره شود."
+            )
+        try:
+            await query.edit_message_text(
+                text,
+                parse_mode="HTML",
+                reply_markup=_admin_add_user_otp_keyboard(),
+            )
+        except Exception:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=_admin_add_user_otp_keyboard(),
+            )
+        return
 
 
 async def admin_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2084,6 +2182,34 @@ async def admin_dashboard_callback(update: Update, context: ContextTypes.DEFAULT
         await _admin_edit_dashboard(context, context.bot, "✅ ربات فعال شد.")
         return
 
+    if action == "brate":
+        from handlers.bonbast_daily import post_bonbast_rates_now
+
+        try:
+            await query.answer("در حال دریافت نرخ از bonbast…")
+        except Exception:
+            pass
+        context.user_data["state"] = UserState.ADMIN_MENU.name
+        _persist_admin_wizard_state(admin_uid, context)
+        try:
+            ok = await post_bonbast_rates_now(context.bot)
+            if ok:
+                msg = "✅ نرخ ارز در کانال منتشر شد."
+            else:
+                msg = (
+                    "❌ کانال برای پست نرخ تنظیم نشده.\n"
+                    "در `.env` مقدار `ADVERT_CHANNEL_ID` یا `BONBAST_CHANNEL_ID` را بررسی کنید."
+                )
+        except Exception as exc:
+            msg = f"❌ خطا در دریافت/ارسال نرخ: {exc}"
+        await _admin_edit_dashboard(
+            context,
+            context.bot,
+            msg,
+            reply_markup=admin_panel_back_keyboard(),
+        )
+        return
+
     if action == "rsvc":
         cmd = (BOT_RESTART_COMMAND or "").strip()
         if not cmd:
@@ -3266,21 +3392,30 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # If phone is new (not used by any user), verify by SMS first.
                 if not get_user_by_phone(value):
                     code = generate_sms_code()
-                    sent = send_verification_sms(value, code)
-                    if not sent:
-                        return await _admin_reply(update,"⚠️ ارسال پیامک ناموفق بود. لطفاً بعداً دوباره تلاش کنید.", reply_markup=None, context=context)
+                    via_verify = False
+                    if try_send_verification_sms(value, code):
+                        via_verify = uses_twilio_verify()
+                        hint = "📨 کد به خط موبایل پیامک شد.\n\n"
+                    else:
+                        hint = (
+                            f"⚠️ پیامک ارسال نشد. کد: <code>{code}</code>\n"
+                            "همان را وارد کنید.\n\n"
+                        )
                     context.user_data["pending_phone_update"] = {
                         "uid": uid,
                         "field": field,
                         "value": value,
                         "code": code,
+                        "otp_verify_twilio": via_verify,
+                        "otp_telegram_sent": False,
                     }
                     context.user_data["state"] = UserState.ADMIN_EDIT_PHONE_VERIFY.name
                     return await _admin_reply(
                         update,
-                        "📨 کد تایید به شماره ارسال شد. لطفاً کد را وارد کنید:\n\n"
+                        hint + "لطفاً کد را وارد کنید:\n\n"
                         f"«{_ADMIN_KB_CANCEL}»: لغو و خروج",
                         reply_markup=_inline_cancel(),
+                        parse_mode="HTML",
                     )
             ok = False
             if isinstance(uid, int) and isinstance(field, str):
@@ -3296,7 +3431,8 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data.pop("pending_phone_update", None)
                 await _admin_exit_edit_user_wizard(context, update)
                 return
-            if input_code != str(pending.get("code")):
+            phone_chk = (pending.get("value") or "").strip()
+            if not is_otp_code_valid(phone_chk, input_code, user_data=pending):
                 return await _admin_reply(
                     update,
                     "❌ کد اشتباه است. دوباره وارد کنید یا «❌ انصراف» را بزنید:",
@@ -3396,16 +3532,38 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 code = generate_sms_code()
                 new_user["sms_code"] = code
                 new_user["_step"] = "verify_code"
+                new_user["otp_verify_twilio"] = False
                 context.user_data["new_user"] = new_user
-                sent = send_verification_sms(phone, code)
-                if not sent:
-                    return await _admin_reply(update,"⚠️ ارسال پیامک ناموفق بود. لطفاً بعداً دوباره تلاش کنید.", reply_markup=None, context=context)
-                return await _admin_reply(update,"📨 کد تایید به شماره ارسال شد. لطفاً کد را وارد کنید:", reply_markup=_inline_cancel())
+                if try_send_verification_sms(phone, code):
+                    new_user["otp_verify_twilio"] = uses_twilio_verify()
+                    context.user_data["new_user"] = new_user
+                    return await _admin_reply(
+                        update,
+                        "📨 کد به خط موبایل پیامک شد.\n"
+                        "کدی که کاربر دریافت کرد را اینجا وارد کنید:\n\n"
+                        "انصراف → بازگشت به <b>منوی ادمین</b>.",
+                        reply_markup=_admin_add_user_otp_keyboard(),
+                        parse_mode="HTML",
+                    )
+                return await _admin_reply(
+                    update,
+                    "⚠️ <b>پیامک ارسال نشد.</b>\n"
+                    "«ارسال مجدد پیامک» یا «نمایش کد در چت» را بزنید، "
+                    "سپس همان کد را اینجا وارد کنید.\n\n"
+                    "انصراف → بازگشت به <b>منوی ادمین</b>.",
+                    reply_markup=_admin_add_user_otp_keyboard(),
+                    parse_mode="HTML",
+                )
 
             if step == "verify_code":
                 input_code = text.strip()
-                if input_code != str(new_user.get("sms_code")):
-                    return await _admin_reply(update,"❌ کد اشتباه است. دوباره وارد کنید:", reply_markup=_inline_cancel())
+                phone_chk = (new_user.get("phone_number") or "").strip()
+                if not is_otp_code_valid(phone_chk, input_code, user_data=new_user):
+                    return await _admin_reply(
+                        update,
+                        "❌ کد اشتباه است. دوباره وارد کنید:",
+                        reply_markup=_admin_add_user_otp_keyboard(),
+                    )
                 uid = context.user_data.get("new_user_id")
                 try:
                     save_user(

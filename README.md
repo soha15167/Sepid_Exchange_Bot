@@ -88,11 +88,44 @@ python main.py
 └── scripts/             # ابزارهای نگهداری (دیتابیس تازه)
 ```
 
+## نرخ روزانه Bonbast در کانال
+
+هر روز **ساعت ۱۲:۰۰ به وقت تهران** (قابل تغییر در `.env`) نرخ ارزهای انتخاب‌شده از [bonbast.com](https://www.bonbast.com) در کانال منتشر می‌شود.
+
+| محیط | فایل نمونه |
+|------|------------|
+| کانال/ربات قبلی (تست) | `.env.legacy.example` |
+| Sepid جدید | `.env.sepid.example` |
+
+```env
+BONBAST_DAILY_POST_ENABLED=1
+BONBAST_DAILY_HOUR=12
+BONBAST_DAILY_MINUTE=0
+BONBAST_CURRENCY_CODES=usd,eur,gbp,aed,try,chf,cad,sek
+# اختیاری — اگر آگهی‌ها کانال دیگری دارند ولی نرخ در کانال قدیمی می‌ماند:
+# BONBAST_CHANNEL_ID=-100...
+```
+
+پیش‌فرض: `BONBAST_CHANNEL_ID` خالی → همان `ADVERT_CHANNEL_ID`.
+
+تست فوری (فقط ادمین): `/post_rates` در چت خصوصی با ربات.
+
+نیاز: `pip install -r requirements.txt` (شامل `job-queue`).
+
 ## دیپلوی روی سرور
 
 1. کد را روی سرور قرار دهید (مثلاً `/root/telegram_bot_project2`).
 2. `.env` و `eurobot.db` را **فقط روی سرور** نگه دارید (در گیت نیستند).
 3. پس از تغییر کد، فایل‌های لازم را با `scp` منتقل و سرویس ربات را ری‌استارت کنید.
+
+**مهم:** اگر `systemctl` از `venv/bin/python3` استفاده می‌کند، وابستگی‌ها را **داخل venv** نصب کنید (نه فقط `pip` سراسری):
+
+```bash
+cd /root/telegram_bot_project2
+./venv/bin/python3 -m pip install -r requirements.txt
+./venv/bin/python3 -c "from telegram.ext import JobQueue; JobQueue(); print('job-queue ok')"
+systemctl restart telegram-bot
+```
 
 ## امنیت
 

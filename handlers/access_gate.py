@@ -59,6 +59,12 @@ _RESTRICTED_OK_CALLBACKS = frozenset(
         "start_begin",
         "terms_accept",
         "terms_decline",
+        "terms_decline",
+        "reg_otp_telegram",
+        "reg_otp_resend_sms",
+        "admin_add_otp_resend",
+        "admin_add_otp_show",
+        "ch_member_ok",
         "inline_cancel",
         "svc_cancel",
         "cancel",
@@ -203,6 +209,8 @@ async def unregistered_user_gate(update: Update, context: ContextTypes.DEFAULT_T
         raise ApplicationHandlerStop
 
     if context.user_data.get("registration_active"):
+        return
+    if (context.user_data.get("state") or "").upper() in ("VERIFY_CODE", "REGISTER_PHONE"):
         return
     if context.user_data.get("state") == "TERMS":
         return

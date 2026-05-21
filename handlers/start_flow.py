@@ -9,7 +9,7 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 from config.settings import ADMIN_IDS
-from database.db import get_restriction_block_message
+from database.db import get_restriction_block_message, get_user
 from keyboards.menus import terms_inline_keyboard
 from models.enums import UserState
 from messages import texts
@@ -57,6 +57,7 @@ async def handle_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else []
         )
         context.user_data.clear()
+        context.user_data["pending_offer_advert_id"] = int(offer_ad_id)
         try:
             if update.message:
                 await update.message.delete()
@@ -68,22 +69,42 @@ async def handle_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=update.effective_chat.id,
                 ids=mids_to_clean,
             )
-        await deliver_offer_proposal_gate(context, user_id, offer_ad_id)
+        if get_user(user_id):
+            context.user_data.pop("pending_offer_advert_id", None)
+            await deliver_offer_proposal_gate(context, user_id, offer_ad_id)
+        else:
+            await send_registration_welcome(
+                context.bot,
+                chat_id=update.effective_chat.id,
+                user_id=user_id,
+                store=user_data_store,
+                context=context,
+            )
         return
 
     context.user_data.clear()
     if update.message:
         remember_cleanup_id(user_data_store, user_id, update.message.message_id, _MAIN_CLEANUP_KEY)
 
-    mid = await send_registration_welcome(
-        context.bot,
-        chat_id=update.effective_chat.id,
-        user_id=user_id,
-        store=user_data_store,
-        context=context,
-    )
-    remember_cleanup_id(user_data_store, user_id, mid, _MAIN_CLEANUP_KEY)
-    context.user_data['state'] = UserState.START.name
+    if get_user(user_id):
+        context.user_data["state"] = UserState.MAIN_MENU.name
+        mid = await send_or_replace_main_menu(
+            context.bot,
+            chat_id=update.effective_chat.id,
+            user_id=user_id,
+            store=user_data_store,
+        )
+        remember_cleanup_id(user_data_store, user_id, mid, _MAIN_CLEANUP_KEY)
+    else:
+        mid = await send_registration_welcome(
+            context.bot,
+            chat_id=update.effective_chat.id,
+            user_id=user_id,
+            store=user_data_store,
+            context=context,
+        )
+        remember_cleanup_id(user_data_store, user_id, mid, _MAIN_CLEANUP_KEY)
+        context.user_data["state"] = UserState.TERMS.name
     try:
         if update.message:
             await update.message.delete()

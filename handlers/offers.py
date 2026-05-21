@@ -1429,6 +1429,12 @@ def _fee_eur_line_for_party(fee_eur: float, advert: dict | None = None) -> str:
     return f"• کارمزد شما (یورو): <b>{_fmt_fee_eur_display(fee_eur)}</b> یورو\n"
 
 
+def _copyable_toman_html(amount: int) -> str:
+    from utils.channel_format import format_copyable_toman_html
+
+    return format_copyable_toman_html(amount)
+
+
 def _financial_blocks_html(advert: dict, rate: int, eur_amt: int) -> tuple[str, str]:
     """خلاصهٔ مالی؛ کارمزد یورو/تومان برای هر طرف برابر مبلغ پلکانی/دستی (بدون نصف کردن)."""
     op = (advert.get("operation") or "").strip()
@@ -1480,7 +1486,7 @@ def _financial_blocks_html(advert: dict, rate: int, eur_amt: int) -> tuple[str, 
             f"{eur_ln}"
             f"• کارمزد شما (تومان): <b>{fee_party_toman:,}</b> تومان\n"
             f"• مبلغ نهایی (بعد از کسر کارمزد — مبلغی که برای شما واریز می‌شود): "
-            f"<b>{owner_net:,}</b> تومان\n\n"
+            f"{_copyable_toman_html(owner_net)}\n\n"
         )
         prop_blk = (
             f"🧮 <b>خلاصه برای شما (پیشنهاد دهنده — خریدار یورو):</b>\n"
@@ -1489,7 +1495,7 @@ def _financial_blocks_html(advert: dict, rate: int, eur_amt: int) -> tuple[str, 
             f"{eur_ln}"
             f"• کارمزد شما (تومان): <b>{fee_party_toman:,}</b> تومان\n"
             f"• مبلغ نهایی (با جمع کارمزد — مبلغ واریز شما): "
-            f"<b>{buyer_pay:,}</b> تومان\n\n"
+            f"{_copyable_toman_html(buyer_pay)}\n\n"
         )
         return owner_blk, prop_blk
 
@@ -1502,7 +1508,7 @@ def _financial_blocks_html(advert: dict, rate: int, eur_amt: int) -> tuple[str, 
         f"{eur_ln}"
         f"• کارمزد شما (تومان): <b>{fee_party_toman:,}</b> تومان\n"
         f"• مبلغ نهایی (با جمع کارمزد — مبلغ واریز شما): "
-        f"<b>{buyer_pay:,}</b> تومان\n\n"
+        f"{_copyable_toman_html(buyer_pay)}\n\n"
     )
     prop_blk = (
         f"🧮 <b>خلاصه برای شما (پیشنهاد دهنده — فروشنده یورو):</b>\n"
@@ -1511,71 +1517,85 @@ def _financial_blocks_html(advert: dict, rate: int, eur_amt: int) -> tuple[str, 
         f"{eur_ln}"
         f"• کارمزد شما (تومان): <b>{fee_party_toman:,}</b> تومان\n"
         f"• مبلغ نهایی (بعد از کسر کارمزد — مبلغی که برای شما واریز می‌شود): "
-        f"<b>{seller_recv:,}</b> تومان\n\n"
+        f"{_copyable_toman_html(seller_recv)}\n\n"
     )
     return owner_blk, prop_blk
+
+
+def _acceptance_role_label(advert: dict, row: dict, viewer_telegram_id: int) -> str:
+    """نقش کوتاه بیننده در پیام تأیید."""
+    op = (advert.get("operation") or "").strip()
+    is_owner = int(viewer_telegram_id) == int(row["owner_id"])
+    if op == "فروش":
+        return "فروشنده یورو" if is_owner else "خریدار یورو"
+    if op == "خرید":
+        return "خریدار یورو" if is_owner else "فروشنده یورو"
+    return "آگهی‌دهنده" if is_owner else "پیشنهاددهنده"
 
 
 def _post_acceptance_account_context_html(
     advert: dict, row: dict, viewer_telegram_id: int
 ) -> str:
-    """کشور حساب و روش‌های پرداخت/دریافت؛ متن بر اساس خریدار یا فروشنده بودن بیننده."""
+    """کشور خریدار و فروشنده برای هر دو طرف؛ روش‌ها بر اساس نقش بیننده."""
     op = (advert.get("operation") or "").strip()
-    owner_id = int(row["owner_id"])
-    proposer_id = int(row["proposer_telegram_id"])
-    vid = int(viewer_telegram_id)
-    is_owner = vid == owner_id
+    is_owner = int(viewer_telegram_id) == int(row["owner_id"])
+    role = _acceptance_role_label(advert, row, viewer_telegram_id)
+    prop_ct = row.get("proposer_account_country")
+    buyer_ct, seller_ct = _offer_euro_buyer_seller_country_texts(advert, prop_ct)
 
-    adv_ct = (advert.get("account_country") or "").strip() or "—"
-    prop_ct = (row.get("proposer_account_country") or "").strip() or "—"
     methods_raw = (advert.get("methods") or "").strip() or "—"
+    if op == "فروش":
+        methods_lbl = "روش‌های دریافت" if is_owner else "روش‌های پرداخت (طبق آگهی)"
+    elif op == "خرید":
+        methods_lbl = "روش‌های پرداخت" if is_owner else "روش‌های دریافت (طبق آگهی)"
+    else:
+        methods_lbl = "روش‌ها"
 
-    adv_ct_e = html_module.escape(adv_ct)
-    prop_ct_e = html_module.escape(prop_ct)
-    methods_e = html_module.escape(methods_raw)
+    return (
+        f"{_RTL}📋 <b>اطلاعات معامله</b>\n"
+        f"{_RTL}• نقش شما: <b>{html_module.escape(role)}</b>\n"
+        f"{_RTL}• کشور حساب <b>خریدار یورو:</b> {buyer_ct}\n"
+        f"{_RTL}• کشور حساب <b>فروشنده یورو:</b> {seller_ct}\n"
+        f"{_RTL}• {html_module.escape(methods_lbl)}:\n"
+        f"<code>{html_module.escape(methods_raw)}</code>\n\n"
+    )
 
-    lines: list[str] = [f"{_RTL}📋 <b>کشور حساب و روش‌های مرتبط با معامله</b>\n"]
+
+def _financial_accept_summary_html(
+    advert: dict, rate: int, eur_amt: int, *, owner_view: bool
+) -> str:
+    """خلاصهٔ مالی کوتاه بعد از تأیید — فقط برای نقش بیننده."""
+    op = (advert.get("operation") or "").strip()
+    owner_blk, prop_blk = _financial_blocks_html(advert, rate, eur_amt)
+    if op not in ("خرید", "فروش") or eur_amt <= 0:
+        return owner_blk if owner_view else prop_blk
+
+    base = int(eur_amt) * int(rate)
+    ov = advert_fee_override_eur(advert)
+    fee_eur = fee_total_eur(eur_amt, ov)
+    fee_toman = int(round(fee_eur * float(rate)))
+    fee_eur_s = _fmt_fee_eur_display(fee_eur)
 
     if op == "فروش":
-        if is_owner:
-            lines.append(
-                f"{_RTL}شما <b>آگهی‌دهنده و فروشندهٔ یورو</b> هستید.\n"
-                f"{_RTL}🏦 کشور حساب شما (ثبت در آگهی): <b>{adv_ct_e}</b>\n"
-                f"{_RTL}💳 روش‌های دریافت وجه (ثبت در آگهی):\n<code>{methods_e}</code>\n"
-            )
-        else:
-            lines.append(
-                f"{_RTL}شما <b>پیشنهاددهنده و خریدار یورو</b> هستید.\n"
-                f"{_RTL}🏦 کشور حساب شما (ثبت در پیشنهاد): <b>{prop_ct_e}</b>\n"
-                f"{_RTL}🌍 کشور حساب <b>آگهی‌دهنده</b> (فروشنده): <b>{adv_ct_e}</b>\n"
-                f"{_RTL}💳 برای پرداخت به فروشنده، از <b>روش‌های ثبت‌شده در آگهی</b> استفاده کنید:\n"
-                f"<code>{methods_e}</code>\n"
-            )
-    elif op == "خرید":
-        if is_owner:
-            lines.append(
-                f"{_RTL}شما <b>آگهی‌دهنده و خریدار یورو</b> هستید.\n"
-                f"{_RTL}🏦 کشور حساب شما (ثبت در آگهی): <b>{adv_ct_e}</b>\n"
-                f"{_RTL}💳 روش‌های پرداخت شما به فروشنده (ثبت در آگهی):\n<code>{methods_e}</code>\n"
-            )
-        else:
-            lines.append(
-                f"{_RTL}شما <b>پیشنهاددهنده و فروشندهٔ یورو</b> هستید.\n"
-                f"{_RTL}🏦 کشور حساب شما (ثبت در پیشنهاد): <b>{prop_ct_e}</b>\n"
-                f"{_RTL}🌍 کشور حساب <b>آگهی‌دهنده</b> (خریدار): <b>{adv_ct_e}</b>\n"
-                f"{_RTL}💳 دریافت وجه از خریدار طبق <b>روش‌های ثبت‌شده در آگهی</b> اوست:\n"
-                f"<code>{methods_e}</code>\n"
-            )
+        final_amt = base - fee_toman if owner_view else base + fee_toman
+        final_lbl = "واریز به شما" if owner_view else "مبلغ واریز شما"
     else:
-        who = "آگهی‌دهنده" if is_owner else "پیشنهاددهنده"
-        lines.append(
-            f"{_RTL}نقش شما در این آگهی: <b>{who}</b> (نوع آگهی: <b>{html_module.escape(op or '—')}</b>)\n"
-            f"{_RTL}🏦 کشور حساب آگهی‌دهنده (آگهی): <b>{adv_ct_e}</b>\n"
-            f"{_RTL}🏦 کشور حساب پیشنهاددهنده (پیشنهاد): <b>{prop_ct_e}</b>\n"
-            f"{_RTL}💳 روش‌ها در آگهی:\n<code>{methods_e}</code>\n"
-        )
+        final_amt = base + fee_toman if owner_view else base - fee_toman
+        final_lbl = "مبلغ واریز شما" if owner_view else "واریز به شما"
 
-    return "\n".join(lines) + "\n"
+    lines = [
+        f"{_RTL}🧮 <b>خلاصه مالی</b>\n",
+        f"{_RTL}• نرخ <b>{rate:,}</b> تومان · <b>{eur_amt:,}</b> یورو\n",
+    ]
+    if fee_eur > 0 or (ov is not None and fee_eur == 0):
+        lines.append(
+            f"{_RTL}• کارمزد شما: <b>{fee_eur_s}</b> یورو "
+            f"(<b>{fee_toman:,}</b> تومان)\n"
+        )
+    lines.append(
+        f"{_RTL}• مبلغ نهایی ({final_lbl}): {_copyable_toman_html(final_amt)}\n\n"
+    )
+    return "".join(lines)
 
 
 def _post_acceptance_message_html(
@@ -1588,46 +1608,36 @@ def _post_acceptance_message_html(
     """پیام تأیید معامله برای آگهی‌دهنده یا پیشنهاددهنده با خلاصه مالی و راهنمای ادمین."""
     rate = int(row["rate_toman"])
     try:
-        eur_amt = int(advert.get("euro_amount") or 0)
+        pe_raw = int(row.get("proposed_euro_amount") or 0)
     except (TypeError, ValueError):
-        eur_amt = 0
+        pe_raw = 0
+    pe_kw = pe_raw if pe_raw > 0 else None
+    eur_amt = _offer_effective_euro_amount(advert, pe_kw)
     owner_id = int(row["owner_id"])
-    proposer_id = int(row["proposer_telegram_id"])
-    owner_blk, prop_blk = _financial_blocks_html(advert, rate, eur_amt)
-    if int(viewer_telegram_id) == owner_id:
-        fin = owner_blk
-    else:
-        fin = prop_blk
-    ov = advert_fee_override_eur(advert)
-    if ov is not None:
-        fee_summary = (
-            f"{_RTL}🧾 <b>خلاصهٔ مالی برای شما</b> "
-            f"(کارمزد هر طرف، <b>ثابت (تنظیم ادمین)</b>: {format_fee_eur(eur_amt, ov)}):\n"
-        )
-    else:
-        pe = fee_total_eur(eur_amt, None)
-        fee_num = f"{pe:.2f}".rstrip("0").rstrip(".") if pe else "0"
-        fee_summary = (
-            f"{_RTL}🧾 <b>خلاصهٔ مالی برای شما</b> "
-            f"(کارمزد تقریبی از <b>فرمول پلکانی</b>؛ حدود <b>{fee_num}</b> یورو):\n"
-        )
+    is_owner_view = int(viewer_telegram_id) == owner_id
+    fin = _financial_accept_summary_html(
+        advert, rate, eur_amt, owner_view=is_owner_view
+    )
     ad_link = advert_public_link_html(advert, aid)
-    hdr = f"{_RTL}✅ پیشنهاد شماره <b>{seq}</b> برای {ad_link} تأیید شد.\n\n{fee_summary}"
+    amt_line = _offer_amount_line_html(advert, pe_kw)
+    hdr = (
+        f"{_RTL}✅ پیشنهاد <b>{seq}</b> برای {ad_link} تأیید شد.\n\n"
+        f"{amt_line}"
+    )
     acct = _post_acceptance_account_context_html(advert, row, viewer_telegram_id)
     adm = (DEAL_NEXT_STEPS_ADMIN or "").strip()
     if adm:
         adm_esc = html_module.escape(adm)
         foot = (
-            f"\n{_RTL}⚠️ بدون هماهنگی مدیریت <b>هیچ مبلغی</b> پرداخت یا واریز نکنید.\n"
-            f"{_RTL}برای مراحل بعدی، <b>همین پیام را برای ادمین فوروارد کنید</b>: "
-            f"<b>{adm_esc}</b>\n"
-            f"{_RTL}📌 شناسهٔ حساب شما در تلگرام: <code>{viewer_telegram_id}</code>"
+            f"{_RTL}⚠️ بدون هماهنگی مدیریت مبلغی پرداخت یا واریز نکنید.\n"
+            f"{_RTL}همین پیام را به ادمین فوروارد کنید: <b>{adm_esc}</b>\n"
+            f"{_RTL}📌 شناسه تلگرام: <code>{viewer_telegram_id}</code>"
         )
     else:
         foot = (
-            f"\n{_RTL}⚠️ بدون هماهنگی مدیریت <b>هیچ مبلغی</b> پرداخت یا واریز نکنید.\n"
-            f"{_RTL}برای مراحل بعدی، همین پیام را به <b>ادمین</b> ارسال کنید.\n"
-            f"{_RTL}📌 شناسهٔ حساب شما در تلگرام: <code>{viewer_telegram_id}</code>"
+            f"{_RTL}⚠️ بدون هماهنگی مدیریت مبلغی پرداخت یا واریز نکنید.\n"
+            f"{_RTL}همین پیام را به ادمین فوروارد کنید.\n"
+            f"{_RTL}📌 شناسه تلگرام: <code>{viewer_telegram_id}</code>"
         )
     return hdr + fin + acct + foot
 
@@ -1838,6 +1848,12 @@ def _channel_offer_line_rtl(inner_html: str) -> str:
 
 def _strip_channel_offer_block(html: str) -> str:
     """اگر متن کانال قبلاً بلوک وضعیت/پیشنهاد دارد، قبل از بازسازی حذفش کن (جلوگیری از ماندهٔ قدیمی)."""
+    from utils.channel_format import CHANNEL_AD_FOOTER_MARKER
+
+    footer_i = html.find(CHANNEL_AD_FOOTER_MARKER)
+    if footer_i >= 0:
+        return html[:footer_i].rstrip() + "\n\n" + html[footer_i:]
+
     marker = "⚙️ <b>وضعیت:</b>"
     bot = "🤖 <b>ربات:"
     if marker not in html:
@@ -1860,14 +1876,26 @@ def append_offer_lists_to_channel_html(base_html: str, advert_rowid: int) -> str
     accepted = list_accepted_offers_for_advert(advert_rowid)
     agreement_html = ""
     if accepted:
+        ac = accepted[0]
         try:
-            rt = int(accepted[0]["rate_toman"])
+            rt = int(ac["rate_toman"])
         except (TypeError, ValueError, KeyError):
             rt = 0
+        try:
+            pe = int(ac.get("proposed_euro_amount") or 0)
+        except (TypeError, ValueError):
+            pe = 0
+        adv_e = _advert_euro_amount_int(advert_for_list)
         if rt > 0:
-            agreement_html = (
-                f"{_RTL}✅ این آگهی با نرخ پیشنهادی {_ltr_rate_toman_html(rt)} به توافق رسیده است.\n\n"
-            )
+            if pe > 0 and adv_e > 0 and pe != adv_e:
+                agreement_html = (
+                    f"{_RTL}✅ این آگهی با نرخ {_ltr_rate_toman_html(rt)} و "
+                    f"مقدار <b>{pe:,}</b> یورو به توافق رسیده است.\n\n"
+                )
+            else:
+                agreement_html = (
+                    f"{_RTL}✅ این آگهی با نرخ پیشنهادی {_ltr_rate_toman_html(rt)} به توافق رسیده است.\n\n"
+                )
         elif hybrid_list and rt == 0:
             agreement_html = (
                 f"{_RTL}✅ این آگهی با توافق «معاوضهٔ یورو به یورو» (بدون نرخ تومان ثابت در پیشنهاد) "
@@ -1924,8 +1952,12 @@ def append_offer_lists_to_channel_html(base_html: str, advert_rowid: int) -> str
             line_end = len(base_html)
         rest = base_html[line_end + 1 :].lstrip("\n")
         return base_html[:idx].rstrip() + "\n\n" + block + "\n\n" + rest
-    bot_m = "🤖 <b>ربات:"
-    bi = base_html.rfind(bot_m)
+    from utils.channel_format import CHANNEL_AD_FOOTER_MARKER
+
+    bi = base_html.rfind(CHANNEL_AD_FOOTER_MARKER)
+    if bi < 0:
+        bot_m = "🤖 <b>ربات:"
+        bi = base_html.rfind(bot_m)
     if bi >= 0:
         return base_html[:bi].rstrip() + "\n\n" + block + "\n\n" + base_html[bi:]
     return base_html + "\n\n" + block
@@ -1991,7 +2023,7 @@ def parse_offer_start_payload(args: list[str]) -> int | None:
 
 def offer_proposal_inline_button(advert_id: int, bot_username: str | None = None) -> InlineKeyboardButton:
     """
-    دکمه زیر آگهی در کانال: با URL تلگرام مستقیم چت ربات را باز می‌کند (deep link).
+    دکمه زیر آگهی در کانال: باز کردن مستقیم ربات با deep link (پیشنهاد همان آگهی).
     اگر یوزرنیم نبود، fallback به callback برای پست‌های قدیمی.
     """
     label = "📨 پیشنهاد به آگهی"
@@ -2014,6 +2046,7 @@ async def deliver_offer_proposal_gate(
     if not get_user(user_id):
         from utils.telegram_utils import send_registration_welcome
 
+        context.user_data["pending_offer_advert_id"] = int(advert_id)
         await send_registration_welcome(
             bot,
             chat_id=user_id,
@@ -2459,15 +2492,27 @@ def _offer_ack_description_text(desc: str) -> str:
 
 
 async def handle_offer_advert_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """پست‌های قدیمی با callback_data: offer_<rowid> (بدون دکمهٔ url)."""
+    """پست‌های قدیمی با callback — باز کردن ربات؛ گیت از /start (همان دکمهٔ url)."""
     query = update.callback_query
     if not query or not query.from_user:
         return
-    await query.answer()
     m = re.match(r"^offer_(\d+)$", query.data or "")
     if not m:
         return
-    await deliver_offer_proposal_gate(context, query.from_user.id, int(m.group(1)))
+    aid = int(m.group(1))
+    uname = (BOT_USERNAME or "").strip().lstrip("@")
+    if uname:
+        from utils.channel_ad_publish import try_open_telegram_url
+
+        await try_open_telegram_url(
+            query, f"https://t.me/{uname}?start=offer_{aid}"
+        )
+        return
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    await deliver_offer_proposal_gate(context, query.from_user.id, aid)
 
 
 async def handle_offer_gate_agree(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

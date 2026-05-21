@@ -5,6 +5,9 @@ EN: ConversationHandler — name, display name, email, address, phone, SMS code.
 FA: فلو چندمرحله‌ای تا ذخیره در جدول users؛ نام نمایشی یکتا در آگهی.
 """
 
+import html as html_module
+import re
+
 from telegram import Update, ReplyKeyboardRemove
 from telegram.ext import (
     ContextTypes,
@@ -16,7 +19,13 @@ from telegram.ext import (
 )
 from config.settings import ADMIN_IDS
 from utils.validators import is_valid_email, is_valid_phone, normalize_phone_input
-from utils.sms import send_verification_sms, generate_sms_code
+from utils.sms import (
+    generate_sms_code,
+    is_otp_code_valid,
+    try_send_verification_sms,
+    uses_twilio_verify,
+)
+from keyboards.menus import registration_otp_fallback_keyboard
 from database.db import (
     get_user_by_id,
     get_user_by_phone,
@@ -27,15 +36,16 @@ from database.db import (
 )
 from models.enums import UserState
 from state import user_data_store
+from keyboards.menus import REGISTRATION_START_BUTTON_TEXT, reply_menu_text_matches
 from utils.telegram_utils import send_or_replace_main_menu, send_registration_welcome
 
 REGISTER_FULLNAME, REGISTER_LASTNAME, REGISTER_DISPLAY_NAME, REGISTER_EMAIL, REGISTER_ADDRESS, REGISTER_PHONE, VERIFY_CODE = range(7)
 
 
 async def terms_accept_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ورود به فلو ثبت‌نام با اینلاین «قبول قوانین» (callback؛ بدون update.message)."""
+    """ورود به فلو ثبت‌نام — «قبول قوانین» یا دکمهٔ «📝 ثبت‌نام»."""
     q = update.callback_query
-    if not q or (q.data or "") != "terms_accept":
+    if not q or (q.data or "") not in ("terms_accept", "start_begin"):
         return ConversationHandler.END
     user_id = update.effective_user.id
     user_data_store.setdefault(user_id, {})
@@ -75,6 +85,16 @@ async def terms_accept_entry(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await q.message.delete()
             except Exception:
                 pass
+        pending_offer = context.user_data.pop("pending_offer_advert_id", None)
+        if pending_offer is not None:
+            try:
+                from handlers.offers import deliver_offer_proposal_gate
+
+                context.user_data["state"] = UserState.OFFER_ADVERT_ID.name
+                await deliver_offer_proposal_gate(context, user_id, int(pending_offer))
+                return ConversationHandler.END
+            except (TypeError, ValueError):
+                pass
         await send_or_replace_main_menu(
             context.bot,
             chat_id=cid,
@@ -103,14 +123,34 @@ async def terms_accept_entry(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return REGISTER_FULLNAME
 
 
-async def start_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _begin_registration_form(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     if get_user_by_id(user_id) or get_user(user_id):
-        await update.message.reply_text("✅ شما قبلاً ثبت‌نام کرده‌اید.")
+        await send_or_replace_main_menu(
+            context.bot,
+            chat_id=update.effective_chat.id,
+            user_id=user_id,
+            store=user_data_store,
+            text="ℹ️ شما قبلاً ثبت‌نام کرده‌اید.",
+        )
         return ConversationHandler.END
-
-    await update.message.reply_text("👤 لطفاً نام خود را وارد کنید:", reply_markup=ReplyKeyboardRemove())
+    context.user_data["registration_active"] = True
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="👤 لطفاً نام خود را وارد کنید:",
+        reply_markup=ReplyKeyboardRemove(),
+    )
     return REGISTER_FULLNAME
+
+
+async def start_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip() if update.message else ""
+    if not (
+        reply_menu_text_matches(REGISTRATION_START_BUTTON_TEXT, text)
+        or text in ("ثبت نام", "ثبت‌نام")
+    ):
+        return ConversationHandler.END
+    return await _begin_registration_form(update, context)
 
 async def get_fullname(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['full_name'] = update.message.text.strip()
@@ -170,30 +210,95 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    context.user_data['phone_number'] = phone
+    context.user_data["phone_number"] = phone
     code = generate_sms_code()
-    context.user_data['sms_code'] = code
+    context.user_data["sms_code"] = code
+    context.user_data.pop("otp_telegram_sent", None)
 
-    sent = send_verification_sms(phone, code)
-    if sent:
+    if try_send_verification_sms(phone, code):
+        context.user_data["otp_delivery"] = "sms"
+        context.user_data["otp_verify_twilio"] = uses_twilio_verify()
         await update.message.reply_text(
-            "📨 یک کد تأیید به شمارهٔ شما ارسال شد. لطفاً آن را در همینجا وارد کنید:"
-        )
-    else:
-        # Twilio خراب / ایران / trial — ثبت‌نام را با کد داخل تلگرام پیش می‌بریم
-        await update.message.reply_text(
-            "⚠️ ارسال پیامک انجام نشد (تنظیمات Twilio یا محدودیت اپراتور).\n"
-            "کد تأیید را در همین چت برایتان فرستادیم؛ همان را وارد کنید:",
-        )
-        await update.message.reply_text(
-            f"🔐 کد تأیید شما: <code>{code}</code>",
+            "📨 کد تأیید به <b>خط موبایل</b> شما پیامک شد.\n"
+            "لطفاً همان کد را اینجا وارد کنید:",
             parse_mode="HTML",
         )
+    else:
+        context.user_data["otp_delivery"] = "sms_failed"
+        context.user_data["otp_verify_twilio"] = False
+        await update.message.reply_text(
+            "⚠️ ارسال پیامک به این شماره انجام نشد.\n"
+            "چند دقیقه صبر کنید یا «ارسال مجدد پیامک» را بزنید.\n"
+            "اگر پیامک نرسید، با دکمهٔ زیر <b>درخواست ارسال کد در تلگرام</b> دهید:",
+            parse_mode="HTML",
+            reply_markup=registration_otp_fallback_keyboard,
+        )
+    return VERIFY_CODE
+
+
+async def registration_otp_resend_sms(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or (q.data or "") != "reg_otp_resend_sms":
+        return VERIFY_CODE
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    phone = context.user_data.get("phone_number") or ""
+    code = context.user_data.get("sms_code") or generate_sms_code()
+    context.user_data["sms_code"] = code
+    if try_send_verification_sms(phone, code):
+        context.user_data["otp_delivery"] = "sms"
+        context.user_data["otp_verify_twilio"] = uses_twilio_verify()
+        await q.edit_message_text(
+            "📨 پیامک دوباره ارسال شد.\nلطفاً کد را اینجا وارد کنید:",
+            parse_mode="HTML",
+        )
+    else:
+        context.user_data["otp_delivery"] = "sms_failed"
+        context.user_data["otp_verify_twilio"] = False
+        await q.edit_message_text(
+            "⚠️ ارسال پیامک باز هم ممکن نشد.\n"
+            "اگر خط شما پیامک نگرفت، «ارسال کد در تلگرام» را بزنید:",
+            parse_mode="HTML",
+            reply_markup=registration_otp_fallback_keyboard,
+        )
+    return VERIFY_CODE
+
+
+async def registration_otp_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or (q.data or "") != "reg_otp_telegram":
+        return VERIFY_CODE
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    if context.user_data.get("otp_telegram_sent"):
+        await q.edit_message_text(
+            "ℹ️ کد قبلاً در همین چت فرستاده شده؛ همان را وارد کنید.",
+            parse_mode="HTML",
+        )
+        return VERIFY_CODE
+    code = context.user_data.get("sms_code") or ""
+    context.user_data["otp_telegram_sent"] = True
+    context.user_data["otp_delivery"] = "telegram"
+    context.user_data["otp_verify_twilio"] = False
+    await q.edit_message_text(
+        "📲 طبق درخواست شما، کد در <b>تلگرام</b> ارسال می‌شود:",
+        parse_mode="HTML",
+    )
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=f"🔐 کد تأیید: <code>{html_module.escape(str(code))}</code>",
+        parse_mode="HTML",
+    )
     return VERIFY_CODE
 
 async def verify_sms(update: Update, context: ContextTypes.DEFAULT_TYPE):
     input_code = update.message.text.strip()
-    if input_code != context.user_data.get('sms_code'):
+    phone = context.user_data.get("phone_number") or ""
+    if not is_otp_code_valid(phone, input_code, user_data=context.user_data):
         await update.message.reply_text("❌ کد اشتباه است. لطفاً دوباره تلاش کنید:")
         return VERIFY_CODE
 
@@ -210,6 +315,17 @@ async def verify_sms(update: Update, context: ContextTypes.DEFAULT_TYPE):
         username=update.effective_user.username,
     )
     context.user_data.pop("registration_active", None)
+    pending_offer = context.user_data.pop("pending_offer_advert_id", None)
+    if pending_offer is not None:
+        try:
+            from handlers.offers import deliver_offer_proposal_gate
+
+            context.user_data["state"] = UserState.OFFER_ADVERT_ID.name
+            await deliver_offer_proposal_gate(context, uid, int(pending_offer))
+            return ConversationHandler.END
+        except (TypeError, ValueError):
+            pass
+
     context.user_data["state"] = UserState.MAIN_MENU.name
     welcome_txt = (
         "✅ ثبت‌نام شما با موفقیت انجام شد.\n\n"
@@ -240,10 +356,14 @@ async def cancel_registration(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 # هندلر نهایی برای اضافه شدن در main.py
+_registration_btn_re = (
+    rf"^({re.escape(REGISTRATION_START_BUTTON_TEXT)}|ثبت[\s\u200c]*نام)$"
+)
+
 registration_handler = ConversationHandler(
     entry_points=[
-        MessageHandler(filters.Regex("^ثبت نام$"), start_registration),
-        CallbackQueryHandler(terms_accept_entry, pattern="^terms_accept$"),
+        MessageHandler(filters.Regex(_registration_btn_re), start_registration),
+        CallbackQueryHandler(terms_accept_entry, pattern=r"^(terms_accept|start_begin)$"),
     ],
     states={
         REGISTER_FULLNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_fullname)],
@@ -252,7 +372,11 @@ registration_handler = ConversationHandler(
         REGISTER_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_email)],
         REGISTER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_address)],
         REGISTER_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone)],
-        VERIFY_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, verify_sms)],
+        VERIFY_CODE: [
+            CallbackQueryHandler(registration_otp_telegram, pattern="^reg_otp_telegram$"),
+            CallbackQueryHandler(registration_otp_resend_sms, pattern="^reg_otp_resend_sms$"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, verify_sms),
+        ],
     },
     fallbacks=[CommandHandler("cancel", cancel_registration)]
 )

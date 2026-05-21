@@ -16,12 +16,20 @@ from keyboards.menus import (
     main_menu_inline_keyboard,
 )
 from config.settings import ADVERT_CHANNEL_ID, CHANNEL_USERNAME
+from utils.channel_format import format_channel_ad_footer
 from database.db import get_user, get_db
 from state import user_data_store
 from utils.telegram_utils import remember_cleanup_id, cleanup_ids, send_or_replace_main_menu
 from utils.euro_fees import format_fee_eur as _format_fee_eur
 from handlers.offers import offer_proposal_inline_button
 from utils.channel_format import format_payment_methods_rtl as _format_methods_rtl
+from utils.channel_membership import (
+    channel_membership_required_html,
+    ensure_advert_channel_member,
+    channel_membership_keyboard,
+)
+from utils.channel_ad_publish import try_open_telegram_url
+
 _EURO_CLEANUP_KEY = "euro_cleanup_message_ids"
 
 
@@ -314,8 +322,8 @@ async def preview_advert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🧾 <b>کارمزد معامله:</b> {_format_fee_eur(amount)}\n\n"
         f"{_channel_country_html(account_country, operation=operation)}"
         f"{_format_optional_line('⚡ <b>امکان واریز آنی:</b>', instant_transfer)}"
-        f"📄 <b>توضیحات:</b> {desc}\n\n"
-        f"🤖 <b>ربات:</b> @{(await context.bot.get_me()).username}\n"
+        f"📄 <b>توضیحات:</b> {desc}"
+        f"{format_channel_ad_footer(bot_username=(await context.bot.get_me()).username)}"
     )
 
     sent_preview = await msg.reply_text(
@@ -343,6 +351,29 @@ async def confirm_and_post_advert(update: Update, context: ContextTypes.DEFAULT_
         owner_id = int(owner_id)
     except (TypeError, ValueError):
         owner_id = int(user_id)
+
+    member_ok, _ = await ensure_advert_channel_member(context.bot, owner_id)
+    if not member_ok:
+        kb = channel_membership_keyboard()
+        member_err = channel_membership_required_html(at_confirm_step=True)
+        try:
+            await query.edit_message_text(
+                member_err,
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+            context.user_data["channel_member_block_mid"] = query.message.message_id
+        except Exception:
+            sent = await context.bot.send_message(
+                chat_id=chat_id,
+                text=member_err,
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+            context.user_data["channel_member_block_mid"] = sent.message_id
+        return
 
     amount = context.user_data.get('euro_amount')
     rate = context.user_data.get('euro_rate')
@@ -384,8 +415,8 @@ async def confirm_and_post_advert(update: Update, context: ContextTypes.DEFAULT_
         f"🧾 <b>کارمزد معامله:</b> {_format_fee_eur(amount)}\n\n"
         f"{_channel_country_html(account_country, operation=operation)}"
         f"{_format_optional_line('⚡ <b>امکان واریز آنی:</b>', instant_transfer)}"
-        f"📄 <b>توضیحات:</b> {desc}\n\n"
-        f"🤖 <b>ربات:</b> @{bot_uname}\n"
+        f"📄 <b>توضیحات:</b> {desc}"
+        f"{format_channel_ad_footer(bot_username=bot_uname)}"
     )
 
     real_link = ""
@@ -464,17 +495,15 @@ async def confirm_and_post_advert(update: Update, context: ContextTypes.DEFAULT_
         await query.message.delete()
     except Exception:
         pass
+    await try_open_telegram_url(query, real_link)
+
     rm = admin_home_inline_keyboard() if admin_posting else main_menu_inline_keyboard
-    ok_msg = (
-        "✅ آگهی با موفقیت در کانال منتشر شد.\n"
-        f'🔗 <a href="{real_link}">مشاهدهٔ پست در کانال</a>'
-    )
     await send_or_replace_main_menu(
         context.bot,
         chat_id=chat_id,
         user_id=user_id,
         store=user_data_store,
-        text=ok_msg,
+        text="✅ آگهی در کانال منتشر شد.",
         reply_markup=rm,
         parse_mode=ParseMode.HTML,
     )

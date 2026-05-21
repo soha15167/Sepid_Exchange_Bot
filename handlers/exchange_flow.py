@@ -17,10 +17,17 @@ from keyboards.menus import (
 )
 from handlers.euro_flow import resolve_channel_advert_identity
 from config.settings import ADVERT_CHANNEL_ID, CHANNEL_USERNAME
+from utils.channel_format import format_channel_ad_footer
 from database.db import get_db
 from utils.telegram_utils import remember_cleanup_id, cleanup_ids, send_or_replace_main_menu
 from utils.euro_fees import format_fee_eur as _format_fee_eur
 from handlers.offers import offer_proposal_inline_button
+from utils.channel_membership import (
+    channel_membership_required_html,
+    ensure_advert_channel_member,
+    channel_membership_keyboard,
+)
+from utils.channel_ad_publish import try_open_telegram_url
 
 
 _EXCHANGE_CLEANUP_KEY = "exchange_cleanup_message_ids"
@@ -356,8 +363,8 @@ async def handle_exchange_description(update: Update, context: ContextTypes.DEFA
         f"{rtl_city_ir_line}\n\n"
         f"📦 <b>{'روش دریافت' if side == 'خرید' else 'روش تحویل'}:</b> {method}\n"
         f"{instant_line}\n"
-        f"📄 <b>توضیحات:</b> {desc}\n\n"
-        f"🤖 <b>ربات:</b> @{(await context.bot.get_me()).username}\n"
+        f"📄 <b>توضیحات:</b> {desc}"
+        f"{format_channel_ad_footer(bot_username=(await context.bot.get_me()).username, euro_exchange_no_rate=True)}"
     )
 
     sent = await context.bot.send_message(
@@ -383,6 +390,29 @@ async def handle_confirm_exchange(update: Update, context: ContextTypes.DEFAULT_
         owner_id = int(owner_id)
     except (TypeError, ValueError):
         owner_id = int(user_id)
+
+    member_ok, _ = await ensure_advert_channel_member(context.bot, owner_id)
+    if not member_ok:
+        kb = channel_membership_keyboard()
+        member_err = channel_membership_required_html(at_confirm_step=True)
+        try:
+            await query.edit_message_text(
+                member_err,
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+            context.user_data["channel_member_block_mid"] = query.message.message_id
+        except Exception:
+            sent = await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=member_err,
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+            context.user_data["channel_member_block_mid"] = sent.message_id
+        return
 
     side = _get_exchange_side(user_id, context)
     method = context.user_data.get("exchange_method", "-")
@@ -434,8 +464,8 @@ async def handle_confirm_exchange(update: Update, context: ContextTypes.DEFAULT_
         f"{rtl_city_ir_line}\n\n"
         f"📦 <b>{'روش دریافت' if side == 'خرید' else 'روش تحویل'}:</b> {method}\n"
         f"{instant_line}\n"
-        f"📄 <b>توضیحات:</b> {desc}\n\n"
-        f"🤖 <b>ربات:</b> @{bot_uname}\n"
+        f"📄 <b>توضیحات:</b> {desc}"
+        f"{format_channel_ad_footer(bot_username=bot_uname, euro_exchange_no_rate=True)}"
     )
 
     chat_id = query.message.chat_id
@@ -510,17 +540,15 @@ async def handle_confirm_exchange(update: Update, context: ContextTypes.DEFAULT_
         await query.message.delete()
     except Exception:
         pass
+    await try_open_telegram_url(query, real_link)
+
     rm = admin_home_inline_keyboard() if admin_posting else main_menu_inline_keyboard
-    ok_msg = (
-        "✅ آگهی با موفقیت در کانال منتشر شد.\n"
-        f'🔗 <a href="{real_link}">مشاهدهٔ پست در کانال</a>'
-    )
     await send_or_replace_main_menu(
         context.bot,
         chat_id=chat_id,
         user_id=user_id,
         store=user_data_store,
-        text=ok_msg,
+        text="✅ آگهی در کانال منتشر شد.",
         reply_markup=rm,
         parse_mode=ParseMode.HTML,
     )

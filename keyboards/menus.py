@@ -155,6 +155,12 @@ terms_inline_keyboard = InlineKeyboardMarkup([
     [InlineKeyboardButton(TERMS_DECLINE_BUTTON_TEXT, callback_data="terms_decline")],
 ])
 
+# وقتی پیامک نرسید — کاربر خودش درخواست کد در تلگرام می‌دهد
+registration_otp_fallback_keyboard = InlineKeyboardMarkup([
+    [InlineKeyboardButton("📲 ارسال کد در تلگرام", callback_data="reg_otp_telegram")],
+    [InlineKeyboardButton("🔄 ارسال مجدد پیامک", callback_data="reg_otp_resend_sms")],
+])
+
 services_keyboard = ReplyKeyboardMarkup([
     ["💶 خرید/فروش یورو"],
     ["🔒 اشتراک VPN ایران"],

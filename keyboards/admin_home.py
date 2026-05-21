@@ -41,6 +41,7 @@ def admin_home_inline_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("⛔️ غیرفعال کردن ربات", callback_data="adm|bot0"),
                 InlineKeyboardButton("✅ فعال کردن ربات", callback_data="adm|bot1"),
             ],
+            [InlineKeyboardButton("📊 ارسال نرخ بن‌بست در کانال", callback_data="adm|brate")],
             [InlineKeyboardButton("🔄 ری‌استارت سرویس ربات (سرور)", callback_data="adm|rsvc")],
             [InlineKeyboardButton("🏠 بازگشت به منوی اصلی کاربر", callback_data="adm|exit")],
         ]

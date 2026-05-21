@@ -245,6 +245,35 @@ async def handle_service_operation_callback(update: Update, context: ContextType
     else:
         return
 
+    if user_id not in set(ADMIN_IDS or []):
+        from utils.channel_membership import (
+            ensure_advert_channel_member,
+            channel_membership_keyboard,
+        )
+
+        ok, err = await ensure_advert_channel_member(context.bot, user_id)
+        if not ok:
+            try:
+                await query.answer(
+                    "ابتدا عضو کانال شوید، بعد «عضو شدم — بازگشت به منو».",
+                    show_alert=True,
+                )
+            except Exception:
+                pass
+            kb = channel_membership_keyboard()
+            if query.message and err:
+                try:
+                    sent = await query.message.reply_text(
+                        err,
+                        parse_mode="HTML",
+                        reply_markup=kb,
+                        disable_web_page_preview=True,
+                    )
+                    context.user_data["channel_member_block_mid"] = sent.message_id
+                except Exception:
+                    pass
+            return
+
     user_data_store[user_id]["operation"] = operation
     user_data_store[user_id]["methods"] = []
     context.user_data['state'] = UserState.SERVICE_SELECTION.name
