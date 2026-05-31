@@ -1381,6 +1381,7 @@ async def _on_both_yes(
     _cancel_gate_reminder_jobs(context, offer_id)
     try:
         from handlers.offers import clear_offer_flow_user_data
+        from utils.telegram_utils import reset_flow_user_bucket
 
         for party_uid in (buyer_id, seller_id):
             if not party_uid:
@@ -1394,6 +1395,7 @@ async def _on_both_yes(
                     party_uid,
                     offer_id,
                 )
+            reset_flow_user_bucket(user_data_store, int(party_uid))
     except Exception:
         logger.exception("deal_gate: clear offer flow failed offer=%s", offer_id)
     for uid, is_buyer in (
@@ -1759,9 +1761,9 @@ async def deal_gate_accounts_photo_router(
     gate = deal_gate_active_for_user(uid)
     if not gate or (gate.get("gate_status") or "").strip().lower() != "accounts":
         return
-    from utils.flow_guards import user_advert_offer_wizard_text_step
+    from utils.flow_guards import user_offer_wizard_text_step
 
-    if user_advert_offer_wizard_text_step(context):
+    if user_offer_wizard_text_step(context):
         return
     from handlers.iran_panel_sync import is_awaiting_iran_panel_field
 
@@ -1955,9 +1957,14 @@ async def deal_gate_accounts_router(
     gate = deal_gate_active_for_user(uid)
     if not gate or (gate.get("gate_status") or "").strip().lower() != "accounts":
         return
-    from utils.flow_guards import user_advert_offer_wizard_text_step
+    from utils.flow_guards import user_offer_wizard_text_step
 
-    if user_advert_offer_wizard_text_step(context):
+    if user_offer_wizard_text_step(context):
+        logger.info(
+            "deal_gate: skip text uid=%s offer=%s — offer wizard text step",
+            uid,
+            gate.get("offer_id"),
+        )
         return
     from handlers.iran_panel_sync import is_awaiting_iran_panel_field
 
@@ -1988,6 +1995,14 @@ async def deal_gate_accounts_router(
         await update.message.reply_text(f"{_RTL}اطلاعات حساب شما قبلاً ثبت شده.")
         raise ApplicationHandlerStop
 
+    logger.info(
+        "deal_gate: text account uid=%s offer=%s party=%s state=%r len=%s",
+        uid,
+        oid,
+        party,
+        context.user_data.get("state"),
+        len(text),
+    )
     await _commit_party_account(
         context,
         gate=gate,

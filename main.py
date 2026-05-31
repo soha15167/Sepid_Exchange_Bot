@@ -254,7 +254,20 @@ async def wizard_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if await ensure_registered_or_redirect(update, context):
         raise ApplicationHandlerStop
 
-    from utils.flow_guards import user_advert_offer_wizard_active
+    from database.db import deal_gate_active_for_user
+    from utils.flow_guards import (
+        user_advert_offer_wizard_active,
+        user_offer_wizard_text_step,
+    )
+
+    uid = update.effective_user.id if update.effective_user else None
+    if uid and deal_gate_active_for_user(uid) and not user_offer_wizard_text_step(context):
+        logger.info(
+            "wizard_text: defer uid=%s state=%r — deal_gate account collection",
+            uid,
+            context.user_data.get("state"),
+        )
+        return
 
     flow_active = user_advert_offer_wizard_active(context)
     if not flow_active:
@@ -756,7 +769,7 @@ def main():
     # بعد از شروع
     async def post_init(app):
         logger.info(
-            "flow_routing: wizard_first_v5 (advert/offer before deal_gate accounts)"
+            "flow_routing: wizard_first_v6 (deal_gate beats euro advert wizard)"
         )
         await auto_start_notify(app)
         _setup_bonbast_daily_job(app)

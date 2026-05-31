@@ -29,6 +29,24 @@ _WIZARD_TEXT_OFFER_STEPS = frozenset(
     {"counter_euro", "rate", "account_country", "description"}
 )
 
+_OFFER_TEXT_STATES = frozenset(
+    s
+    for s in _WIZARD_TEXT_STATES
+    if s.startswith("OFFER_")
+)
+
+
+def user_offer_wizard_text_step(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Typed-input steps in offer flow only (not euro advert posting)."""
+    ud = context.user_data
+    if not ud:
+        return False
+    state = (ud.get("state") or "").strip()
+    if state in _OFFER_TEXT_STATES:
+        return True
+    step = (ud.get("offer_flow_step") or "").strip()
+    return step in _WIZARD_TEXT_OFFER_STEPS
+
 
 def user_advert_offer_wizard_text_step(context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
