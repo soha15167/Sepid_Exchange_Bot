@@ -19,8 +19,10 @@ from telegram.ext import (
     JobQueue,
     filters,
     ContextTypes,
+    ApplicationHandlerStop,
 )
 from telegram import BotCommand, BotCommandScopeChat, Update
+from telegram.constants import ChatType
 import logging
 import sys
 from datetime import time
@@ -76,7 +78,14 @@ from handlers.admin import (
     admin_exchange_edit_callback,
     admin_dashboard_callback,
     admin_neg_ad_command,
-    _recover_admin_wizard_state,
+)
+from handlers.bank_cards import admin_cards_command, bank_cards_callback
+from handlers.iran_panel_sync import (
+    iran_panel_fill_router,
+    iran_panel_sync_router,
+    iran_panel_tx_callback,
+    txin_command,
+    txout_command,
 )
 from database.db import get_user
 from database.db import ensure_schema
@@ -98,9 +107,11 @@ from handlers.offers import (
     handle_offer_gate_back,
     handle_offer_rate_message,
     handle_offer_rate_cancel,
+    handle_offer_back_euro_amount,
     handle_offer_description_message,
     handle_offer_account_country_message,
     handle_offer_preview_idle_message,
+    route_offer_flow_message,
     handle_offer_final_confirm,
     handle_offer_final_cancel,
     handle_offer_desc_cancel,
@@ -115,6 +126,7 @@ from handlers.offers import (
     handle_my_offers_callback,
     handle_my_offers_reply_message,
     handle_my_offers_close,
+    handle_my_offers_page_callback,
     handle_offer_proposer_edit_start,
     handle_offer_edit_rate_message,
     _pop_offer_draft_keys,
@@ -126,14 +138,22 @@ from handlers.channel_info import (
     handle_main_rules_callback,
     handle_main_rules_reply_message,
 )
+from handlers.deal_gate import deal_gate_accounts_router, deal_gate_callback
 from handlers.error_handler import global_error_handler
-from handlers.access_gate import restricted_user_gate, unregistered_user_gate
+from handlers.access_gate import (
+    bot_disabled_gate,
+    ensure_registered_or_redirect,
+    restricted_user_gate,
+    unregistered_user_gate,
+)
 from handlers.user_adverts import (
     handle_main_my_adverts_callback,
     handle_main_my_adverts_message,
     handle_user_adv_callback,
+    handle_user_adv_find_message,
     handle_user_own_advert_edit_message,
 )
+from handlers.misc_callbacks import handle_bot_closed_callback, handle_noop_callback
 
 
 # بررسی وضعیت جاری و هدایت مرحله‌ای
@@ -149,22 +169,85 @@ def is_exchange_state(state):
     ]
 
 
+async def wizard_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    ثبت آگهی / پیشنهاد / معاوضه — قبل از deal_gate تا state پاک نشود.
+    """
+    if not update.effective_chat or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    if not update.message or context.user_data is None:
+        return
+    if await ensure_registered_or_redirect(update, context):
+        raise ApplicationHandlerStop
+
+    from utils.flow_guards import user_advert_offer_wizard_active
+
+    if not user_advert_offer_wizard_active(context):
+        return
+
+    state = context.user_data.get("state")
+    handled = False
+
+    if state == UserState.EURO_AMOUNT.name:
+        await ask_euro_rate(update, context)
+        handled = True
+    elif state == UserState.EURO_RATE.name:
+        await ask_euro_description(update, context)
+        handled = True
+    elif state == UserState.EURO_ACCOUNT_COUNTRY.name:
+        await handle_account_country(update, context)
+        handled = True
+    elif state == UserState.EURO_DESCRIPTION.name:
+        await preview_advert(update, context)
+        handled = True
+    elif is_exchange_state(state):
+        if state == UserState.EXCHANGE_AMOUNT.name:
+            await handle_exchange_amount(update, context)
+            handled = True
+        elif state == UserState.EXCHANGE_COUNTRY_INT.name:
+            await handle_exchange_country_int(update, context)
+            handled = True
+        elif state == UserState.EXCHANGE_CITY_INT.name:
+            await handle_exchange_city_int(update, context)
+            handled = True
+        elif state == UserState.EXCHANGE_CITY_IR.name:
+            await handle_exchange_city_ir(update, context)
+            handled = True
+        elif state == UserState.EXCHANGE_DESCRIPTION.name:
+            await handle_exchange_description(update, context)
+            handled = True
+    elif await route_offer_flow_message(update, context):
+        handled = True
+    elif state == UserState.OFFER_EDIT_RATE.name:
+        await handle_offer_edit_rate_message(update, context)
+        handled = True
+
+    if handled:
+        logger.info(
+            "wizard_text: uid=%s state=%r handled",
+            update.effective_user.id if update.effective_user else None,
+            state,
+        )
+        raise ApplicationHandlerStop
+
+
 async def euro_flow_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     EN: Routes TEXT messages by UserState (euro, exchange, offer, admin, negotiation).
     FA: هدایت پیام متنی بر اساس state کاربر.
     """
+    if not update.effective_chat or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    if context.user_data is None:
+        return
+    if await ensure_registered_or_redirect(update, context):
+        return
     u = update.effective_user
-    if u and u.id in set(ADMIN_IDS or []):
-        try:
-            _recover_admin_wizard_state(u.id, context)
-        except Exception:
-            pass
     state = context.user_data.get("state")
     msg = update.message
     if msg and reply_menu_text_matches(MY_ADVERTS_REPLY_BUTTON_TEXT, msg.text or ""):
         return await handle_main_my_adverts_message(update, context)
-    if msg and reply_menu_text_matches("🚀 ثبت درخواست خدمات", msg.text or ""):
+    if msg and reply_menu_text_matches("🚀 درخواست خدمات", msg.text or ""):
         return await show_services_menu(update, context)
     if msg and reply_menu_text_matches(MY_OFFERS_REPLY_BUTTON_TEXT, msg.text or ""):
         return await handle_my_offers_reply_message(update, context)
@@ -172,29 +255,17 @@ async def euro_flow_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await handle_main_rules_reply_message(update, context)
     if msg and reply_menu_text_matches(FEE_INFO_REPLY_BUTTON_TEXT, msg.text or ""):
         return await handle_main_fees_reply_message(update, context)
+    if context.user_data.get("user_adv_find_prompt"):
+        return await handle_user_adv_find_message(update, context)
     if state == UserState.USER_EDIT_OWN_ADVERT.name:
         return await handle_user_own_advert_edit_message(update, context)
 
-    if state == UserState.EURO_AMOUNT.name:
-        return await ask_euro_rate(update, context)
-    elif state == UserState.EURO_RATE.name:
-        return await ask_euro_description(update, context)
-    elif state == UserState.EURO_ACCOUNT_COUNTRY.name:
-        return await handle_account_country(update, context)
-    elif state == UserState.EURO_DESCRIPTION.name:
-        return await preview_advert(update, context)
-    elif is_exchange_state(state):
-        if state == UserState.EXCHANGE_AMOUNT.name:
-            return await handle_exchange_amount(update, context)
-        elif state == UserState.EXCHANGE_COUNTRY_INT.name:
-            return await handle_exchange_country_int(update, context)
-        elif state == UserState.EXCHANGE_CITY_INT.name:
-            return await handle_exchange_city_int(update, context)
-        elif state == UserState.EXCHANGE_CITY_IR.name:
-            return await handle_exchange_city_ir(update, context)
-        elif state == UserState.EXCHANGE_DESCRIPTION.name:
-            return await handle_exchange_description(update, context)
-    elif state == UserState.NEGOTIATION.name:
+    from database.db import deal_gate_active_for_user
+
+    if u and deal_gate_active_for_user(u.id):
+        return
+
+    if state == UserState.NEGOTIATION.name:
         return await handle_negotiation_message(update, context)
     elif state == UserState.NEGOTIATION_GATE.name:
         if update.message and update.message.text:
@@ -202,30 +273,29 @@ async def euro_flow_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "\u200fلطفاً با دکمهٔ «ارسال پیام» یا «انصراف» ادامه دهید."
             )
         return
-    elif context.user_data.get("offer_advert_id") is not None:
-        offer_step = context.user_data.get("offer_flow_step")
-        if offer_step == "counter_euro":
-            return await handle_offer_counter_amount_message(update, context)
-        if offer_step == "rate":
-            return await handle_offer_rate_message(update, context)
-        if offer_step == "account_country":
-            return await handle_offer_account_country_message(update, context)
-        if offer_step == "description":
-            return await handle_offer_description_message(update, context)
-        if offer_step == "preview":
-            return await handle_offer_preview_idle_message(update, context)
-    elif state == UserState.OFFER_ACCOUNT_COUNTRY.name:
-        return await handle_offer_account_country_message(update, context)
-    elif state == UserState.OFFER_COUNTER_EURO.name:
-        return await handle_offer_counter_amount_message(update, context)
-    elif state == UserState.OFFER_RATE.name:
-        return await handle_offer_rate_message(update, context)
-    elif state == UserState.OFFER_DESCRIPTION.name:
-        return await handle_offer_description_message(update, context)
-    elif state == UserState.OFFER_PREVIEW.name:
-        return await handle_offer_preview_idle_message(update, context)
+    elif await route_offer_flow_message(update, context):
+        return
     elif state == UserState.OFFER_EDIT_RATE.name:
         return await handle_offer_edit_rate_message(update, context)
+
+    if not msg or not msg.text:
+        return
+    from handlers.admin import _admin_should_skip_wizard_recovery
+
+    uid = u.id if u else None
+    if _admin_should_skip_wizard_recovery(context):
+        offer_step = (context.user_data.get("offer_flow_step") or "").strip()
+        logger.warning(
+            "flow_route: unhandled uid=%s state=%r offer_step=%r text=%r",
+            uid,
+            state,
+            offer_step,
+            (msg.text or "")[:60],
+        )
+        extra = f"\n(state={state or '—'})" if uid in set(ADMIN_IDS or []) else ""
+        await msg.reply_text(
+            f"\u200f⚠️ مرحلهٔ فلو شناخته نشد — /menu بزنید و دوباره شروع کنید.{extra}"
+        )
 
 
 # مشاهده پروفایل
@@ -248,12 +318,14 @@ async def show_user_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Force LTR display so leading '+' and '@' stay at left.
     phone_display = f"\u200e{phone_raw}"
     username_display = f"\u200e{username_raw}"
+    display_name = (db_user.get("display_name") or "").strip() or "—"
 
     profile_text = f"""
 👤 <b>مشخصات کاربر:</b>
 
 🆔 <b>آیدی عددی:</b> {tg_user.id}
 👨‍💼 <b>نام:</b> {db_user.get('full_name', '---')} {db_user.get('last_name', '')}
+🏷️ <b>نام نمایشی در آگهی:</b> {display_name}
 📧 <b>ایمیل:</b> {db_user.get('email', '---')}
 🏠 <b>آدرس:</b> {db_user.get('address', '---')}
 📱 <b>شماره:</b> <code>{phone_display}</code>
@@ -312,8 +384,42 @@ def _create_application() -> Application:
 
 
 async def auto_start_notify(application: Application):
+    from config.settings import ADMIN_IDS, ADMIN_NOTIFY_CHAT_IDS
+
     bot_info = await application.bot.get_me()
     print(f"✅ ربات آماده‌ست: @{bot_info.username}")
+    print(f"✅ deal-admin notify: users={ADMIN_IDS} extra_chats={ADMIN_NOTIFY_CHAT_IDS or '—'}")
+    try:
+        from handlers.offers import OFFER_RATE_REJECTION_BUILD
+
+        print(f"✅ offer rate rejection build: {OFFER_RATE_REJECTION_BUILD}")
+    except Exception:
+        pass
+
+
+def _setup_daily_admin_report_job(application: Application) -> None:
+    from config.settings import DAILY_REPORT_ENABLED, DAILY_REPORT_HOUR, DAILY_REPORT_MINUTE
+    from handlers.daily_report import post_daily_admin_report
+
+    if not DAILY_REPORT_ENABLED:
+        return
+    if not application.job_queue:
+        return
+    when = time(
+        hour=DAILY_REPORT_HOUR,
+        minute=DAILY_REPORT_MINUTE,
+        tzinfo=ZoneInfo("Asia/Tehran"),
+    )
+    application.job_queue.run_daily(
+        post_daily_admin_report,
+        time=when,
+        name="daily_admin_report",
+    )
+    logger.info(
+        "Daily admin report at %02d:%02d Asia/Tehran",
+        DAILY_REPORT_HOUR,
+        DAILY_REPORT_MINUTE,
+    )
 
 
 def _setup_bonbast_daily_job(application: Application) -> None:
@@ -354,6 +460,9 @@ async def _set_bot_command_menus(bot) -> None:
     admin_cmds = public_cmds + [
         BotCommand("admin", "پنل مدیریت"),
         BotCommand("post_rates", "ارسال نرخ بن‌بست در کانال"),
+        BotCommand("cards", "کارت‌های بانکی (قابل کپی)"),
+        BotCommand("txin", "ثبت ورودی در سایت ایران"),
+        BotCommand("txout", "ثبت خروجی در سایت ایران"),
     ]
     await bot.set_my_commands(public_cmds)
     for admin_id in set(ADMIN_IDS or []):
@@ -439,15 +548,20 @@ def main():
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
+    from utils.app_logging import setup_app_logging
+
+    setup_app_logging()
     print("🚀 بوت رباط در حال اجراست...")
-    # Ensure DB columns exist for newest features.
     try:
         ensure_schema()
+        logging.getLogger(__name__).info("ensure_schema completed")
     except Exception:
-        pass
+        logging.getLogger(__name__).exception("ensure_schema failed")
     application = _create_application()
 
-    # Group -1: access gates / گیت محدودیت و ثبت‌نام
+    # Group -1: access gates / گیت غیرفعال بودن، محدودیت و ثبت‌نام
+    application.add_handler(MessageHandler(filters.ALL, bot_disabled_gate), group=-1)
+    application.add_handler(CallbackQueryHandler(bot_disabled_gate), group=-1)
     application.add_handler(MessageHandler(filters.ALL, restricted_user_gate), group=-1)
     application.add_handler(CallbackQueryHandler(restricted_user_gate), group=-1)
     application.add_handler(MessageHandler(filters.ALL, unregistered_user_gate), group=-1)
@@ -459,6 +573,9 @@ def main():
     application.add_handler(CommandHandler("admin", admin_entry))
     application.add_handler(CommandHandler("neg_ad", admin_neg_ad_command))
     application.add_handler(CommandHandler("post_rates", admin_post_bonbast_rates_cmd))
+    application.add_handler(CommandHandler("cards", admin_cards_command))
+    application.add_handler(CommandHandler("txin", txin_command))
+    application.add_handler(CommandHandler("txout", txout_command))
     # Inline start/terms (prevents user-message spam)
     application.add_handler(CallbackQueryHandler(handle_channel_member_ack, pattern="^ch_member_ok$"))
     # terms_accept / start_begin → registration_handler
@@ -475,6 +592,9 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_main_fees_callback, pattern=r"^main_fees$"))
     application.add_handler(CallbackQueryHandler(handle_info_close_callback, pattern=r"^info_close$"))
     application.add_handler(CallbackQueryHandler(handle_user_adv_callback, pattern=r"^user_adv\|"))
+    application.add_handler(CallbackQueryHandler(handle_bot_closed_callback, pattern=r"^bot_closed$"))
+    application.add_handler(CallbackQueryHandler(handle_noop_callback, pattern=r"^pg\|noop$"))
+    application.add_handler(CallbackQueryHandler(handle_my_offers_page_callback, pattern=r"^my_off\|p\|\d+$"))
     application.add_handler(CallbackQueryHandler(handle_services_menu_callback, pattern="^svc_"))
 
     # دکمه‌های انصراف و بازگشت
@@ -487,22 +607,37 @@ def main():
     # (Service selection is inline now)
 
     # ورود مرحله‌ای اطلاعات یورو / معاوضه
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, euro_flow_router), group=0)
+    _private_text = filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND
+    _iran_fill_text = filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND
+    _iran_txn = filters.ChatType.PRIVATE & ~filters.COMMAND
+    application.add_handler(MessageHandler(_private_text, wizard_text_router), group=0)
+    application.add_handler(MessageHandler(_private_text, deal_gate_accounts_router), group=0)
+    application.add_handler(MessageHandler(_private_text, euro_flow_router), group=0)
+    application.add_handler(MessageHandler(_iran_fill_text, iran_panel_fill_router), group=0)
+    application.add_handler(MessageHandler(_iran_txn, iran_panel_sync_router), group=0)
     # Admin panel: run in later group to avoid hijacking normal flows
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_router), group=1)
+    application.add_handler(CallbackQueryHandler(iran_panel_tx_callback, pattern=r"^tx\|"))
+    application.add_handler(CallbackQueryHandler(deal_gate_callback, pattern=r"^(deal\||adm\|dg\|)"))
+    application.add_handler(MessageHandler(_private_text, admin_router), group=1)
 
     # تایید نهایی آگهی
     application.add_handler(CallbackQueryHandler(confirm_and_post_advert, pattern="^confirm_advert$"))
     application.add_handler(CallbackQueryHandler(handle_instant_transfer_callback, pattern="^instant_"))
 
     # معاوضه یورو به یورو
-    application.add_handler(MessageHandler(filters.Regex("^💱 معاوضه Euro به Euro$"), start_exchange_flow))
+    application.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & filters.Regex("^💱 معاوضه Euro به Euro$"),
+            start_exchange_flow,
+        )
+    )
     application.add_handler(CallbackQueryHandler(handle_exchange_instant_transfer_callback, pattern="^exchange_instant_"))
     application.add_handler(CallbackQueryHandler(handle_exchange_choice, pattern="^exchange_(can_transfer|no_transfer)$"))
     application.add_handler(CallbackQueryHandler(handle_confirm_exchange, pattern="^confirm_exchange$"))
     application.add_handler(CallbackQueryHandler(handle_service_operation_callback, pattern="^service_op_"))
     application.add_handler(CallbackQueryHandler(handle_inline_cancel_callback, pattern="^inline_cancel$"))
     application.add_handler(CallbackQueryHandler(admin_dashboard_callback, pattern=r"^adm\|"))
+    application.add_handler(CallbackQueryHandler(bank_cards_callback, pattern=r"^cards\|"))
     application.add_handler(
         CallbackQueryHandler(
             admin_add_user_otp_callback,
@@ -521,6 +656,7 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_offer_gate_custom, pattern=r"^offer_gate_custom\|\d+$"))
     application.add_handler(CallbackQueryHandler(handle_offer_gate_back, pattern=r"^offer_gate_back\|\d+$"))
     application.add_handler(CallbackQueryHandler(handle_offer_rate_cancel, pattern=r"^offer_rate_cancel\|\d+$"))
+    application.add_handler(CallbackQueryHandler(handle_offer_back_euro_amount, pattern=r"^offer_back_euro\|\d+$"))
     application.add_handler(CallbackQueryHandler(handle_offer_desc_cancel, pattern=r"^offer_desc_cancel\|\d+$"))
     application.add_handler(CallbackQueryHandler(handle_offer_country_cancel, pattern=r"^offer_country_cancel\|\d+$"))
     application.add_handler(CallbackQueryHandler(handle_offer_final_confirm, pattern=r"^offer_final_confirm$"))
@@ -552,6 +688,7 @@ def main():
     async def post_init(app):
         await auto_start_notify(app)
         _setup_bonbast_daily_job(app)
+        _setup_daily_admin_report_job(app)
         try:
             await _set_bot_command_menus(app.bot)
         except Exception:

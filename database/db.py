@@ -10,10 +10,13 @@ FA:
   «شماره آگهی» در کانال = `rowid` جدول euro_adverts.
 """
 
+import logging
 import sqlite3
 import time
-from config.settings import DB_PATH
+from config.settings import DB_PATH, LIST_RECENT_LIMIT
 from contextlib import contextmanager
+
+_logger = logging.getLogger(__name__)
 
 # --- Schema helpers / کمک‌تابع‌های ساختار ---
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -54,6 +57,13 @@ def ensure_schema() -> None:
             cur.execute("ALTER TABLE users ADD COLUMN is_restricted INTEGER DEFAULT 0")
         if "restricted_until" not in cols:
             cur.execute("ALTER TABLE users ADD COLUMN restricted_until INTEGER")
+        cols = _table_columns(conn, "users")
+        if "created_at" not in cols:
+            cur.execute("ALTER TABLE users ADD COLUMN created_at TEXT")
+            cur.execute(
+                "UPDATE users SET created_at = datetime('now') "
+                "WHERE created_at IS NULL OR TRIM(COALESCE(created_at, '')) = ''"
+            )
 
         # Unique index for display_name (case-insensitive), allows NULLs.
         cur.execute(
@@ -131,6 +141,31 @@ def ensure_schema() -> None:
             """
         )
         cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('bot_enabled', '1')")
+        cur.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('channel_post_template_v', '2')"
+        )
+
+        _ensure_admin_audit_log_table(conn)
+
+        # پیام‌های DM قابل حذف (بین ری‌استارت‌ها برای پاک‌سازی ثبت‌نام)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dm_trackable_messages (
+                telegram_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                PRIMARY KEY (telegram_id, message_id)
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dm_main_menu_anchors (
+                telegram_id INTEGER PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL
+            )
+            """
+        )
 
         # --- پیشنهاد نرخ به آگهی (کانال) ---
         cur.execute(
@@ -251,6 +286,41 @@ def ensure_schema() -> None:
             "CREATE INDEX IF NOT EXISTS idx_offer_neg_lines_offer ON offer_negotiation_lines(offer_id)"
         )
 
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS offer_deal_gates (
+                offer_id INTEGER PRIMARY KEY,
+                advert_rowid INTEGER NOT NULL,
+                buyer_telegram_id INTEGER NOT NULL,
+                seller_telegram_id INTEGER NOT NULL,
+                gate_status TEXT NOT NULL DEFAULT 'pending',
+                buyer_response TEXT,
+                seller_response TEXT,
+                buyer_confirmed_at INTEGER,
+                seller_confirmed_at INTEGER,
+                started_at INTEGER NOT NULL,
+                reminder_count INTEGER NOT NULL DEFAULT 0,
+                admin_escalated_at INTEGER,
+                admin_decision TEXT,
+                buyer_gate_mid INTEGER,
+                seller_gate_mid INTEGER,
+                buyer_accounts_text TEXT,
+                seller_accounts_text TEXT,
+                completed_at INTEGER,
+                admin_notify_mids TEXT
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_offer_deal_gates_advert ON offer_deal_gates(advert_rowid)"
+        )
+        try:
+            cur.execute(
+                "ALTER TABLE offer_deal_gates ADD COLUMN admin_notify_mids TEXT"
+            )
+        except Exception:
+            pass
+
         conn.commit()
 
 
@@ -329,28 +399,28 @@ def negotiation_transcript_list(offer_id: int) -> list[dict]:
     out: list[dict] = []
     for r in rows:
         fr = str(r["from_role"] or "").strip().lower()
-        if fr not in ("owner", "proposer"):
+        if fr not in ("owner", "proposer", "system", "admin", "buyer", "seller"):
             fr = "other"
         out.append({"from": fr, "text": r["body"]})
     return out
 
 
 def negotiation_transcript_append_line(
-    offer_id: int, from_role: str, text: str, *, max_lines: int = 40
+    offer_id: int, from_role: str, text: str, *, max_lines: int | None = None
 ) -> list[dict]:
-    """یک خط به متن مذاکره اضافه می‌کند؛ حداکثر max_lines خط نگه داشته می‌شود."""
+    """یک خط به آرشیو پیشنهاد/مذاکره/معامله اضافه می‌کند (پیش‌فرض: بدون حذف خطوط قدیمی)."""
     try:
         oid = int(offer_id)
     except (TypeError, ValueError):
         return []
     fr = (from_role or "").strip().lower()
-    if fr not in ("owner", "proposer"):
-        fr = "proposer"
-    t = (text or "").strip()[:1200]
+    allowed = ("owner", "proposer", "system", "admin", "buyer", "seller")
+    if fr not in allowed:
+        fr = "system"
+    t = (text or "").strip()[:4000]
     if not t:
         return negotiation_transcript_list(oid)
     now = int(time.time())
-    mx = max(1, min(int(max_lines), 200))
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
         cur.execute(
@@ -360,21 +430,23 @@ def negotiation_transcript_append_line(
             """,
             (oid, fr, t, now),
         )
-        cur.execute(
-            "SELECT COUNT(*) FROM offer_negotiation_lines WHERE offer_id = ?",
-            (oid,),
-        )
-        n = int(cur.fetchone()[0] or 0)
-        if n > mx:
-            excess = n - mx
+        if max_lines is not None and int(max_lines) > 0:
+            mx = max(1, min(int(max_lines), 500))
             cur.execute(
-                """
-                DELETE FROM offer_negotiation_lines WHERE id IN (
-                    SELECT id FROM offer_negotiation_lines WHERE offer_id = ? ORDER BY id ASC LIMIT ?
-                )
-                """,
-                (oid, excess),
+                "SELECT COUNT(*) FROM offer_negotiation_lines WHERE offer_id = ?",
+                (oid,),
             )
+            n = int(cur.fetchone()[0] or 0)
+            if n > mx:
+                excess = n - mx
+                cur.execute(
+                    """
+                    DELETE FROM offer_negotiation_lines WHERE id IN (
+                        SELECT id FROM offer_negotiation_lines WHERE offer_id = ? ORDER BY id ASC LIMIT ?
+                    )
+                    """,
+                    (oid, excess),
+                )
         conn.commit()
     return negotiation_transcript_list(oid)
 
@@ -395,7 +467,104 @@ def delete_user(telegram_id: int) -> bool:
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
         cur.execute("DELETE FROM users WHERE telegram_id = ?", (telegram_id,))
-        return cur.rowcount > 0
+        deleted = cur.rowcount > 0
+        if deleted:
+            cur.execute(
+                "DELETE FROM dm_trackable_messages WHERE telegram_id = ?",
+                (telegram_id,),
+            )
+            cur.execute(
+                "DELETE FROM dm_main_menu_anchors WHERE telegram_id = ?",
+                (telegram_id,),
+            )
+            conn.commit()
+        return deleted
+
+
+def record_dm_trackable_message(telegram_id: int, message_id: int | None) -> None:
+    if not message_id:
+        return
+    try:
+        tid, mid = int(telegram_id), int(message_id)
+    except (TypeError, ValueError):
+        return
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO dm_trackable_messages (telegram_id, message_id) VALUES (?, ?)",
+            (tid, mid),
+        )
+        conn.commit()
+
+
+def fetch_dm_trackable_messages(telegram_id: int) -> list[int]:
+    try:
+        tid = int(telegram_id)
+    except (TypeError, ValueError):
+        return []
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT message_id FROM dm_trackable_messages WHERE telegram_id = ?",
+            (tid,),
+        ).fetchall()
+    return [int(r[0]) for r in rows]
+
+
+def clear_dm_trackable_messages(telegram_id: int) -> None:
+    try:
+        tid = int(telegram_id)
+    except (TypeError, ValueError):
+        return
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "DELETE FROM dm_trackable_messages WHERE telegram_id = ?",
+            (tid,),
+        )
+        conn.commit()
+
+
+def save_main_menu_anchor(telegram_id: int, chat_id: int, message_id: int) -> None:
+    try:
+        tid, cid, mid = int(telegram_id), int(chat_id), int(message_id)
+    except (TypeError, ValueError):
+        return
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO dm_main_menu_anchors (telegram_id, chat_id, message_id)
+            VALUES (?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                chat_id = excluded.chat_id,
+                message_id = excluded.message_id
+            """,
+            (tid, cid, mid),
+        )
+        conn.commit()
+
+
+def fetch_main_menu_anchor(telegram_id: int) -> tuple[int, int] | None:
+    """(chat_id, message_id) or None."""
+    try:
+        tid = int(telegram_id)
+    except (TypeError, ValueError):
+        return None
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT chat_id, message_id FROM dm_main_menu_anchors WHERE telegram_id = ?",
+            (tid,),
+        ).fetchone()
+    if not row:
+        return None
+    return int(row[0]), int(row[1])
+
+
+def clear_main_menu_anchor(telegram_id: int) -> None:
+    try:
+        tid = int(telegram_id)
+    except (TypeError, ValueError):
+        return
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM dm_main_menu_anchors WHERE telegram_id = ?", (tid,))
+        conn.commit()
 
 
 def update_user_field(telegram_id: int, field: str, value: str | None) -> bool:
@@ -531,11 +700,207 @@ def set_setting(key: str, value: str) -> None:
         conn.commit()
 
 
-def search_users(query: str, limit: int = 20):
+def is_bot_enabled() -> bool:
+    """False وقتی ادمین ربات را از پنل غیرفعال کرده باشد."""
+    raw = (get_setting("bot_enabled", "1") or "1").strip().lower()
+    return raw in ("1", "true", "yes", "on", "enabled")
+
+
+def _ensure_admin_audit_log_table(conn: sqlite3.Connection | None = None) -> None:
+    """جدول لاگ ادمین — اگر سرور بدون ensure_schema قدیمی باشد، اینجا ساخته می‌شود."""
+    own_conn = conn is None
+    if own_conn:
+        conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admin_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_telegram_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                detail TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_admin_audit_created "
+            "ON admin_audit_log (created_at DESC)"
+        )
+        if own_conn:
+            conn.commit()
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def log_admin_action(
+    admin_telegram_id: int, action: str, detail: str | None = None
+) -> None:
+    try:
+        aid = int(admin_telegram_id)
+    except (TypeError, ValueError):
+        aid = 0
+    act = (action or "").strip()[:120]
+    if not act:
+        return
+    det = (detail or "").strip()[:2000] or None
+    try:
+        _ensure_admin_audit_log_table()
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                """
+                INSERT INTO admin_audit_log (admin_telegram_id, action, detail)
+                VALUES (?, ?, ?)
+                """,
+                (aid, act, det),
+            )
+            conn.commit()
+    except sqlite3.Error as exc:
+        _logger.warning("log_admin_action skipped: %s", exc)
+
+
+def count_users() -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT COUNT(*) FROM users").fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+def list_users_page(*, limit: int, offset: int) -> list[tuple]:
+    lim = max(1, min(int(limit), 50))
+    off = max(0, int(offset))
+    with sqlite3.connect(DB_PATH) as conn:
+        return conn.execute(
+            """
+            SELECT telegram_id, username, display_name, full_name, last_name,
+                   phone_number, email, address
+            FROM users
+            ORDER BY rowid DESC
+            LIMIT ? OFFSET ?
+            """,
+            (lim, off),
+        ).fetchall()
+
+
+def count_euro_adverts() -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT COUNT(*) FROM euro_adverts").fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+def list_euro_adverts_page(*, limit: int, offset: int) -> list[tuple]:
+    lim = max(1, min(int(limit), 50))
+    off = max(0, int(offset))
+    with sqlite3.connect(DB_PATH) as conn:
+        return conn.execute(
+            """
+            SELECT
+                a.rowid,
+                COALESCE(u.display_name, a.full_name) AS adv_name,
+                u.username,
+                a.euro_amount,
+                a.rate_toman,
+                a.operation
+            FROM euro_adverts a
+            LEFT JOIN users u ON u.telegram_id = a.user_id
+            ORDER BY a.rowid DESC
+            LIMIT ? OFFSET ?
+            """,
+            (lim, off),
+        ).fetchall()
+
+
+def list_recent_channel_advert_rowids(limit: int = 25) -> list[int]:
+    lim = max(1, min(int(limit), 80))
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            """
+            SELECT rowid FROM euro_adverts
+            WHERE channel_message_id IS NOT NULL
+              AND channel_chat_id IS NOT NULL
+            ORDER BY rowid DESC
+            LIMIT ?
+            """,
+            (lim,),
+        ).fetchall()
+    return [int(r[0]) for r in rows]
+
+
+def daily_stats_since_hours(hours: int = 24) -> dict:
+    """Counts for admin daily report (SQLite datetime)."""
+    h = max(1, min(int(hours), 168))
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        users_n = int(
+            cur.execute(
+                f"""
+                SELECT COUNT(*) FROM users
+                WHERE datetime(created_at) >= datetime('now', '-{h} hours')
+                """
+            ).fetchone()[0]
+            or 0
+        )
+        adverts_n = int(
+            cur.execute(
+                f"""
+                SELECT COUNT(*) FROM euro_adverts
+                WHERE datetime(created_at) >= datetime('now', '-{h} hours')
+                """
+            ).fetchone()[0]
+            or 0
+        )
+        offers_n = int(
+            cur.execute(
+                f"""
+                SELECT COUNT(*) FROM advert_offers
+                WHERE datetime(created_at) >= datetime('now', '-{h} hours')
+                """
+            ).fetchone()[0]
+            or 0
+        )
+        accepted_n = int(
+            cur.execute(
+                f"""
+                SELECT COUNT(*) FROM advert_offers
+                WHERE lower(trim(coalesce(status,''))) = 'accepted'
+                  AND datetime(created_at) >= datetime('now', '-{h} hours')
+                """
+            ).fetchone()[0]
+            or 0
+        )
+        total_users = int(cur.execute("SELECT COUNT(*) FROM users").fetchone()[0] or 0)
+    return {
+        "hours": h,
+        "new_users": users_n,
+        "new_adverts": adverts_n,
+        "new_offers": offers_n,
+        "accepted_offers": accepted_n,
+        "total_users": total_users,
+    }
+
+
+def search_users(query: str, limit: int = 10):
     q = (query or "").strip()
     if not q:
         return []
-    like = f"%{q}%"
+    # normalize common admin inputs: "@username" or "t.me/username"
+    q = q.strip()
+    if q.lower().startswith("https://t.me/"):
+        q = q.split("/")[-1].strip()
+    elif q.lower().startswith("t.me/"):
+        q = q.split("/")[-1].strip()
+    q = q.lstrip("@").strip()
+    # Normalize digits for phone searches (supports Persian/Arabic digits).
+    _digit_map = str.maketrans(
+        "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
+        "01234567890123456789",
+    )
+    q_norm = q.translate(_digit_map).strip()
+    q_lower = q_norm.lower()
+    like = f"%{q_lower}%"
+    q_digits = "".join(ch for ch in q_norm if ch.isdigit())
+    like_digits = f"%{q_digits}%"
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
         return cur.execute(
@@ -544,17 +909,27 @@ def search_users(query: str, limit: int = 20):
             FROM users
             WHERE
                 CAST(telegram_id AS TEXT) LIKE ?
-                OR COALESCE(username,'') LIKE ?
-                OR COALESCE(display_name,'') LIKE ?
-                OR COALESCE(full_name,'') LIKE ?
-                OR COALESCE(last_name,'') LIKE ?
-                OR COALESCE(phone_number,'') LIKE ?
-                OR COALESCE(email,'') LIKE ?
-                OR COALESCE(address,'') LIKE ?
+                OR lower(COALESCE(username,'')) LIKE ?
+                OR lower(COALESCE(display_name,'')) LIKE ?
+                OR lower(COALESCE(full_name,'')) LIKE ?
+                OR lower(COALESCE(last_name,'')) LIKE ?
+                OR replace(replace(replace(replace(COALESCE(phone_number,''), ' ', ''), '-', ''), '+', ''), '۰', '0') LIKE ?
+                OR lower(COALESCE(email,'')) LIKE ?
+                OR lower(COALESCE(address,'')) LIKE ?
             ORDER BY rowid DESC
             LIMIT ?
             """,
-            (like, like, like, like, like, like, like, like, int(limit)),
+            (
+                f"%{q_digits or q_norm}%",
+                like,
+                like,
+                like,
+                like,
+                (like_digits if q_digits else like),
+                like,
+                like,
+                int(limit),
+            ),
         ).fetchall()
 
 
@@ -577,7 +952,7 @@ def get_user(user_id):
 
 
 def set_user_channel_rules_acknowledged(telegram_user_id: int) -> None:
-    """پس از باز کردن صفحهٔ «قوانین و روال کار کانال» برای فعال شدن ثبت درخواست خدمات."""
+    """پس از باز کردن صفحهٔ «قوانین و روال کار کانال» برای فعال شدن دکمهٔ درخواست خدمات."""
     try:
         tid = int(telegram_user_id)
     except (TypeError, ValueError):
@@ -624,15 +999,30 @@ def user_advert_has_active_offers(advert_rowid: int) -> bool:
     return False
 
 
+def count_euro_adverts_owned_by_user(telegram_user_id: int) -> int:
+    try:
+        uid = int(telegram_user_id)
+    except (TypeError, ValueError):
+        return 0
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM euro_adverts WHERE user_id = ?", (uid,)
+        ).fetchone()
+    return int(row[0] or 0) if row else 0
+
+
 def list_euro_adverts_owned_by_user(
-    telegram_user_id: int, limit: int = 35
+    telegram_user_id: int,
+    limit: int = LIST_RECENT_LIMIT,
+    offset: int = 0,
 ) -> list[dict]:
-    """همهٔ آگهی‌های ثبت‌شده با این telegram_id (با یا بدون پیشنهاد فعال)."""
+    """آخرین آگهی‌های ثبت‌شده با این telegram_id."""
     try:
         uid = int(telegram_user_id)
     except (TypeError, ValueError):
         return []
     lim = max(1, min(int(limit), 50))
+    off = max(0, int(offset))
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -642,10 +1032,10 @@ def list_euro_adverts_owned_by_user(
                    COALESCE(euro_exchange, 0) AS euro_exchange
             FROM euro_adverts
             WHERE user_id = ?
-            ORDER BY advert_rowid ASC
-            LIMIT ?
+            ORDER BY advert_rowid DESC
+            LIMIT ? OFFSET ?
             """,
-            (uid, lim),
+            (uid, lim, off),
         ).fetchall()
     out: list[dict] = []
     for r in rows:
@@ -659,10 +1049,10 @@ def list_euro_adverts_owned_by_user(
 
 
 def list_manageable_euro_adverts_for_user(
-    telegram_user_id: int, limit: int = 35
+    telegram_user_id: int, limit: int = LIST_RECENT_LIMIT
 ) -> list[dict]:
     """آگهی‌های یورو/معاوضهٔ کاربر بدون پیشنهاد فعال (pending یا accepted)."""
-    owned = list_euro_adverts_owned_by_user(telegram_user_id, limit=50)
+    owned = list_euro_adverts_owned_by_user(telegram_user_id, limit=LIST_RECENT_LIMIT * 5)
     out: list[dict] = []
     for d in owned:
         rid = int(d["rowid"])
@@ -772,8 +1162,12 @@ def update_euro_advert_field_for_owner(
         return cur.rowcount > 0
 
 
-def list_my_advert_offers(advert_rowid: int, proposer_telegram_id: int, limit: int = 15) -> list[tuple]:
-    """(id, rate_toman, created_at[, description[, status]]) قدیمی‌ترین اول تا جدیدترین پایین لیست."""
+def list_my_advert_offers(
+    advert_rowid: int,
+    proposer_telegram_id: int,
+    limit: int = LIST_RECENT_LIMIT,
+) -> list[tuple]:
+    """آخرین پیشنهادهای همین کاربر روی یک آگهی (قدیمی‌ترین اول در خروجی)."""
     try:
         aid = int(advert_rowid)
         uid = int(proposer_telegram_id)
@@ -783,50 +1177,62 @@ def list_my_advert_offers(advert_rowid: int, proposer_telegram_id: int, limit: i
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
         cols = _table_columns(conn, "advert_offers")
+        pe_sel = (
+            ", COALESCE(proposed_euro_amount, 0)"
+            if "proposed_euro_amount" in cols
+            else ", 0"
+        )
         if "description" in cols and "status" in cols and "seq_in_advert" in cols:
-            return cur.execute(
-                """
+            rows = cur.execute(
+                f"""
                 SELECT id, rate_toman, created_at, description,
                        COALESCE(NULLIF(TRIM(status), ''), 'pending') AS offer_status,
                        COALESCE(seq_in_advert, id) AS seq_in_advert
+                       {pe_sel}
                 FROM advert_offers
                 WHERE advert_rowid = ? AND proposer_telegram_id = ?
-                ORDER BY id ASC
+                ORDER BY id DESC
                 LIMIT ?
                 """,
                 (aid, uid, lim),
             ).fetchall()
+            return list(reversed(rows))
         if "description" in cols and "status" in cols:
-            return cur.execute(
-                """
+            rows = cur.execute(
+                f"""
                 SELECT id, rate_toman, created_at, description,
-                       COALESCE(NULLIF(TRIM(status), ''), 'pending') AS offer_status
+                       COALESCE(NULLIF(TRIM(status), ''), 'pending') AS offer_status,
+                       0 AS seq_in_advert
+                       {pe_sel}
                 FROM advert_offers
                 WHERE advert_rowid = ? AND proposer_telegram_id = ?
-                ORDER BY id ASC
+                ORDER BY id DESC
                 LIMIT ?
                 """,
                 (aid, uid, lim),
             ).fetchall()
+            return list(reversed(rows))
         if "description" in cols:
-            return cur.execute(
+            rows = cur.execute(
                 """
                 SELECT id, rate_toman, created_at, description FROM advert_offers
                 WHERE advert_rowid = ? AND proposer_telegram_id = ?
-                ORDER BY id ASC
+                ORDER BY id DESC
                 LIMIT ?
                 """,
                 (aid, uid, lim),
             ).fetchall()
-        return cur.execute(
+            return list(reversed(rows))
+        rows = cur.execute(
             """
             SELECT id, rate_toman, created_at FROM advert_offers
             WHERE advert_rowid = ? AND proposer_telegram_id = ?
-            ORDER BY id ASC
+            ORDER BY id DESC
             LIMIT ?
             """,
             (aid, uid, lim),
         ).fetchall()
+        return list(reversed(rows))
 
 
 def count_offers_for_advert(advert_rowid: int) -> int:
@@ -846,6 +1252,34 @@ def count_offers_for_advert(advert_rowid: int) -> int:
             return 0
 
 
+def effective_offer_euro_amount_for_advert(
+    advert_rowid: int, proposed_euro_amount: int | None = None
+) -> int:
+    """مقدار یوروی مؤثر پیشنهاد: جزئی (proposed) یا کل آگهی."""
+    try:
+        aid = int(advert_rowid)
+    except (TypeError, ValueError):
+        return 0
+    pe = 0
+    try:
+        if proposed_euro_amount is not None:
+            pe = int(proposed_euro_amount)
+    except (TypeError, ValueError):
+        pe = 0
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT euro_amount FROM euro_adverts WHERE rowid = ?",
+            (aid,),
+        ).fetchone()
+    if not row:
+        return pe if pe > 0 else 0
+    try:
+        adv_e = int(row[0] or 0)
+    except (TypeError, ValueError):
+        adv_e = 0
+    return pe if pe > 0 else adv_e
+
+
 def insert_advert_offer(
     advert_rowid: int,
     proposer_telegram_id: int,
@@ -854,6 +1288,8 @@ def insert_advert_offer(
     offer_alias_name: str | None = None,
     proposer_account_country: str | None = None,
     proposed_euro_amount: int | None = None,
+    *,
+    enforce_rejection_rules: bool = True,
 ) -> tuple[int, int] | None:
     """
     برمی‌گرداند (id ردیف در دیتابیس، شمارهٔ پیشنهاد داخل همان آگهی از ۱).
@@ -866,6 +1302,30 @@ def insert_advert_offer(
         return None
     if rate < 0:
         return None
+    eff_euro = effective_offer_euro_amount_for_advert(aid, proposed_euro_amount)
+    if enforce_rejection_rules and rate > 0 and eff_euro > 0:
+        adv_row = None
+        with sqlite3.connect(DB_PATH) as conn:
+            adv_row = conn.execute(
+                "SELECT euro_amount, operation FROM euro_adverts WHERE rowid = ?",
+                (aid,),
+            ).fetchone()
+        if adv_row:
+            adv_e = int(adv_row[0] or 0)
+            op = (adv_row[1] or "").strip()
+            if (
+                classify_proposer_rate_rejection(
+                    aid,
+                    uid,
+                    rate,
+                    target_euro_amount=eff_euro,
+                    advert_total_euro=adv_e,
+                    operation=op,
+                )
+                is not None
+                or rejected_offer_same_rate_and_euro(aid, rate, eff_euro)
+            ):
+                return None
     from datetime import datetime
 
     created = datetime.now().isoformat(timespec="seconds")
@@ -1025,7 +1485,9 @@ def _pending_offer_status_sql(alias: str = "o") -> str:
     )
 
 
-def list_my_pending_offers_all(proposer_telegram_id: int, limit: int = 40) -> list[dict]:
+def list_my_pending_offers_all(
+    proposer_telegram_id: int, limit: int = LIST_RECENT_LIMIT
+) -> list[dict]:
     try:
         uid = int(proposer_telegram_id)
     except (TypeError, ValueError):
@@ -1086,7 +1548,7 @@ def list_my_pending_offers_all(proposer_telegram_id: int, limit: int = 40) -> li
 
 
 def list_incoming_pending_offers_for_advert_owner(
-    owner_telegram_id: int, limit: int = 40
+    owner_telegram_id: int, limit: int = LIST_RECENT_LIMIT
 ) -> list[dict]:
     """پیشنهادهای pending روی آگهی‌هایی که این کاربر صاحب آن است (نه پیشنهادهایی که خودش فرستاده)."""
     try:
@@ -1190,12 +1652,20 @@ def update_proposer_pending_offer_rate(
     return advert_rowid
 
 
-def list_advert_offers_joined_for_advert(advert_rowid: int) -> list[dict]:
-    """همهٔ پیشنهادهای یک آگهی (برای پنل ادمین / گزارش مذاکره)."""
+def list_advert_offers_joined_for_advert(
+    advert_rowid: int, limit: int | None = LIST_RECENT_LIMIT
+) -> list[dict]:
+    """پیشنهادهای یک آگهی؛ limit=None همهٔ ردیف‌ها (گزارش مذاکره)."""
     try:
         aid = int(advert_rowid)
     except (TypeError, ValueError):
         return []
+    lim_sql = ""
+    lim_args: tuple = ()
+    if limit is not None:
+        lim_n = max(1, min(int(limit), 500))
+        lim_sql = " LIMIT ?"
+        lim_args = (lim_n,)
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -1224,11 +1694,14 @@ def list_advert_offers_joined_for_advert(advert_rowid: int) -> list[dict]:
             FROM advert_offers o
             INNER JOIN euro_adverts u ON u.rowid = o.advert_rowid
             WHERE o.advert_rowid = ?
-            ORDER BY o.id ASC
+            ORDER BY o.id DESC
+            {lim_sql}
             """,
-            (aid,),
+            (aid, *lim_args),
         ).fetchall()
-    return [dict(r) for r in rows]
+    if limit is None:
+        return [dict(r) for r in reversed(rows)]
+    return [dict(r) for r in reversed(rows)]
 
 
 def get_advert_offer_joined(offer_id: int) -> dict | None:
@@ -1310,7 +1783,14 @@ def reject_other_pending_offers_for_advert(
 
 def update_advert_offer_status(offer_id: int, status: str) -> bool:
     st = (status or "").strip().lower()
-    if st not in ("pending", "accepted", "rejected"):
+    if st not in (
+        "pending",
+        "accepted",
+        "rejected",
+        "gate_aborted",
+        "gate_rejected",
+        "gate_closed",
+    ):
         return False
     try:
         oid = int(offer_id)
@@ -1488,13 +1968,163 @@ def list_rejected_offers_for_advert(advert_rowid: int) -> list[dict]:
     ]
 
 
-def get_last_rejected_offer_rate_toman(
-    advert_rowid: int, *, proposer_telegram_id: int | None = None
-) -> int | None:
-    """آخرین نرخ تومانی پیشنهاد رد‌شده (جدیدترین id).
+def _offer_effective_euro_sql(*, offer_alias: str = "o", advert_alias: str = "a") -> str:
+    """عبارت SQL: مقدار یوروی مؤثر پیشنهاد (جزئی یا کل آگهی)."""
+    o, a = offer_alias, advert_alias
+    pe = f"COALESCE({o}.proposed_euro_amount, 0)"
+    return (
+        f"CASE WHEN CAST({pe} AS INTEGER) > 0 "
+        f"THEN CAST({pe} AS INTEGER) "
+        f"ELSE CAST({a}.euro_amount AS INTEGER) END"
+    )
 
-    اگر ``proposer_telegram_id`` داده شود، فقط همان پیشنهاددهنده (برای سقف/کف نرخ بعدی).
+
+def _row_euro_amount_for_rejection(
+    proposed_euro: int, advert_total_euro: int
+) -> int:
+    pe = int(proposed_euro or 0)
+    if pe > 0:
+        return pe
+    return int(advert_total_euro or 0)
+
+
+def classify_proposer_rate_rejection(
+    advert_rowid: int,
+    proposer_telegram_id: int,
+    rate_toman: int,
+    *,
+    target_euro_amount: int,
+    advert_total_euro: int,
+    operation: str,
+) -> str | None:
     """
+    همان منطق لیست «پیشنهادهای قبلی» — برای اعتبارسنجی مرحله نرخ.
+    برمی‌گرداند: 'exact' | 'sell_low' | 'buy_high' یا None.
+    """
+    try:
+        aid = int(advert_rowid)
+        uid = int(proposer_telegram_id)
+        rate = int(rate_toman)
+        target = int(target_euro_amount)
+        adv_e = int(advert_total_euro)
+    except (TypeError, ValueError):
+        return None
+    if aid <= 0 or uid <= 0 or rate <= 0 or target <= 0:
+        return None
+    op = (operation or "").strip()
+    if op not in ("خرید", "فروش"):
+        return None
+    rows = list_my_advert_offers(aid, uid, limit=50)
+    last_rej_rate: int | None = None
+    last_rej_id = -1
+    for row in rows:
+        st = str(row[4] if len(row) > 4 else "pending").strip().lower()
+        if st != "rejected":
+            continue
+        try:
+            oid = int(row[0])
+            rt = int(row[1] or 0)
+        except (TypeError, ValueError):
+            continue
+        if rt <= 0:
+            continue
+        pe_row = 0
+        if len(row) > 6:
+            try:
+                pe_row = int(row[6] or 0)
+            except (TypeError, ValueError):
+                pe_row = 0
+        row_euro = _row_euro_amount_for_rejection(pe_row, adv_e)
+        if row_euro != target:
+            continue
+        if rt == rate:
+            return "exact"
+        if oid >= last_rej_id:
+            last_rej_id = oid
+            last_rej_rate = rt
+    if last_rej_rate is None:
+        return None
+    if op == "فروش" and rate <= last_rej_rate:
+        return "sell_low"
+    if op == "خرید" and rate >= last_rej_rate:
+        return "buy_high"
+    return None
+
+
+def rejected_offer_rate_and_proposed_euro(
+    advert_rowid: int,
+    rate_toman: int,
+    proposed_euro_amount: int,
+) -> bool:
+    """همان نرخ + همان proposed_euro_amount (ستون) — هر کاربر، وضعیت رد."""
+    try:
+        aid = int(advert_rowid)
+        rate = int(rate_toman)
+        pe = int(proposed_euro_amount)
+    except (TypeError, ValueError):
+        return False
+    if aid <= 0 or rate <= 0 or pe <= 0:
+        return False
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cols = _table_columns(conn, "advert_offers")
+        if "status" not in cols or "proposed_euro_amount" not in cols:
+            return False
+        row = cur.execute(
+            """
+            SELECT 1 FROM advert_offers
+            WHERE advert_rowid = ?
+              AND LOWER(TRIM(COALESCE(status, ''))) = 'rejected'
+              AND rate_toman = ?
+              AND CAST(COALESCE(proposed_euro_amount, 0) AS INTEGER) = ?
+            LIMIT 1
+            """,
+            (aid, rate, pe),
+        ).fetchone()
+    return row is not None
+
+
+def rejected_offer_same_rate_and_euro(
+    advert_rowid: int,
+    rate_toman: int,
+    effective_euro_amount: int,
+) -> bool:
+    """هر پیشنهاددهنده — همان نرخ + همان مقدار یورو قبلاً رد شده باشد."""
+    try:
+        aid = int(advert_rowid)
+        rate = int(rate_toman)
+        eff = int(effective_euro_amount)
+    except (TypeError, ValueError):
+        return False
+    if aid <= 0 or rate <= 0 or eff <= 0:
+        return False
+    euro_sql = _offer_effective_euro_sql()
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        if "status" not in _table_columns(conn, "advert_offers"):
+            return False
+        row = cur.execute(
+            f"""
+            SELECT 1 FROM advert_offers o
+            INNER JOIN euro_adverts a ON a.rowid = o.advert_rowid
+            WHERE o.advert_rowid = ?
+              AND LOWER(TRIM(COALESCE(o.status, ''))) = 'rejected'
+              AND o.rate_toman = ?
+              AND ({euro_sql}) = ?
+            LIMIT 1
+            """,
+            (aid, rate, eff),
+        ).fetchone()
+    return row is not None
+
+
+def get_last_rejected_offer_rate_toman(
+    advert_rowid: int,
+    *,
+    proposer_telegram_id: int | None = None,
+    effective_euro_amount: int | None = None,
+) -> int | None:
+    """آخرین نرخ تومانی پیشنهاد رد‌شده (جدیدترین id) — اختیاری: فقط همان پیشنهاددهنده و/یا همان مقدار یورو."""
     try:
         aid = int(advert_rowid)
     except (TypeError, ValueError):
@@ -1503,33 +2133,38 @@ def get_last_rejected_offer_rate_toman(
         pid = int(proposer_telegram_id) if proposer_telegram_id is not None else None
     except (TypeError, ValueError):
         pid = None
+    try:
+        eff = int(effective_euro_amount) if effective_euro_amount is not None else None
+    except (TypeError, ValueError):
+        eff = None
+    if eff is not None and eff <= 0:
+        eff = None
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
         if "status" not in _table_columns(conn, "advert_offers"):
             return None
+        euro_sql = _offer_effective_euro_sql()
+        params: list = [aid]
+        where = [
+            "o.advert_rowid = ?",
+            "LOWER(TRIM(COALESCE(o.status, ''))) = 'rejected'",
+        ]
         if pid is not None:
-            row = cur.execute(
-                """
-                SELECT rate_toman FROM advert_offers
-                WHERE advert_rowid = ?
-                  AND LOWER(TRIM(COALESCE(status, ''))) = 'rejected'
-                  AND proposer_telegram_id = ?
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (aid, pid),
-            ).fetchone()
-        else:
-            row = cur.execute(
-                """
-                SELECT rate_toman FROM advert_offers
-                WHERE advert_rowid = ?
-                  AND LOWER(TRIM(COALESCE(status, ''))) = 'rejected'
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (aid,),
-            ).fetchone()
+            where.append("o.proposer_telegram_id = ?")
+            params.append(pid)
+        if eff is not None:
+            where.append(f"({euro_sql}) = ?")
+            params.append(eff)
+        row = cur.execute(
+            f"""
+            SELECT o.rate_toman FROM advert_offers o
+            INNER JOIN euro_adverts a ON a.rowid = o.advert_rowid
+            WHERE {' AND '.join(where)}
+            ORDER BY o.id DESC
+            LIMIT 1
+            """,
+            tuple(params),
+        ).fetchone()
     if not row:
         return None
     try:
@@ -1718,11 +2353,185 @@ def get_user_by_phone(phone_number):
 def save_user(user_id, full_name, last_name, email, address, phone_number, display_name: str | None = None, username: str | None = None):
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO users (telegram_id, full_name, last_name, email, address, phone_number, display_name, username)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (user_id, full_name, last_name, email, address, phone_number, display_name, username))
+        cols = _table_columns(conn, "users")
+        if "created_at" in cols:
+            cur.execute(
+                """
+                INSERT INTO users (
+                    telegram_id, full_name, last_name, email, address, phone_number,
+                    display_name, username, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                """,
+                (user_id, full_name, last_name, email, address, phone_number, display_name, username),
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO users (telegram_id, full_name, last_name, email, address, phone_number, display_name, username)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, full_name, last_name, email, address, phone_number, display_name, username),
+            )
         conn.commit()
+
+def update_euro_advert_status(advert_rowid: int, status: str) -> bool:
+    try:
+        rid = int(advert_rowid)
+    except (TypeError, ValueError):
+        return False
+    st = (status or "").strip()
+    if not st:
+        return False
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE euro_adverts SET status = ? WHERE rowid = ?", (st, rid))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def _deal_gate_row_to_dict(row: sqlite3.Row | tuple, cols: list[str]) -> dict:
+    if hasattr(row, "keys"):
+        return dict(row)
+    return {cols[i]: row[i] for i in range(len(cols))}
+
+
+def deal_gate_get(offer_id: int) -> dict | None:
+    try:
+        oid = int(offer_id)
+    except (TypeError, ValueError):
+        return None
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        row = cur.execute(
+            "SELECT * FROM offer_deal_gates WHERE offer_id = ?",
+            (oid,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def deal_gate_upsert(
+    *,
+    offer_id: int,
+    advert_rowid: int,
+    buyer_telegram_id: int,
+    seller_telegram_id: int,
+    gate_status: str | None = None,
+    **fields,
+) -> None:
+    oid = int(offer_id)
+    now = int(time.time())
+    if "gate_status" in fields:
+        gate_status = fields.pop("gate_status")
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        existing = cur.execute(
+            "SELECT 1 FROM offer_deal_gates WHERE offer_id = ?",
+            (oid,),
+        ).fetchone()
+        if not existing:
+            cur.execute(
+                """
+                INSERT INTO offer_deal_gates (
+                    offer_id, advert_rowid, buyer_telegram_id, seller_telegram_id,
+                    gate_status, started_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    oid,
+                    int(advert_rowid),
+                    int(buyer_telegram_id),
+                    int(seller_telegram_id),
+                    (gate_status or "pending").strip(),
+                    now,
+                ),
+            )
+        elif gate_status is not None:
+            cur.execute(
+                "UPDATE offer_deal_gates SET gate_status = ? WHERE offer_id = ?",
+                ((gate_status or "pending").strip(), oid),
+            )
+        allowed = {
+            "gate_status",
+            "buyer_response",
+            "seller_response",
+            "buyer_confirmed_at",
+            "seller_confirmed_at",
+            "reminder_count",
+            "admin_escalated_at",
+            "admin_decision",
+            "buyer_gate_mid",
+            "seller_gate_mid",
+            "buyer_accounts_text",
+            "seller_accounts_text",
+            "completed_at",
+            "admin_notify_mids",
+        }
+        for key, val in fields.items():
+            if key not in allowed:
+                continue
+            cur.execute(
+                f"UPDATE offer_deal_gates SET {key} = ? WHERE offer_id = ?",
+                (val, oid),
+            )
+        conn.commit()
+
+
+def deal_gate_delete(offer_id: int) -> None:
+    try:
+        oid = int(offer_id)
+    except (TypeError, ValueError):
+        return
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.cursor().execute("DELETE FROM offer_deal_gates WHERE offer_id = ?", (oid,))
+        conn.commit()
+
+
+def deal_gate_active_for_user(user_id: int) -> dict | None:
+    """Gate فعال که کاربر باید حساب بفرستد (accounts)."""
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return None
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        rows = cur.execute(
+            """
+            SELECT * FROM offer_deal_gates
+            WHERE (buyer_telegram_id = ? OR seller_telegram_id = ?)
+              AND gate_status IN ('accounts', 'pending')
+            ORDER BY started_at DESC
+            """,
+            (uid, uid),
+        ).fetchall()
+        for row in rows:
+            d = dict(row)
+            st = (d.get("gate_status") or "").strip().lower()
+            br = (d.get("buyer_response") or "").strip().lower()
+            sr = (d.get("seller_response") or "").strip().lower()
+            if st == "pending":
+                if br != "yes" or sr != "yes":
+                    continue
+                oid = int(d["offer_id"])
+                cur.execute(
+                    "UPDATE offer_deal_gates SET gate_status = 'accounts' WHERE offer_id = ?",
+                    (oid,),
+                )
+                conn.commit()
+                d["gate_status"] = "accounts"
+            elif st != "accounts":
+                continue
+            buyer_id = int(d.get("buyer_telegram_id") or 0)
+            seller_id = int(d.get("seller_telegram_id") or 0)
+            if uid == buyer_id and (d.get("buyer_accounts_text") or "").strip():
+                continue
+            if uid == seller_id and (d.get("seller_accounts_text") or "").strip():
+                continue
+            return d
+    return None
+
 
 @contextmanager
 def get_db():

@@ -70,7 +70,7 @@ async def handle_channel_member_ack(update: Update, context: ContextTypes.DEFAUL
         store=user_data_store,
         text=(
             "✅ عضویت شما در کانال تأیید شد.\n\n"
-            "از منوی زیر «🚀 ثبت درخواست خدمات» را بزنید تا آگهی ثبت کنید."
+            "از منوی زیر «🚀 درخواست خدمات» را بزنید تا آگهی ثبت کنید."
         ),
         parse_mode=ParseMode.HTML,
     )

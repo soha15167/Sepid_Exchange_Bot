@@ -16,7 +16,9 @@ from messages import texts
 from state import user_data_store
 from utils.telegram_utils import (
     cleanup_ids,
+    purge_all_trackable_dm_messages,
     remember_cleanup_id,
+    pop_menu_anchor_message_id,
     send_or_replace_main_menu,
     send_registration_welcome,
 )
@@ -78,11 +80,12 @@ async def handle_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=update.effective_chat.id,
                 user_id=user_id,
                 store=user_data_store,
-                context=context,
             )
+            context.user_data["state"] = UserState.START.name
         return
 
     context.user_data.clear()
+    context.user_data.pop("registration", None)
     if update.message:
         remember_cleanup_id(user_data_store, user_id, update.message.message_id, _MAIN_CLEANUP_KEY)
 
@@ -96,15 +99,31 @@ async def handle_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         remember_cleanup_id(user_data_store, user_id, mid, _MAIN_CLEANUP_KEY)
     else:
-        mid = await send_registration_welcome(
+        cid = update.effective_chat.id
+        extra: list[int] = []
+        am = pop_menu_anchor_message_id(user_data_store, user_id)
+        if am is not None:
+            extra.append(am)
+        if update.message:
+            extra.append(update.message.message_id)
+        context.user_data.clear()
+        context.user_data["state"] = UserState.START.name
+        await purge_all_trackable_dm_messages(
             context.bot,
-            chat_id=update.effective_chat.id,
+            chat_id=cid,
+            user_id=user_id,
+            store=user_data_store,
+            context_user_data=context.user_data,
+            extra_message_ids=extra,
+        )
+        await send_registration_welcome(
+            context.bot,
+            chat_id=cid,
             user_id=user_id,
             store=user_data_store,
             context=context,
+            purge_chat=False,
         )
-        remember_cleanup_id(user_data_store, user_id, mid, _MAIN_CLEANUP_KEY)
-        context.user_data["state"] = UserState.TERMS.name
     try:
         if update.message:
             await update.message.delete()
@@ -195,17 +214,28 @@ async def handle_terms_response(update: Update, context: ContextTypes.DEFAULT_TY
         await q.answer()
     except Exception:
         pass
-    remember_cleanup_id(
-        user_data_store,
-        user_id,
-        q.message.message_id if q.message else None,
-        _MAIN_CLEANUP_KEY,
-    )
-    mid = await send_registration_welcome(
+    cid = q.message.chat_id if q.message else update.effective_chat.id
+    extra: list[int] = []
+    if q.message:
+        extra.append(q.message.message_id)
+    am = pop_menu_anchor_message_id(user_data_store, user_id)
+    if am is not None:
+        extra.append(am)
+    context.user_data.clear()
+    context.user_data["state"] = UserState.START.name
+    await purge_all_trackable_dm_messages(
         context.bot,
-        chat_id=q.message.chat_id if q.message else update.effective_chat.id,
+        chat_id=cid,
+        user_id=user_id,
+        store=user_data_store,
+        context_user_data=context.user_data,
+        extra_message_ids=extra,
+    )
+    await send_registration_welcome(
+        context.bot,
+        chat_id=cid,
         user_id=user_id,
         store=user_data_store,
         context=context,
+        purge_chat=False,
     )
-    remember_cleanup_id(user_data_store, user_id, mid, _MAIN_CLEANUP_KEY)

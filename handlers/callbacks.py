@@ -22,7 +22,14 @@ from handlers.exchange_flow import start_exchange_flow
 from handlers.euro_flow import ask_account_country, ask_euro_amount
 from keyboards.admin_home import admin_home_inline_keyboard
 from config.settings import ADMIN_IDS
-from utils.telegram_utils import remember_cleanup_id, send_or_replace_main_menu, reset_flow_user_bucket
+from handlers.access_gate import ensure_registered_or_redirect
+from handlers.admin import _clear_admin_pending
+from utils.telegram_utils import (
+    cleanup_transient_dm_messages,
+    remember_cleanup_id,
+    send_or_replace_main_menu,
+    reset_flow_user_bucket,
+)
 
 _EURO_CLEANUP_KEY = "euro_cleanup_message_ids"
 _EXCHANGE_CLEANUP_KEY = "exchange_cleanup_message_ids"
@@ -30,6 +37,8 @@ _EXCHANGE_CLEANUP_KEY = "exchange_cleanup_message_ids"
 
 # 🎯 هندل کردن کلیک روی دکمه‌های اینلاین
 async def handle_payment_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await ensure_registered_or_redirect(update, context):
+        return
     query = update.callback_query
     if not query or not query.from_user:
         return
@@ -57,7 +66,10 @@ async def handle_payment_selection_callback(update: Update, context: ContextType
     # تأیید بدون انتخاب روش: فقط یک بار answer (نمایش هشدار)
     if choice in ("confirm", CONFIRM_SELECTION_CALLBACK) and not data.get("methods"):
         try:
-            await query.answer("لطفاً حداقل یک روش پرداخت انتخاب کنید.", show_alert=True)
+            await query.answer(
+                "لطفاً حداقل یک روش انتخاب کنید، سپس دکمهٔ «آماده» را بزنید.",
+                show_alert=True,
+            )
         except Exception:
             pass
         return
@@ -70,12 +82,16 @@ async def handle_payment_selection_callback(update: Update, context: ContextType
     # ❌ انصراف کامل
     if choice == "cancel":
         chat_id_cancel = query.message.chat_id if query.message else user_id
+        extra = [query.message.message_id] if query.message else []
+        await cleanup_transient_dm_messages(
+            context.bot,
+            chat_id=chat_id_cancel,
+            user_id=user_id,
+            store=user_data_store,
+            context_user_data=context.user_data,
+            extra_message_ids=extra,
+        )
         reset_flow_user_bucket(user_data_store, user_id)
-        if query.message:
-            try:
-                await query.message.delete()
-            except Exception:
-                pass
         if context.user_data.get("admin_post_advert_for") and user_id in set(ADMIN_IDS or []):
             context.user_data.clear()
             context.user_data["state"] = UserState.ADMIN_MENU.name
@@ -95,6 +111,8 @@ async def handle_payment_selection_callback(update: Update, context: ContextType
 
     # ✅ تایید نهایی انتخاب روش پرداخت
     elif choice in ("confirm", CONFIRM_SELECTION_CALLBACK):
+        if user_id in set(ADMIN_IDS or []):
+            _clear_admin_pending(user_id)
         if EXCHANGE_OPTION in data["methods"] and len(data["methods"]) == 1:
             exchange_side = data.get("operation", "")
             # Persist "buy/sell" side for exchange flow wording.
@@ -189,7 +207,11 @@ async def handle_payment_selection_callback(update: Update, context: ContextType
         return
 
     op = data.get("operation", "")
-    await query.edit_message_text(get_payment_selection_text(op), reply_markup=keyboard)
+    await query.edit_message_text(
+        get_payment_selection_text(op),
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
 
 
 # ✅ هندلر شروع مستقیم فلو معاوضه (در صورت نیاز مستقیم)

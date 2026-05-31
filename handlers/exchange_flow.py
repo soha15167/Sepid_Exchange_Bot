@@ -19,9 +19,15 @@ from handlers.euro_flow import resolve_channel_advert_identity
 from config.settings import ADVERT_CHANNEL_ID, CHANNEL_USERNAME
 from utils.channel_format import format_channel_ad_footer
 from database.db import get_db
-from utils.telegram_utils import remember_cleanup_id, cleanup_ids, send_or_replace_main_menu
+from utils.telegram_utils import (
+    remember_cleanup_id,
+    cleanup_ids,
+    cleanup_transient_dm_messages,
+    mark_flow_keep_message,
+    send_or_replace_main_menu,
+)
 from utils.euro_fees import format_fee_eur as _format_fee_eur
-from handlers.offers import offer_proposal_inline_button
+from handlers.offers import channel_ad_reply_markup
 from utils.channel_membership import (
     channel_membership_required_html,
     ensure_advert_channel_member,
@@ -61,6 +67,10 @@ def _get_exchange_side(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> str:
 
 
 async def start_exchange_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from handlers.access_gate import ensure_registered_or_redirect
+
+    if await ensure_registered_or_redirect(update, context):
+        return
     query = update.callback_query
     user_id = update.effective_user.id
     preserved_posting = context.user_data.get("admin_post_advert_for")
@@ -117,6 +127,10 @@ async def start_exchange_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def handle_exchange_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from handlers.access_gate import ensure_registered_or_redirect
+
+    if await ensure_registered_or_redirect(update, context):
+        return
     query = update.callback_query
     await query.answer()
     choice = query.data
@@ -192,6 +206,10 @@ async def handle_exchange_choice(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def handle_exchange_instant_transfer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from handlers.access_gate import ensure_registered_or_redirect
+
+    if await ensure_registered_or_redirect(update, context):
+        return
     query = update.callback_query
     if not query:
         return
@@ -262,6 +280,14 @@ async def handle_exchange_amount(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def handle_exchange_country_int(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    if context.user_data.get("state") != UserState.EXCHANGE_COUNTRY_INT.name:
+        await update.message.reply_text(
+            "⚠️ مرحلهٔ قبلی منقضی شده.\n"
+            "از /menu منوی اصلی را بزنید و دوباره ثبت آگهی را شروع کنید."
+        )
+        return
     context.user_data['exchange_country_int'] = update.message.text.strip()
     user_id = update.effective_user.id
     _remember_cleanup(user_id, update.message.message_id)
@@ -381,10 +407,26 @@ async def handle_exchange_description(update: Update, context: ContextTypes.DEFA
 
 
 async def handle_confirm_exchange(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from config.settings import ADMIN_IDS
+    from database.db import is_bot_enabled
+    from handlers.access_gate import ensure_registered_or_redirect
+
+    if await ensure_registered_or_redirect(update, context):
+        return
     query = update.callback_query
-    await query.answer()
     user_id = query.from_user.id
     admin_posting = bool(context.user_data.get("admin_post_advert_for"))
+    if (
+        not is_bot_enabled()
+        and not admin_posting
+        and user_id not in set(ADMIN_IDS or [])
+    ):
+        try:
+            await query.answer("⛔️ ربات موقتاً غیرفعال است.", show_alert=True)
+        except Exception:
+            pass
+        return
+    await query.answer()
     owner_id, full_name = resolve_channel_advert_identity(context, user_id)
     try:
         owner_id = int(owner_id)
@@ -475,9 +517,7 @@ async def handle_confirm_exchange(update: Update, context: ContextTypes.DEFAULT_
             chat_id=ADVERT_CHANNEL_ID,
             text=ad_text,
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(
-                [[offer_proposal_inline_button(int(advert_id), bot_uname)]]
-            ),
+            reply_markup=channel_ad_reply_markup(int(advert_id), bot_uname),
             disable_web_page_preview=True,
         )
 
@@ -511,10 +551,15 @@ async def handle_confirm_exchange(update: Update, context: ContextTypes.DEFAULT_
                 )
         except Exception:
             pass
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
+        extra = [query.message.message_id] if query.message else []
+        await cleanup_transient_dm_messages(
+            context.bot,
+            chat_id=chat_id,
+            user_id=user_id,
+            store=user_data_store,
+            context_user_data=context.user_data,
+            extra_message_ids=extra,
+        )
         rm = admin_home_inline_keyboard() if admin_posting else main_menu_inline_keyboard
         fail_msg = (
             "❌ انتشار در کانال انجام نشد.\n"
@@ -536,14 +581,19 @@ async def handle_confirm_exchange(update: Update, context: ContextTypes.DEFAULT_
         )
         return
 
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
+    extra = [query.message.message_id] if query.message else []
+    await cleanup_transient_dm_messages(
+        context.bot,
+        chat_id=chat_id,
+        user_id=user_id,
+        store=user_data_store,
+        context_user_data=context.user_data,
+        extra_message_ids=extra,
+    )
     await try_open_telegram_url(query, real_link)
 
     rm = admin_home_inline_keyboard() if admin_posting else main_menu_inline_keyboard
-    await send_or_replace_main_menu(
+    menu_mid = await send_or_replace_main_menu(
         context.bot,
         chat_id=chat_id,
         user_id=user_id,
@@ -552,6 +602,7 @@ async def handle_confirm_exchange(update: Update, context: ContextTypes.DEFAULT_
         reply_markup=rm,
         parse_mode=ParseMode.HTML,
     )
+    mark_flow_keep_message(user_data_store, user_id, context.user_data, menu_mid)
 
     context.user_data.clear()
     context.user_data["state"] = UserState.ADMIN_MENU.name if admin_posting else UserState.MAIN_MENU.name

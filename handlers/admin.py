@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import asyncio
 import html as html_module
+import logging
 import re
 import sqlite3
 import time
 from datetime import datetime
 
 from telegram import Update, ReplyKeyboardRemove, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
 
@@ -28,6 +30,7 @@ from config.settings import (
     BOT_RESTART_BROADCAST_MENU,
     BOT_RESTART_COMMAND,
     CHANNEL_USERNAME,
+    LIST_RECENT_LIMIT,
 )
 from database.db import (
     get_db,
@@ -52,6 +55,11 @@ from database.db import (
     get_advert_offer_joined,
     insert_advert_offer,
     list_advert_offers_joined_for_advert,
+    count_offers_for_advert,
+    count_users,
+    list_users_page,
+    count_euro_adverts,
+    list_euro_adverts_page,
 )
 from state import user_data_store
 from keyboards.admin_home import admin_home_inline_keyboard
@@ -62,6 +70,11 @@ from keyboards.menus import (
     PAYMENT_OPTIONS,
 )
 from utils.euro_fees import format_fee_eur, advert_fee_override_eur
+from handlers.admin_user_notify import (
+    notify_advert_exchange_bundle_updated,
+    notify_advert_field_updated,
+    notify_user_profile_updated,
+)
 from handlers.offers import (
     offer_proposal_inline_button,
     refresh_advert_channel_post,
@@ -80,7 +93,7 @@ from utils.sms import (
     generate_sms_code,
     is_otp_code_valid,
     try_send_verification_sms,
-    uses_twilio_verify,
+    otp_checked_via_twilio_verify,
 )
 from utils.validators import is_valid_phone, is_valid_email
 from utils.telegram_utils import (
@@ -89,6 +102,8 @@ from utils.telegram_utils import (
     send_or_replace_main_menu,
     remove_main_menu_anchor_message,
 )
+
+logger = logging.getLogger(__name__)
 
 # سرورهای قدیمی فقط ADMIN_RESTRICT_LEVEL در enum دارند؛ بدون این بلوک import با AttributeError می‌میرد.
 _ADMIN_RESTRICT_DAYS_STATE_NAME = (
@@ -307,10 +322,241 @@ def _admin_offer_row_summary_html(advert: dict, orow: dict, *, aid: int, seq: in
     )
 
 
-def _admin_offers_list_html(offers: list[dict]) -> str:
+def _admin_welcome_text() -> str:
+    from utils.bot_lifecycle import admin_status_banner_html
+
+    return texts.ADMIN_WELCOME + "\n" + admin_status_banner_html()
+
+
+async def _admin_show_users_page(
+    context: ContextTypes.DEFAULT_TYPE,
+    bot,
+    *,
+    page: int,
+    edit_message=None,
+) -> None:
+    from config.settings import LIST_RECENT_LIMIT
+    from utils.pagination import clamp_page, pagination_nav_row, sql_offset
+
+    total = count_users()
+    page, pages = clamp_page(page, total)
+    lim, off = sql_offset(page)
+    rows = list_users_page(limit=lim, offset=off)
+    enriched = []
+    for r in rows:
+        tg_id = int(r[0])
+        uname = (r[1] or "").strip().lstrip("@") or None
+        contact_ok = bool(uname)
+        if not contact_ok and tg_id > 0:
+            try:
+                uname = await _ensure_username(context, tg_id, r[1])
+                contact_ok = bool(uname)
+            except Exception:
+                uname = r[1]
+            if not contact_ok:
+                try:
+                    await context.bot.get_chat(tg_id)
+                    contact_ok = True
+                except Exception:
+                    contact_ok = False
+        else:
+            try:
+                uname = await _ensure_username(context, tg_id, r[1]) or uname
+            except Exception:
+                pass
+        enriched.append((r[0], uname, r[2], r[3], r[4], r[5], r[6], r[7], contact_ok))
+
+    # Build body without truncating mid-HTML-tag (Telegram: Can't parse entities).
+    header = (
+        f"👥 <b>کاربران</b> — صفحه {page + 1}/{pages} (کل {total})\n\n"
+        f"{_RTL}برای هر کاربر، روی لینک «ارسال پیام» زیر اطلاعات همان کاربر بزنید.\n\n"
+    )
+    hint = _admin_list_recent_hint(search_label="جستجوی کاربر")
+    budget = max(800, _ADMIN_EDIT_MAX - len(header) - len(hint) - 50)
+    parts_txt: list[str] = []
+    used = 0
+    for i, r in enumerate(enriched):
+        block = _fmt_user_block(r[:8], idx=i + 1 + off)
+        block_len = len(block) + (2 if parts_txt else 0)
+        if parts_txt and used + block_len > budget:
+            parts_txt.append(f"{_RTL}… (ادامه در صفحه بعد)")
+            break
+        if not parts_txt and block_len > budget:
+            # Always show at least one.
+            parts_txt.append(block[:budget])
+            break
+        parts_txt.append(block)
+        used += block_len
+    blocks = "\n\n".join(parts_txt)
+    body = (
+        header + (blocks or "—") + hint
+    )
+    nav = pagination_nav_row(
+        prev_cb=f"adm|lu|p|{page - 1}" if page > 0 else None,
+        next_cb=f"adm|lu|p|{page + 1}" if page < pages - 1 else None,
+        page=page,
+        total_pages=pages,
+    )
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    if nav:
+        kb_rows.append(nav)
+    kb_rows.append([InlineKeyboardButton("🔙 پنل", callback_data="adm|panel")])
+    kb = InlineKeyboardMarkup(kb_rows)
+    ok = await _admin_edit_dashboard(
+        context, bot, body, reply_markup=kb, parse_mode="HTML"
+    )
+    return ok
+
+
+def _admin_fetch_user_row(tg_id: int):
+    """Return 8-tuple for _fmt_user_block or None."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        row = cur.execute(
+            """
+            SELECT
+                telegram_id,
+                username,
+                display_name,
+                full_name,
+                last_name,
+                phone_number,
+                email,
+                address
+            FROM users
+            WHERE telegram_id = ?
+            """,
+            (int(tg_id),),
+        ).fetchone()
+    if not row:
+        return None
+    return tuple(row)
+
+
+async def _admin_show_user_detail(
+    context: ContextTypes.DEFAULT_TYPE,
+    bot,
+    *,
+    tg_id: int,
+    back_page: int = 0,
+) -> bool:
+    row = _admin_fetch_user_row(tg_id)
+    if not row:
+        return await _admin_edit_dashboard(
+            context,
+            bot,
+            "ℹ️ کاربر پیدا نشد (شاید حذف شده یا آیدی اشتباه است).",
+            reply_markup=admin_panel_back_keyboard(),
+        )
+    try:
+        uname = await _ensure_username(context, int(row[0]), row[1])
+    except Exception:
+        uname = (row[1] or "").strip().lstrip("@") or None
+    row8 = (row[0], uname, row[2], row[3], row[4], row[5], row[6], row[7])
+
+    text = "👤 <b>جزئیات کاربر</b>\n\n" + _fmt_user_block(row8, idx=None)
+
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    username = (uname or "").strip().lstrip("@")
+    if username:
+        kb_rows.append(
+            [InlineKeyboardButton("💬 پیام در تلگرام", url=f"https://t.me/{username}")]
+        )
+    else:
+        # Only add tg:// button if get_chat works (user likely started bot)
+        ok = False
+        try:
+            await context.bot.get_chat(int(tg_id))
+            ok = True
+        except Exception:
+            ok = False
+        if ok:
+            kb_rows.append(
+                [InlineKeyboardButton("💬 پیام در تلگرام", url=f"tg://user?id={int(tg_id)}")]
+            )
+        else:
+            text += (
+                f"\n\n{_RTL}ℹ️ این کاربر @username ندارد و هنوز با ربات چت نکرده؛ "
+                f"برای اینکه دکمهٔ پیام فعال شود باید یک‌بار به ربات <b>/start</b> بزند."
+            )
+    kb_rows.append(
+        [
+            InlineKeyboardButton("⬅️ برگشت به لیست", callback_data=f"adm|lu|p|{int(back_page)}"),
+            InlineKeyboardButton("🔙 پنل", callback_data="adm|panel"),
+        ]
+    )
+    kb = InlineKeyboardMarkup(kb_rows)
+    return await _admin_edit_dashboard(context, bot, text, reply_markup=kb, parse_mode="HTML")
+
+
+async def _admin_show_adverts_page(
+    context: ContextTypes.DEFAULT_TYPE,
+    bot,
+    *,
+    page: int,
+) -> None:
+    from utils.pagination import clamp_page, pagination_nav_row, sql_offset
+
+    total = count_euro_adverts()
+    page, pages = clamp_page(page, total)
+    lim, off = sql_offset(page)
+    rows = list_euro_adverts_page(limit=lim, offset=off)
+    lines = []
+    for r in rows:
+        advert_id, adv_name, uname, amount, rate, op = r
+        u_at = f"@{uname}" if uname else "—"
+        lines.append(
+            f"- #{advert_id} | {op} | {adv_name} | {u_at} | {amount}€ | {_fmt_thousands(rate)}"
+        )
+    body = (
+        f"📢 <b>آگهی‌ها</b> — صفحه {page + 1}/{pages} (کل {total})\n"
+        + "\n".join(lines or ["—"])
+        + _admin_list_recent_hint(search_label="جستجوی آگهی")
+    )
+    nav = pagination_nav_row(
+        prev_cb=f"adm|al|p|{page - 1}" if page > 0 else None,
+        next_cb=f"adm|al|p|{page + 1}" if page < pages - 1 else None,
+        page=page,
+        total_pages=pages,
+    )
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    kb_rows = [nav] if nav else []
+    kb_rows.append([InlineKeyboardButton("🔙 پنل", callback_data="adm|panel")])
+    await _admin_edit_dashboard(
+        context,
+        bot,
+        body,
+        reply_markup=InlineKeyboardMarkup(kb_rows),
+    )
+
+
+def _admin_list_recent_hint(*, search_label: str) -> str:
+    return (
+        f"\n\n{_RTL}ℹ️ فقط <b>{LIST_RECENT_LIMIT}</b> مورد آخر نمایش داده می‌شود. "
+        f"برای بقیه از <b>{search_label}</b> استفاده کنید."
+    )
+
+
+def _admin_offers_list_html(
+    offers: list[dict], *, total_count: int | None = None
+) -> str:
     if not offers:
         return f"{_RTL}<i>هنوز پیشنهادی برای این آگهی ثبت نشده است.</i>\n"
-    lines = [f"{_RTL}<b>پیشنهادهای این آگهی</b> ({len(offers)} مورد):"]
+    shown = len(offers)
+    total = int(total_count) if total_count is not None else shown
+    if total > shown:
+        head = (
+            f"{_RTL}<b>پیشنهادهای این آگهی</b> "
+            f"({shown} از {total} — آخرین‌ها):"
+        )
+    else:
+        head = f"{_RTL}<b>پیشنهادهای این آگهی</b> ({shown} مورد):"
+    lines = [head]
     for o in offers:
         seq = int(o.get("seq_in_advert") or o.get("id") or 0)
         rate = int(o.get("rate_toman") or 0)
@@ -328,7 +574,13 @@ def _admin_offers_list_html(offers: list[dict]) -> str:
         lines.append(
             f"{_RTL}• <b>{seq}</b> — <b>{rate:,}</b> تومان{amt} — {who} — <i>{st}</i>"
         )
-    lines.append(f"{_RTL}\nیک پیشنهاد را از دکمه‌ها انتخاب کنید یا شمارهٔ آن را بفرستید.")
+    lines.append(
+        f"{_RTL}\nیک پیشنهاد را از دکمه‌ها انتخاب کنید یا شمارهٔ آن را بفرستید."
+    )
+    if total > shown:
+        lines.append(
+            f"{_RTL}ℹ️ برای پیشنهادهای قدیمی‌تر، شمارهٔ پیشنهاد را مستقیم بفرستید."
+        )
     return "\n".join(lines)
 
 
@@ -378,10 +630,11 @@ async def _admin_offer_show_pick_page(
     advert: dict,
 ) -> None:
     offers = list_advert_offers_joined_for_advert(aid)
+    offer_total = count_offers_for_advert(aid)
     summary = _admin_offer_ad_summary_html(advert)
     body = (
         f"{_RTL}📋 <b>خلاصه آگهی {aid}</b>\n\n{summary}\n\n"
-        f"{_admin_offers_list_html(offers)}"
+        f"{_admin_offers_list_html(offers, total_count=offer_total)}"
     )
     kb = _admin_offer_pick_keyboard(offers) if offers else _inline_cancel()
     context.user_data["admin_offer_advert"] = aid
@@ -539,6 +792,9 @@ def _admin_neg_offer_status_fa(status_val: str | None) -> str:
         "pending": "در انتظار",
         "accepted": "پذیرفته",
         "rejected": "رد شده",
+        "gate_aborted": "لغو (فعال‌سازی مجدد)",
+        "gate_rejected": "رد تأیید نهایی",
+        "gate_closed": "بسته",
     }.get(s, html_module.escape(s))
 
 
@@ -569,6 +825,14 @@ def _admin_negotiation_report_chunks(
                 lab = "آگهی‌دهنده"
             elif fr == "proposer":
                 lab = "پیشنهاددهنده"
+            elif fr == "system":
+                lab = "سیستم"
+            elif fr == "admin":
+                lab = "ادمین"
+            elif fr == "buyer":
+                lab = "خریدار"
+            elif fr == "seller":
+                lab = "فروشنده"
             elif fr == "other":
                 lab = "؟"
             else:
@@ -780,7 +1044,7 @@ async def _admin_deliver_negotiation_report(
     """ارسال گزارش مذاکرات؛ در صورت خطا رشتهٔ خطا، در صورت موفقیت None."""
     if not get_euro_advert_by_rowid(advert_id):
         return "ℹ️ آگهی پیدا نشد."
-    offers = list_advert_offers_joined_for_advert(advert_id)
+    offers = list_advert_offers_joined_for_advert(advert_id, limit=None)
     chunks = _admin_negotiation_report_chunks(
         advert_id, offers, context.application.bot_data
     )
@@ -867,7 +1131,7 @@ async def admin_add_user_otp_callback(update: Update, context: ContextTypes.DEFA
 
     if data == "admin_add_otp_resend":
         if try_send_verification_sms(phone, code):
-            new_user["otp_verify_twilio"] = uses_twilio_verify()
+            new_user["otp_verify_twilio"] = otp_checked_via_twilio_verify()
             context.user_data["new_user"] = new_user
             text = "📨 پیامک دوباره ارسال شد.\nلطفاً کدی که کاربر دریافت کرد را وارد کنید:"
         else:
@@ -1014,6 +1278,11 @@ async def admin_delete_user_confirm_callback(update: Update, context: ContextTyp
     _persist_admin_wizard_state(admin_uid, context)
 
     ok = delete_user(target_uid)
+    from utils.telegram_utils import clear_user_bot_session, notify_account_deleted_by_admin
+
+    clear_user_bot_session(user_data_store, target_uid)
+    if ok:
+        await notify_account_deleted_by_admin(context.bot, target_uid)
     chat_id = query.message.chat_id if query.message else update.effective_chat.id
     try:
         if query.message:
@@ -1329,6 +1598,8 @@ async def admin_advert_inline_callback(update: Update, context: ContextTypes.DEF
             await _send_admin_exch_delivery_prompt(context, query.message.chat_id)
             return
 
+        advert_before = get_euro_advert_by_rowid(int(advert_id))
+
         with get_db() as conn:
             cur = conn.cursor()
             if field == "methods":
@@ -1388,6 +1659,12 @@ async def admin_advert_inline_callback(update: Update, context: ContextTypes.DEF
             remember_cleanup_id(
                 user_data_store, query.from_user.id, sent.message_id, _ADMIN_CLEANUP_KEY
             )
+            try:
+                await notify_advert_field_updated(
+                    context.bot, int(advert_id), field, advert_before
+                )
+            except Exception:
+                pass
             return
 
         context.user_data["state"] = UserState.ADMIN_MENU.name
@@ -1421,6 +1698,13 @@ async def admin_advert_inline_callback(update: Update, context: ContextTypes.DEF
                 note = " (این آگهی قبل از آپدیت ساخته شده و پیام کانال در دیتابیس ذخیره نشده.)"
         except Exception:
             updated = False
+
+        try:
+            await notify_advert_field_updated(
+                context.bot, int(advert_id), field, advert_before
+            )
+        except Exception:
+            pass
 
         await context.bot.send_message(
             chat_id=query.message.chat_id,
@@ -1571,22 +1855,69 @@ def _fmt_user_block(row, idx: int | None = None) -> str:
     # Force correct direction: Persian RTL + keep identifiers LTR.
     RLM = "\u200f"
     LRM = "\u200e"
-    uname = f"{LRM}@{username}" if username else "—"
-    adv = display_name or "—"
-    name = f"{fn or ''} {ln or ''}".strip() or "—"
+
+    def _esc(val) -> str:
+        s = str(val or "").strip()
+        return html_module.escape(s) if s else "—"
+
+    if username:
+        uname = f"{LRM}@{_esc(username.lstrip('@'))}"
+    else:
+        uname = "— (بدون @username در تلگرام)"
+
+    # لینک پیام (داخل متن) — این لینک دکمهٔ کیبورد نیست، پس باعث Button_user_invalid نمی‌شود.
+    # اگر username داشته باشد، t.me بهتر است؛ در غیر این صورت tg://user?id استفاده می‌کنیم.
+    u_clean = (username or "").strip().lstrip("@")
+    if u_clean:
+        msg_href = f"https://t.me/{u_clean}"
+    else:
+        msg_href = f"tg://user?id={int(tg_id)}"
+    adv = _esc(display_name)
+    name = _esc(f"{fn or ''} {ln or ''}".strip() or "—")
+    phone_s = _esc(phone)
+    email_s = _esc(email)
+    addr = _esc(address)
+    if len(addr) > 120:
+        addr = addr[:117] + "…"
     is_admin_flag = "✅" if _is_admin(int(tg_id)) else "—"
     prefix = f"{RLM}{idx}) " if isinstance(idx, int) else ""
     return (
         f"{prefix}{RLM}👤 <b>{adv}</b>\n"
         f"{RLM}🧾 <b>نام/نام‌خانوادگی:</b> {name}\n"
         f"{RLM}🔗 <b>یوزرنیم:</b> <code>{uname}</code>\n"
-        f"{RLM}🆔 <b>آیدی تلگرام:</b> <code>{LRM}{tg_id}</code>\n"
-        f"{RLM}📱 <b>شماره:</b> <code>{LRM}{phone or '—'}</code>\n"
-        f"{RLM}📧 <b>ایمیل:</b> <code>{LRM}{email or '—'}</code>\n"
-        f"{RLM}🏠 <b>آدرس:</b> <code>{LRM}{address or '—'}</code>\n"
+        f"{RLM}🆔 <b>آیدی تلگرام:</b> <code>{LRM}{int(tg_id)}</code>\n"
+        # بعضی کلاینت‌ها tg:// را داخل <a> درست باز نمی‌کنند؛ لینک خام را هم می‌گذاریم.
+        f"{RLM}✉️ <a href=\"{html_module.escape(msg_href, quote=True)}\">ارسال پیام</a>\n"
+        f"{RLM}{LRM}{html_module.escape(msg_href)}\n"
+        f"{RLM}📱 <b>شماره:</b> <code>{LRM}{phone_s}</code>\n"
+        f"{RLM}📧 <b>ایمیل:</b> <code>{LRM}{email_s}</code>\n"
+        f"{RLM}🏠 <b>آدرس:</b> <code>{LRM}{addr}</code>\n"
         f"{RLM}🛡️ <b>ادمین:</b> {is_admin_flag}\n"
-        f"{RLM}💬 <b>پیام دادن:</b> <a href=\"tg://user?id={tg_id}\">ارسال پیام</a>\n"
     )
+
+
+def _admin_user_contact_button_label(row, idx: int | None = None) -> str:
+    """برچسب کوتاه برای دکمهٔ تماس (حداکثر ~۶۴ کاراکتر)."""
+    _tg_id, _username, display_name, fn, ln, *_rest = row[:8]
+    name = (display_name or "").strip() or f"{fn or ''} {ln or ''}".strip() or "کاربر"
+    if isinstance(idx, int):
+        return f"💬 {idx}. {name[:22]}"
+    return f"💬 {name[:26]}"
+
+
+def _admin_user_contact_button(row, idx: int):
+    """دکمه تماس: t.me یا tg://user?id= — فقط وقتی تلگرام لینک را می‌پذیرد."""
+    from telegram import InlineKeyboardButton
+
+    tg_id = int(row[0])
+    username = (row[1] or "").strip().lstrip("@")
+    contact_ok = row[8] if len(row) > 8 else True
+    label = _admin_user_contact_button_label(row, idx=idx)
+    if username:
+        return InlineKeyboardButton(label, url=f"https://t.me/{username}")
+    if not contact_ok or tg_id < 1:
+        return None
+    return InlineKeyboardButton(label, url=f"tg://user?id={tg_id}")
 
 
 _ADMIN_CLEANUP_KEY = "admin_cleanup_message_ids"
@@ -1633,6 +1964,33 @@ _ADMIN_WIZARD_STATE_NAMES = frozenset(
         UserState.ADMIN_PROXY_OFFER_DESC.name,
     }
 )
+
+# فلوهای کاربر/آگهی — نباید با admin_pending بازیابی‌شده بازنویسی شوند.
+_USER_FLOW_STATE_PREFIXES = ("EURO_", "EXCHANGE_", "OFFER_", "NEGOTIATION")
+
+
+def _admin_should_skip_wizard_recovery(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """True when an active non-admin wizard must keep context.user_data['state']."""
+    ud = context.user_data
+    if not ud:
+        return False
+    state = (ud.get("state") or "").strip()
+    if any(state.startswith(p) for p in _USER_FLOW_STATE_PREFIXES):
+        return True
+    if state == UserState.SERVICE_SELECTION.name:
+        return True
+    if ud.get("admin_post_advert_for"):
+        return True
+    if ud.get("offer_advert_id") is not None:
+        return True
+    if (ud.get("offer_flow_step") or "").strip():
+        return True
+    if ud.get("admin_iran_txn_draft_mode") in ("in", "out"):
+        return True
+    if (ud.get("admin_iran_txn_await_field") or "").strip():
+        return True
+    return False
+
 
 # نسخهٔ قدیمی DB (قبل از یکدست‌سازی با UserState.name)
 _ADMIN_PENDING_LEGACY = {
@@ -1698,6 +2056,8 @@ def _get_admin_pending(user_id: int) -> str | None:
 
 def _recover_admin_wizard_state(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
+        if _admin_should_skip_wizard_recovery(context):
+            return
         pending = _get_admin_pending(user_id)
         if not pending:
             return
@@ -1729,7 +2089,8 @@ async def _try_restore_admin_dashboard(context: ContextTypes.DEFAULT_TYPE, bot) 
         await bot.edit_message_text(
             chat_id=int(cid),
             message_id=int(mid),
-            text=texts.ADMIN_WELCOME,
+            text=_admin_welcome_text(),
+            parse_mode=ParseMode.HTML,
             reply_markup=kb,
         )
     except Exception:
@@ -1751,6 +2112,16 @@ async def _admin_edit_dashboard(
     reply_markup=None,
     parse_mode: str | None = None,
 ) -> bool:
+    import re
+
+    def _strip_html(s: str) -> str:
+        # Telegram HTML parse errors often happen when we truncate mid-tag.
+        # Fallback to plain text by stripping tags.
+        s2 = re.sub(r"<[^>]+>", "", s)
+        # Collapse excessive whitespace a bit.
+        s2 = re.sub(r"\n{3,}", "\n\n", s2)
+        return s2
+
     cid = context.user_data.get("adm_dash_cid")
     mid = context.user_data.get("adm_dash_mid")
     if cid is None or mid is None:
@@ -1766,8 +2137,48 @@ async def _admin_edit_dashboard(
             kw["parse_mode"] = parse_mode
         await bot.edit_message_text(**kw)
         return True
-    except Exception:
-        return False
+    except BadRequest as exc:
+        logger.warning("admin dashboard edit failed: %s", exc)
+        rm = reply_markup
+        if "button_user_invalid" in str(exc).lower():
+            rm = admin_panel_back_keyboard()
+        # If HTML entities can't be parsed (often due to truncation),
+        # retry sending as plain text to avoid crashing the admin UI.
+        pm = parse_mode
+        txt = text
+        if "can't parse entities" in str(exc).lower():
+            pm = None
+            txt = _strip_html(text)
+        try:
+            sent = await bot.send_message(
+                chat_id=int(cid),
+                text=txt[:4096],
+                reply_markup=rm if rm is not None else admin_panel_back_keyboard(),
+                parse_mode=pm,
+            )
+            context.user_data["adm_dash_cid"] = int(cid)
+            context.user_data["adm_dash_mid"] = sent.message_id
+            return True
+        except Exception:
+            logger.exception("admin dashboard send fallback failed")
+            return False
+    except Exception as exc:
+        logger.warning("admin dashboard edit failed: %s", exc)
+        try:
+            sent = await bot.send_message(
+                chat_id=int(cid),
+                text=text[:4096],
+                reply_markup=reply_markup
+                if reply_markup is not None
+                else admin_panel_back_keyboard(),
+                parse_mode=parse_mode,
+            )
+            context.user_data["adm_dash_cid"] = int(cid)
+            context.user_data["adm_dash_mid"] = sent.message_id
+            return True
+        except Exception:
+            logger.exception("admin dashboard send fallback failed")
+            return False
 
 
 async def _admin_reply(update: Update, text: str, **kwargs):
@@ -1812,6 +2223,7 @@ async def _admin_persist_fee_override_eur(
     context: ContextTypes.DEFAULT_TYPE, advert_id: int, sql_val: float | None
 ) -> tuple[bool, str]:
     """به‌روزرسانی fee_override_eur (کارمزد یورو برای هر طرف) و رفرش کانال؛ برمی‌گرداند (کانال_آپدیت_شد، یادداشت)."""
+    advert_before = get_euro_advert_by_rowid(int(advert_id))
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute(
@@ -1819,6 +2231,12 @@ async def _admin_persist_fee_override_eur(
             (sql_val, advert_id),
         )
         conn.commit()
+    try:
+        await notify_advert_field_updated(
+            context.bot, int(advert_id), "fee_override_eur", advert_before
+        )
+    except Exception:
+        pass
     note = ""
     updated = False
     try:
@@ -1856,11 +2274,14 @@ async def _admin_strip_reply_keyboard(bot, chat_id: int) -> None:
 
 async def _ensure_username(context: ContextTypes.DEFAULT_TYPE, tg_id: int, current: str | None) -> str | None:
     """Try to fetch missing username from Telegram if possible and persist."""
-    if current:
-        return current
+    cur = (current or "").strip().lstrip("@")
+    if cur:
+        return cur
+    if tg_id < 1:
+        return None
     try:
         chat = await context.bot.get_chat(tg_id)
-        uname = getattr(chat, "username", None)
+        uname = (getattr(chat, "username", None) or "").strip().lstrip("@") or None
         if uname:
             update_user_field(tg_id, "username", uname)
         return uname
@@ -1974,7 +2395,8 @@ async def admin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
     await _best_effort_remove_keyboard(update)
     sent = await update.effective_message.reply_text(
-        texts.ADMIN_WELCOME,
+        _admin_welcome_text(),
+        parse_mode="HTML",
         reply_markup=admin_home_inline_keyboard(),
     )
     context.user_data["adm_dash_cid"] = sent.chat_id
@@ -2040,7 +2462,11 @@ async def admin_dashboard_callback(update: Update, context: ContextTypes.DEFAULT
     _OFFER_INLINE_ACTIONS = frozenset(
         {"ofpick", "ofdel", "ofrate", "ofeur", "oflist"}
     )
-    if action in {"rxclr", "rxgo"} or action in _OFFER_INLINE_ACTIONS:
+    if (
+        action in {"rxclr", "rxgo", "lu", "al"}
+        or action in _OFFER_INLINE_ACTIONS
+        or (action in {"lu", "al"} and len(parts) > 2 and parts[2] == "p")
+    ):
         pass
     else:
         await _admin_cleanup_switch(context, admin_uid, chat_id)
@@ -2074,6 +2500,8 @@ async def admin_dashboard_callback(update: Update, context: ContextTypes.DEFAULT
             return
         await _admin_offer_show_pick_page(update, context, aid=aid, advert=advert)
         return
+
+    # NOTE: action "u" (per-user detail view) removed; user list is textual now.
 
     if action == "ofdel" and len(parts) > 2:
         try:
@@ -2155,31 +2583,36 @@ async def admin_dashboard_callback(update: Update, context: ContextTypes.DEFAULT
         return
 
     if action == "bot0":
-        try:
-            set_setting("bot_enabled", "0")
-        except Exception:
-            pass
-        try:
-            await context.bot.send_message(chat_id=ADVERT_CHANNEL_ID, text="⛔️ ربات غیرفعال شد.")
-        except Exception:
-            pass
+        from utils.bot_lifecycle import set_bot_enabled_state
+
         context.user_data["state"] = UserState.ADMIN_MENU.name
         _persist_admin_wizard_state(admin_uid, context)
-        await _admin_edit_dashboard(context, context.bot, "⛔️ ربات غیرفعال شد.")
+        res = await set_bot_enabled_state(
+            context.bot, enabled=False, admin_telegram_id=admin_uid
+        )
+        await _admin_edit_dashboard(
+            context,
+            context.bot,
+            f"⛔️ ربات غیرفعال شد.\n"
+            f"همگام‌سازی کانال: {res['sync_ok']} موفق، {res['sync_fail']} خطا.",
+        )
         return
 
     if action == "bot1":
-        try:
-            set_setting("bot_enabled", "1")
-        except Exception:
-            pass
-        try:
-            await context.bot.send_message(chat_id=ADVERT_CHANNEL_ID, text="✅ ربات فعال شد.")
-        except Exception:
-            pass
+        from utils.bot_lifecycle import set_bot_enabled_state
+
         context.user_data["state"] = UserState.ADMIN_MENU.name
         _persist_admin_wizard_state(admin_uid, context)
-        await _admin_edit_dashboard(context, context.bot, "✅ ربات فعال شد.")
+        res = await set_bot_enabled_state(
+            context.bot, enabled=True, admin_telegram_id=admin_uid
+        )
+        await _admin_edit_dashboard(
+            context,
+            context.bot,
+            f"✅ ربات فعال شد.\n"
+            f"همگام‌سازی کانال: {res['sync_ok']} موفق.\n"
+            f"اعلان به کاربران: {res['broadcast_n']} نفر.",
+        )
         return
 
     if action == "brate":
@@ -2271,32 +2704,26 @@ async def admin_dashboard_callback(update: Update, context: ContextTypes.DEFAULT
         return
 
     if action == "lu":
+        page = 0
+        if len(parts) > 3 and parts[2] == "p":
+            try:
+                page = int(parts[3])
+            except (TypeError, ValueError):
+                page = 0
         context.user_data["state"] = UserState.ADMIN_MENU.name
         _persist_admin_wizard_state(admin_uid, context)
-        with get_db() as conn:
-            cur = conn.cursor()
-            try:
-                rows = cur.execute(
-                    "SELECT telegram_id, username, display_name, full_name, last_name, phone_number, email, address FROM users ORDER BY rowid DESC LIMIT 30"
-                ).fetchall()
-            except Exception:
-                rows = []
-        if not rows:
+        if count_users() == 0:
             await _admin_edit_dashboard(context, context.bot, "ℹ️ کاربری یافت نشد.")
             return
-        enriched = []
-        for r in rows:
-            tg_id = int(r[0])
-            uname = await _ensure_username(context, tg_id, r[1])
-            enriched.append((r[0], uname, r[2], r[3], r[4], r[5], r[6], r[7]))
-        blocks = "\n".join([_fmt_user_block(r, idx=i + 1) for i, r in enumerate(enriched)])
-        await _admin_edit_dashboard(
-            context,
-            context.bot,
-            "👥 <b>لیست کاربران</b>\n\n" + blocks,
-            reply_markup=admin_panel_back_keyboard(),
-            parse_mode="HTML",
-        )
+        ok = await _admin_show_users_page(context, context.bot, page=page)
+        if not ok:
+            try:
+                await query.answer(
+                    "نمایش لیست کاربران ناموفق بود. دوباره /admin بزنید.",
+                    show_alert=True,
+                )
+            except Exception:
+                pass
         return
 
     if action == "su":
@@ -2404,42 +2831,18 @@ async def admin_dashboard_callback(update: Update, context: ContextTypes.DEFAULT
         return
 
     if action == "al":
+        page = 0
+        if len(parts) > 3 and parts[2] == "p":
+            try:
+                page = int(parts[3])
+            except (TypeError, ValueError):
+                page = 0
         context.user_data["state"] = UserState.ADMIN_MENU.name
         _persist_admin_wizard_state(admin_uid, context)
-        with get_db() as conn:
-            cur = conn.cursor()
-            try:
-                rows = cur.execute(
-                    """
-                    SELECT
-                        a.rowid,
-                        COALESCE(u.display_name, a.full_name) AS adv_name,
-                        u.username,
-                        a.euro_amount,
-                        a.rate_toman,
-                        a.operation
-                    FROM euro_adverts a
-                    LEFT JOIN users u ON u.telegram_id = a.user_id
-                    ORDER BY a.rowid DESC
-                    LIMIT 15
-                    """
-                ).fetchall()
-            except Exception:
-                rows = []
-        if not rows:
+        if count_euro_adverts() == 0:
             await _admin_edit_dashboard(context, context.bot, "ℹ️ آگهی‌ای یافت نشد.")
             return
-        lines = []
-        for r in rows:
-            advert_id, adv_name, uname, amount, rate, op = r
-            u_at = f"@{uname}" if uname else "—"
-            lines.append(f"- #{advert_id} | {op} | {adv_name} | {u_at} | {amount}€ | {_fmt_thousands(rate)}")
-        await _admin_edit_dashboard(
-            context,
-            context.bot,
-            "📢 آخرین آگهی‌ها:\n" + "\n".join(lines),
-            reply_markup=admin_panel_back_keyboard(),
-        )
+        await _admin_show_adverts_page(context, context.bot, page=page)
         return
 
     if action == "rx":
@@ -2500,14 +2903,16 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle admin menu buttons (reply keyboard)."""
     if not update.message:
         return
+    chat = update.effective_chat
+    from telegram.constants import ChatType
+
+    if not chat or chat.type != ChatType.PRIVATE:
+        return
+    if context.user_data is None:
+        return
     user_id = update.effective_user.id
     if not _is_admin(user_id):
         return
-
-    try:
-        _recover_admin_wizard_state(user_id, context)
-    except Exception:
-        pass
 
     text = (update.message.text or "").strip()
     state = context.user_data.get("state")
@@ -2574,6 +2979,12 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
+        _recover_admin_wizard_state(user_id, context)
+    except Exception:
+        pass
+    state = context.user_data.get("state")
+
+    try:
         if state in admin_states and update.message:
             remember_cleanup_id(user_data_store, user_id, update.message.message_id, _ADMIN_USER_INPUT_KEY)
 
@@ -2607,28 +3018,31 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         if text in {"⛔️ غیرفعال کردن ربات", "✅ فعال کردن ربات"}:
+            from utils.bot_lifecycle import set_bot_enabled_state
+
             chat_id_toggle = update.effective_chat.id
             ids_toggle = user_data_store.setdefault(user_id, {}).pop(_ADMIN_CLEANUP_KEY, [])
             await cleanup_ids(context.bot, chat_id=chat_id_toggle, ids=ids_toggle)
             ids_ut = user_data_store.setdefault(user_id, {}).pop(_ADMIN_USER_INPUT_KEY, [])
             await cleanup_ids(context.bot, chat_id=chat_id_toggle, ids=ids_ut)
-            enabled = (text == "✅ فعال کردن ربات")
-            try:
-                set_setting("bot_enabled", "1" if enabled else "0")
-            except Exception:
-                pass
-            # Notify channel (best effort)
-            try:
-                await context.bot.send_message(
-                    chat_id=ADVERT_CHANNEL_ID,
-                    text=("✅ ربات فعال شد." if enabled else "⛔️ ربات غیرفعال شد."),
-                )
-            except Exception:
-                pass
-            return await _admin_reply(update,
-                ("✅ ربات فعال شد." if enabled else "⛔️ ربات غیرفعال شد."),
-                reply_markup=None, context=context,
+            enabled = text == "✅ فعال کردن ربات"
+            res = await set_bot_enabled_state(
+                context.bot,
+                enabled=enabled,
+                admin_telegram_id=user_id,
             )
+            if enabled:
+                msg = (
+                    f"✅ ربات فعال شد.\n"
+                    f"کانال: {res['sync_ok']} پست به‌روز شد.\n"
+                    f"اعلان کاربران: {res['broadcast_n']}."
+                )
+            else:
+                msg = (
+                    f"⛔️ ربات غیرفعال شد.\n"
+                    f"کانال: {res['sync_ok']} پست به‌روز شد."
+                )
+            return await _admin_reply(update, msg, reply_markup=None, context=context)
 
         admin_reply_menu = admin_actions - {
             "🏠 بازگشت به منو اصلی",
@@ -2712,6 +3126,7 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         reply_markup=None, context=context,
                     )
                 context.user_data["admin_post_advert_for"] = {"user_id": owner, "display_name": dn}
+                _clear_admin_pending(user_id)
                 context.user_data.pop("admin_new_advert_owner_id", None)
                 context.user_data.pop("admin_add_ad_step", None)
                 context.user_data["state"] = UserState.SERVICE_SELECTION.name
@@ -2789,6 +3204,7 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 show_instant = side != "خرید" and delivery_method == "امکان واریز به حساب دارم"
                 instant_db = inst if show_instant else None
 
+                advert_before = get_euro_advert_by_rowid(int(advert_id))
                 with get_db() as conn:
                     cur = conn.cursor()
                     cur.execute(
@@ -2851,6 +3267,13 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     updated = False
 
+                try:
+                    await notify_advert_exchange_bundle_updated(
+                        context.bot, int(advert_id), advert_before
+                    )
+                except Exception:
+                    pass
+
                 return await _admin_reply(update,
                     "✅ جزئیات معاوضه ذخیره شد و آگهی به‌روز شد."
                     + (" (کانال هم آپدیت شد.)" if updated else " (آپدیت کانال ناموفق بود.)")
@@ -2859,7 +3282,7 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
         if state == UserState.ADMIN_SEARCH_USER.name:
-            rows = search_users(text, limit=20)
+            rows = search_users(text, limit=LIST_RECENT_LIMIT)
             context.user_data["state"] = UserState.ADMIN_MENU.name
             _clear_admin_pending(user_id)
             if not rows:
@@ -3064,6 +3487,7 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "برای خروج دکمهٔ انصراف را بزنید.",
                     reply_markup=_inline_cancel(),
                 )
+            advert_before = get_euro_advert_by_rowid(int(advert_id))
             with get_db() as conn:
                 cur = conn.cursor()
                 cur.execute("UPDATE euro_adverts SET rate_toman = ? WHERE rowid = ?", (str(vv), advert_id))
@@ -3108,6 +3532,12 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     note = " (این آگهی قبل از آپدیت ساخته شده و پیام کانال در دیتابیس ذخیره نشده.)"
             except Exception:
                 updated = False
+            try:
+                await notify_advert_field_updated(
+                    context.bot, int(advert_id), "rate_toman", advert_before
+                )
+            except Exception:
+                pass
             await _best_effort_remove_keyboard(update)
             return await _admin_reply(update,
                 "✅ نرخ ذخیره شد و آگهی به‌روز شد."
@@ -3192,6 +3622,7 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 value = str(vv)
 
+            advert_before = get_euro_advert_by_rowid(int(advert_id))
             with get_db() as conn:
                 cur = conn.cursor()
                 cur.execute(f"UPDATE euro_adverts SET {field} = ? WHERE rowid = ?", (value, advert_id))
@@ -3240,6 +3671,13 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     note = " (این آگهی قبل از آپدیت ساخته شده و پیام کانال در دیتابیس ذخیره نشده.)"
             except Exception:
                 updated = False
+
+            try:
+                await notify_advert_field_updated(
+                    context.bot, int(advert_id), field, advert_before
+                )
+            except Exception:
+                pass
 
             await _best_effort_remove_keyboard(update)
             return await _admin_reply(update,
@@ -3292,6 +3730,14 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["state"] = UserState.ADMIN_MENU.name
             if text == "✅ تایید حذف" and isinstance(uid, int):
                 ok = delete_user(uid)
+                if ok:
+                    from utils.telegram_utils import (
+                        clear_user_bot_session,
+                        notify_account_deleted_by_admin,
+                    )
+
+                    clear_user_bot_session(user_data_store, uid)
+                    await notify_account_deleted_by_admin(context.bot, uid)
                 return await _admin_reply(
                     update,
                     "✅ حذف شد." if ok else "ℹ️ کاربر پیدا نشد.",
@@ -3394,7 +3840,7 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     code = generate_sms_code()
                     via_verify = False
                     if try_send_verification_sms(value, code):
-                        via_verify = uses_twilio_verify()
+                        via_verify = otp_checked_via_twilio_verify()
                         hint = "📨 کد به خط موبایل پیامک شد.\n\n"
                     else:
                         hint = (
@@ -3418,10 +3864,18 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         parse_mode="HTML",
                     )
             ok = False
+            user_before = get_user(uid) if isinstance(uid, int) else None
             if isinstance(uid, int) and isinstance(field, str):
                 ok = update_user_field(uid, field, value)
             context.user_data["state"] = UserState.ADMIN_MENU.name
             await _best_effort_remove_keyboard(update)
+            if ok and isinstance(uid, int) and isinstance(field, str):
+                try:
+                    await notify_user_profile_updated(
+                        context.bot, uid, field, user_before, get_user(uid)
+                    )
+                except Exception:
+                    pass
             return await _admin_reply(update,"✅ ذخیره شد." if ok else "❌ ذخیره نشد.", reply_markup=None, context=context)
 
         if state == UserState.ADMIN_EDIT_PHONE_VERIFY.name:
@@ -3442,11 +3896,19 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             field = pending.get("field")
             value = pending.get("value")
             ok = False
+            user_before = get_user(uid) if isinstance(uid, int) else None
             if isinstance(uid, int) and isinstance(field, str):
                 ok = update_user_field(uid, field, value)
             context.user_data.pop("pending_phone_update", None)
             context.user_data["state"] = UserState.ADMIN_MENU.name
             await _best_effort_remove_keyboard(update)
+            if ok and isinstance(uid, int) and isinstance(field, str):
+                try:
+                    await notify_user_profile_updated(
+                        context.bot, uid, field, user_before, get_user(uid)
+                    )
+                except Exception:
+                    pass
             return await _admin_reply(update,"✅ ذخیره شد." if ok else "❌ ذخیره نشد.", reply_markup=None, context=context)
 
         if state == UserState.ADMIN_ADD_USER_ID.name:
@@ -3535,7 +3997,7 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 new_user["otp_verify_twilio"] = False
                 context.user_data["new_user"] = new_user
                 if try_send_verification_sms(phone, code):
-                    new_user["otp_verify_twilio"] = uses_twilio_verify()
+                    new_user["otp_verify_twilio"] = otp_checked_via_twilio_verify()
                     context.user_data["new_user"] = new_user
                     return await _admin_reply(
                         update,
@@ -3683,7 +4145,14 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=None,
                     context=context,
                 )
-            ins = insert_advert_offer(aid, user_id, rate, desc, offer_alias_name=alias)
+            ins = insert_advert_offer(
+                aid,
+                user_id,
+                rate,
+                desc,
+                offer_alias_name=alias,
+                enforce_rejection_rules=False,
+            )
             if ins is None:
                 return await _admin_reply(
                     update,
@@ -4039,28 +4508,12 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["state"] = UserState.ADMIN_MENU.name
 
         if text == "👥 لیست کاربران":
-            with get_db() as conn:
-                cur = conn.cursor()
-                try:
-                    rows = cur.execute(
-                        "SELECT telegram_id, username, display_name, full_name, last_name, phone_number, email, address FROM users ORDER BY rowid DESC LIMIT 30"
-                    ).fetchall()
-                except Exception:
-                    rows = []
-            if not rows:
-                return await _admin_reply(update,"ℹ️ کاربری یافت نشد.")
-            enriched = []
-            for r in rows:
-                tg_id = int(r[0])
-                uname = await _ensure_username(context, tg_id, r[1])
-                rr = (r[0], uname, r[2], r[3], r[4], r[5], r[6], r[7])
-                enriched.append(rr)
-            blocks = "\n".join([_fmt_user_block(r, idx=i + 1) for i, r in enumerate(enriched)])
-            return await _admin_reply(update,
-                "👥 <b>لیست کاربران</b>\n\n" + blocks,
-                parse_mode="HTML",
-                reply_markup=None, context=context,
-                disable_web_page_preview=True,
+            return await _admin_reply(
+                update,
+                f"{_RTL}برای لیست صفحه‌بندی‌شده، از پنل اینلاین "
+                f"(دستور /admin → لیست کاربران) استفاده کنید.",
+                reply_markup=None,
+                context=context,
             )
 
         if text == "🔎 جستجوی کاربر":
@@ -4164,34 +4617,13 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         if text == "📢 لیست آگهی‌ها":
-            with get_db() as conn:
-                cur = conn.cursor()
-                try:
-                    rows = cur.execute(
-                        """
-                        SELECT
-                            a.rowid,
-                            COALESCE(u.display_name, a.full_name) AS adv_name,
-                            u.username,
-                            a.euro_amount,
-                            a.rate_toman,
-                            a.operation
-                        FROM euro_adverts a
-                        LEFT JOIN users u ON u.telegram_id = a.user_id
-                        ORDER BY a.rowid DESC
-                        LIMIT 15
-                        """
-                    ).fetchall()
-                except Exception:
-                    rows = []
-            if not rows:
-                return await _admin_reply(update,"ℹ️ آگهی‌ای یافت نشد.")
-            lines = []
-            for r in rows:
-                advert_id, adv_name, uname, amount, rate, op = r
-                u_at = f"@{uname}" if uname else "—"
-                lines.append(f"- #{advert_id} | {op} | {adv_name} | {u_at} | {amount}€ | {_fmt_thousands(rate)}")
-            return await _admin_reply(update,"📢 آخرین آگهی‌ها:\n" + "\n".join(lines))
+            return await _admin_reply(
+                update,
+                f"{_RTL}برای لیست صفحه‌بندی‌شده، از پنل اینلاین "
+                f"(/admin → لیست آگهی‌ها) استفاده کنید.",
+                reply_markup=None,
+                context=context,
+            )
 
         # Fallback
         return await _admin_reply(update,"لطفاً یکی از گزینه‌های پنل مدیریت را انتخاب کنید.")

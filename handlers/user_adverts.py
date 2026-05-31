@@ -14,8 +14,9 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
-from config.settings import ADVERT_CHANNEL_ID
+from config.settings import ADVERT_CHANNEL_ID, LIST_RECENT_LIMIT
 from database.db import (
+    count_euro_adverts_owned_by_user,
     delete_euro_advert_for_owner,
     get_euro_advert_by_rowid,
     get_user,
@@ -23,6 +24,7 @@ from database.db import (
     update_euro_advert_field_for_owner,
     user_advert_has_active_offers,
 )
+from utils.pagination import clamp_page, pagination_nav_row, sql_offset
 from handlers.offers import advert_public_link_html, refresh_advert_channel_post
 from keyboards.menus import MY_ADVERTS_REPLY_BUTTON_TEXT
 from models.enums import UserState
@@ -58,9 +60,15 @@ def _fmt_advert_row_label(d: dict, *, locked: bool) -> str:
     return s[:58] if len(s) > 58 else s
 
 
-def _adverts_list_keyboard(rows: list[dict]) -> InlineKeyboardMarkup:
+def _adverts_list_keyboard(
+    user_id: int, *, page: int = 0
+) -> InlineKeyboardMarkup:
+    total = count_euro_adverts_owned_by_user(user_id)
+    page, pages = clamp_page(page, total)
+    lim, off = sql_offset(page)
+    rows = list_euro_adverts_owned_by_user(user_id, limit=lim, offset=off)
     kb = []
-    for d in rows[:28]:
+    for d in rows:
         rid = int(d["rowid"])
         locked = user_advert_has_active_offers(rid)
         kb.append(
@@ -71,20 +79,36 @@ def _adverts_list_keyboard(rows: list[dict]) -> InlineKeyboardMarkup:
                 )
             ]
         )
+    nav = pagination_nav_row(
+        prev_cb=f"user_adv|pl|{page - 1}" if page > 0 else None,
+        next_cb=f"user_adv|pl|{page + 1}" if page < pages - 1 else None,
+        page=page,
+        total_pages=pages,
+    )
+    if nav:
+        kb.append(nav)
+    kb.append(
+        [InlineKeyboardButton("🔎 شماره آگهی", callback_data="user_adv|find")]
+    )
     kb.append([InlineKeyboardButton("❌ بستن", callback_data="user_adv|close")])
     return InlineKeyboardMarkup(kb)
 
 
-_LIST_INTRO = (
-    f"{_RTL}📰 <b>آگهی‌های من</b>\n"
-    f"{_RTL}🔒 = پیشنهاد <b>در انتظار</b> یا <b>پذیرفته‌شده</b> — فقط مشاهده (بدون ویرایش/حذف).\n"
-    f"{_RTL}یک آگهی را باز کنید:"
-)
+def _list_intro(page: int, total: int) -> str:
+    pages = max(1, (total + LIST_RECENT_LIMIT - 1) // LIST_RECENT_LIMIT) if total else 1
+    return (
+        f"{_RTL}📰 <b>آگهی‌های من</b> — صفحه {page + 1}/{pages} (کل {total})\n"
+        f"{_RTL}🔒 = پیشنهاد فعال — فقط مشاهده.\n"
+        f"{_RTL}برای آگهی قدیمی «شماره آگهی» را بزنید.\n"
+        f"{_RTL}یک آگهی را باز کنید:"
+    )
 
 
-async def _send_my_adverts_list(bot, chat_id: int, user_id: int) -> None:
-    rows = list_euro_adverts_owned_by_user(user_id)
-    if not rows:
+async def _send_my_adverts_list(
+    bot, chat_id: int, user_id: int, *, page: int = 0
+) -> None:
+    total = count_euro_adverts_owned_by_user(user_id)
+    if total == 0:
         await bot.send_message(
             chat_id,
             f"{_RTL}📭 هنوز آگهی ثبت نکرده‌اید.\n"
@@ -98,8 +122,8 @@ async def _send_my_adverts_list(bot, chat_id: int, user_id: int) -> None:
         return
     await bot.send_message(
         chat_id,
-        _LIST_INTRO,
-        reply_markup=_adverts_list_keyboard(rows),
+        _list_intro(page, total),
+        reply_markup=_adverts_list_keyboard(user_id, page=page),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
@@ -136,8 +160,16 @@ async def handle_main_my_adverts_callback(
         await q.answer("ابتدا ثبت‌نام کنید.", show_alert=True)
         return
     await q.answer()
-    rows = list_euro_adverts_owned_by_user(uid)
-    if not rows:
+    data = (q.data or "").strip()
+    if data.startswith("user_adv|pl|"):
+        try:
+            page = int(data.split("|")[2])
+        except (ValueError, IndexError):
+            page = 0
+    else:
+        page = 0
+    total = count_euro_adverts_owned_by_user(uid)
+    if total == 0:
         empty_text = (
             f"{_RTL}📭 هنوز آگهی ثبت نکرده‌اید.\n"
             f"{_RTL}بعد از انتشار آگهی در کانال، اینجا فهرست می‌شود."
@@ -167,13 +199,13 @@ async def handle_main_my_adverts_callback(
         return
     try:
         await q.edit_message_text(
-            _LIST_INTRO,
-            reply_markup=_adverts_list_keyboard(rows),
+            _list_intro(page, total),
+            reply_markup=_adverts_list_keyboard(uid, page=page),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
     except Exception:
-        await _send_my_adverts_list(context.bot, q.message.chat_id, uid)
+        await _send_my_adverts_list(context.bot, q.message.chat_id, uid, page=page)
 
 
 def _detail_keyboard(rid: int, *, locked: bool) -> InlineKeyboardMarkup:
@@ -231,6 +263,37 @@ async def handle_user_adv_callback(update: Update, context: ContextTypes.DEFAULT
 
     if not get_user(uid):
         await q.answer("ثبت‌نام کنید.", show_alert=True)
+        return
+
+    if action == "pl" and len(parts) >= 3:
+        await q.answer()
+        try:
+            page = int(parts[2])
+        except (TypeError, ValueError):
+            page = 0
+        total = count_euro_adverts_owned_by_user(uid)
+        if total == 0:
+            await q.answer("آگهی‌ای ندارید.", show_alert=True)
+            return
+        try:
+            await q.edit_message_text(
+                _list_intro(page, total),
+                reply_markup=_adverts_list_keyboard(uid, page=page),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            await _send_my_adverts_list(context.bot, q.message.chat_id, uid, page=page)
+        return
+
+    if action == "find":
+        await q.answer()
+        context.user_data["user_adv_find_prompt"] = True
+        await context.bot.send_message(
+            q.message.chat_id,
+            f"{_RTL}🔎 <b>شماره آگهی</b> (فقط عدد، مثلاً 3215) را بفرستید:",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     if action == "m" and len(parts) >= 3:
@@ -423,5 +486,44 @@ async def handle_user_own_advert_edit_message(
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton(MY_ADVERTS_REPLY_BUTTON_TEXT, callback_data="main_my_adverts")]]
         ),
+        disable_web_page_preview=True,
+    )
+
+
+async def handle_user_adv_find_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not context.user_data.pop("user_adv_find_prompt", None):
+        return
+    uid = update.effective_user.id
+    if not get_user(uid):
+        await update.message.reply_text("ابتدا ثبت‌نام کنید.")
+        return
+    raw = (update.message.text or "").strip()
+    m = re.search(r"\d+", raw)
+    if not m:
+        await update.message.reply_text(f"{_RTL}شماره آگهی معتبر وارد کنید.")
+        context.user_data["user_adv_find_prompt"] = True
+        return
+    rid = int(m.group(0))
+    adv = get_euro_advert_by_rowid(rid)
+    if not adv or _owner_uid(adv) != uid:
+        await update.message.reply_text(
+            f"{_RTL}آگهی <b>#{rid}</b> برای شما پیدا نشد.", parse_mode=ParseMode.HTML
+        )
+        return
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    locked = user_advert_has_active_offers(rid)
+    link = advert_public_link_html(adv, rid)
+    await update.effective_chat.send_message(
+        f"{_RTL}✅ آگهی {link}\n"
+        f"{_RTL}برای جزئیات و ویرایش از دکمه زیر استفاده کنید.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_detail_keyboard(rid, locked=locked),
         disable_web_page_preview=True,
     )

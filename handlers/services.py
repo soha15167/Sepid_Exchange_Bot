@@ -2,7 +2,7 @@
 handlers/services.py — Main menu services / منوی خدمات
 
 EN: Entry to buy/sell euro, VPN placeholder, cancel; requires channel rules ack.
-FA: ثبت درخواست خدمات، خرید/فروش یورو؛ نیاز به مطالعهٔ قوانین کانال.
+FA: درخواست خدمات، خرید/فروش یورو؛ نیاز به مطالعهٔ قوانین کانال.
 """
 
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
@@ -17,6 +17,7 @@ from config.settings import ADMIN_IDS
 from database.db import get_restriction_block_message, get_user
 from models.enums import UserState
 from state import user_data_store
+from handlers.access_gate import ensure_registered_or_redirect
 from utils.telegram_utils import safe_delete_message
 from utils.telegram_utils import (
     remember_cleanup_id,
@@ -32,6 +33,8 @@ _EXCHANGE_CLEANUP_KEY = "exchange_cleanup_message_ids"
 
 # 📋 نمایش منوی اصلی خدمات
 async def show_services_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await ensure_registered_or_redirect(update, context):
+        return
     user_id = update.effective_user.id
     if user_id not in set(ADMIN_IDS or []):
         block = get_restriction_block_message(user_id)
@@ -75,7 +78,7 @@ async def show_services_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
             q = update.callback_query
             alert = (
                 "ابتدا از منوی اصلی گزینهٔ «قوانین و روال کار کانال» را باز کنید و مطالعه کنید؛ "
-                "بعد «ثبت درخواست خدمات» برای شما فعال می‌شود."
+                "بعد «درخواست خدمات» برای شما فعال می‌شود."
             )
             if q:
                 try:
@@ -115,6 +118,8 @@ async def show_services_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def handle_services_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await ensure_registered_or_redirect(update, context):
+        return
     query = update.callback_query
     try:
         await query.answer()
@@ -194,6 +199,11 @@ async def handle_services_menu_callback(update: Update, context: ContextTypes.DE
 # ❌ انصراف از عملیات و بازگشت به منوی اصلی
 async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    if user_id in set(ADMIN_IDS or []):
+        from handlers.iran_panel_sync import abort_iran_tx_flow_if_active
+
+        if await abort_iran_tx_flow_if_active(update, context):
+            return
     if context.user_data.get("admin_post_advert_for") and user_id in set(ADMIN_IDS or []):
         user_data_store.pop(user_id, None)
         context.user_data.clear()
@@ -203,31 +213,30 @@ async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=admin_home_inline_keyboard(),
         )
     chat_id = update.effective_chat.id
+    extra = [update.message.message_id] if update.message else []
     await cleanup_transient_dm_messages(
         context.bot,
         chat_id=chat_id,
         user_id=user_id,
         store=user_data_store,
         context_user_data=context.user_data,
+        extra_message_ids=extra,
     )
     reset_flow_user_bucket(user_data_store, user_id)
     context.user_data.clear()
     await send_or_replace_main_menu(
         context.bot,
-        chat_id=update.effective_chat.id,
+        chat_id=chat_id,
         user_id=user_id,
         store=user_data_store,
         text="🏠 بازگشت به منوی اصلی:",
     )
-    context.user_data['state'] = UserState.MAIN_MENU.name
-    try:
-        if update.message:
-            await update.message.delete()
-    except Exception:
-        pass
+    context.user_data["state"] = UserState.MAIN_MENU.name
 
 
 async def handle_service_operation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await ensure_registered_or_redirect(update, context):
+        return
     query = update.callback_query
     try:
         await query.answer()
@@ -280,7 +289,8 @@ async def handle_service_operation_callback(update: Update, context: ContextType
 
     await query.edit_message_text(
         get_payment_selection_text(operation),
-        reply_markup=generate_inline_keyboard([])
+        reply_markup=generate_inline_keyboard([]),
+        parse_mode="HTML",
     )
 
 
@@ -313,13 +323,15 @@ async def handle_inline_cancel_callback(update: Update, context: ContextTypes.DE
             reply_markup=admin_home_inline_keyboard(),
         )
     chat_id = query.message.chat_id if query.message else update.effective_chat.id
-    ids = []
-    ids += list((context.user_data or {}).get("offer_flow_mids") or [])
-    bucket = user_data_store.get(user_id, {})
-    ids += bucket.pop(_EURO_CLEANUP_KEY, [])
-    ids += bucket.pop(_EXCHANGE_CLEANUP_KEY, [])
-    ids += bucket.pop(_MAIN_CLEANUP_KEY, [])
-    await cleanup_ids(context.bot, chat_id=chat_id, ids=ids)
+    extra = [query.message.message_id] if query.message else []
+    await cleanup_transient_dm_messages(
+        context.bot,
+        chat_id=chat_id,
+        user_id=user_id,
+        store=user_data_store,
+        context_user_data=context.user_data,
+        extra_message_ids=extra,
+    )
     reset_flow_user_bucket(user_data_store, user_id)
     context.user_data.clear()
     context.user_data['state'] = UserState.MAIN_MENU.name

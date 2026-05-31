@@ -19,9 +19,15 @@ from config.settings import ADVERT_CHANNEL_ID, CHANNEL_USERNAME
 from utils.channel_format import format_channel_ad_footer
 from database.db import get_user, get_db
 from state import user_data_store
-from utils.telegram_utils import remember_cleanup_id, cleanup_ids, send_or_replace_main_menu
+from utils.telegram_utils import (
+    remember_cleanup_id,
+    cleanup_ids,
+    cleanup_transient_dm_messages,
+    mark_flow_keep_message,
+    send_or_replace_main_menu,
+)
 from utils.euro_fees import format_fee_eur as _format_fee_eur
-from handlers.offers import offer_proposal_inline_button
+from handlers.offers import channel_ad_reply_markup
 from utils.channel_format import format_payment_methods_rtl as _format_methods_rtl
 from utils.channel_membership import (
     channel_membership_required_html,
@@ -93,18 +99,13 @@ def _format_instant_transfer(value: str | None) -> str | None:
 async def ask_euro_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['state'] = UserState.EURO_AMOUNT.name
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id if update.effective_chat else user_id
     user_data_store.setdefault(user_id, {})
-    if update.message:
-        prompt = await update.message.reply_text(
-            "💶 لطفاً مقدار یورو مورد نظر را وارد کنید\n(مثال: 1200)",
-            reply_markup=inline_cancel_keyboard()
-        )
-    else:
-        prompt = await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="💶 لطفاً مقدار یورو مورد نظر را وارد کنید\n(مثال: 1200)",
-            reply_markup=inline_cancel_keyboard(),
-        )
+    prompt = await context.bot.send_message(
+        chat_id=chat_id,
+        text="💶 لطفاً مقدار یورو مورد نظر را وارد کنید\n(مثال: 1200)",
+        reply_markup=inline_cancel_keyboard(),
+    )
     context.user_data["last_prompt_message_id"] = prompt.message_id
     remember_cleanup_id(user_data_store, user_id, prompt.message_id, _EURO_CLEANUP_KEY)
 
@@ -127,13 +128,20 @@ async def ask_account_country(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def handle_account_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("state") != UserState.EURO_ACCOUNT_COUNTRY.name or not update.message:
+    if not update.message:
+        return
+    if context.user_data.get("state") != UserState.EURO_ACCOUNT_COUNTRY.name:
+        await update.message.reply_text(
+            "⚠️ مرحلهٔ قبلی منقضی شده.\n"
+            "از /menu منوی اصلی را بزنید و دوباره ثبت آگهی را شروع کنید."
+        )
         return
     country = update.message.text.strip()
     if not country:
         return await update.message.reply_text("❌ لطفاً نام کشور را وارد کنید.", reply_markup=inline_cancel_keyboard())
 
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     if user_id not in user_data_store:
         user_data_store[user_id] = {"methods": [], "operation": ""}
     remember_cleanup_id(user_data_store, user_id, update.message.message_id, _EURO_CLEANUP_KEY)
@@ -148,19 +156,24 @@ async def handle_account_country(update: Update, context: ContextTypes.DEFAULT_T
     try:
         mid = context.user_data.pop("last_prompt_message_id", None)
         if mid:
-            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=mid)
+            await context.bot.delete_message(chat_id=chat_id, message_id=mid)
     except Exception:
         pass
 
     # For BUY flow, skip "instant transfer" step (user receives money, not transfers).
-    operation = user_data_store.get(user_id, {}).get("operation")
+    operation = (
+        user_data_store.get(user_id, {}).get("operation")
+        or context.user_data.get("operation")
+        or ""
+    ).strip()
     if operation == "خرید":
         context.user_data["state"] = UserState.EURO_AMOUNT.name
         return await ask_euro_amount(update, context)
 
     context.user_data["state"] = UserState.EURO_INSTANT_TRANSFER.name
-    q = await update.message.reply_text(
-        "🏦 آیا امکانی واریز آنی را دارید:",
+    q = await context.bot.send_message(
+        chat_id=chat_id,
+        text="🏦 آیا امکانی واریز آنی را دارید:",
         reply_markup=InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("دارم", callback_data="instant_have"),
@@ -174,6 +187,10 @@ async def handle_account_country(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def handle_instant_transfer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from handlers.access_gate import ensure_registered_or_redirect
+
+    if await ensure_registered_or_redirect(update, context):
+        return
     query = update.callback_query
     if not query:
         return
@@ -212,7 +229,13 @@ async def handle_instant_transfer_callback(update: Update, context: ContextTypes
 
 
 async def ask_euro_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("state") != UserState.EURO_AMOUNT.name or not update.message:
+    if not update.message:
+        return
+    if context.user_data.get("state") != UserState.EURO_AMOUNT.name:
+        await update.message.reply_text(
+            "⚠️ مرحلهٔ قبلی منقضی شده.\n"
+            "از /menu منوی اصلی را بزنید و دوباره ثبت آگهی را شروع کنید."
+        )
         return
     msg = update.message
     user_id = update.effective_user.id
@@ -246,7 +269,13 @@ async def ask_euro_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def ask_euro_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("state") != UserState.EURO_RATE.name or not update.message:
+    if not update.message:
+        return
+    if context.user_data.get("state") != UserState.EURO_RATE.name:
+        await update.message.reply_text(
+            "⚠️ مرحلهٔ قبلی منقضی شده.\n"
+            "از /menu منوی اصلی را بزنید و دوباره ثبت آگهی را شروع کنید."
+        )
         return
     msg = update.message
     user_id = update.effective_user.id
@@ -339,13 +368,28 @@ async def preview_advert(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def confirm_and_post_advert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from config.settings import ADMIN_IDS
+    from database.db import is_bot_enabled
+    from handlers.access_gate import ensure_registered_or_redirect
+
+    if await ensure_registered_or_redirect(update, context):
+        return
     query = update.callback_query
-    await query.answer()
     user_id = query.from_user.id
+    admin_posting = bool(context.user_data.get("admin_post_advert_for"))
+    if (
+        not is_bot_enabled()
+        and not admin_posting
+        and user_id not in set(ADMIN_IDS or [])
+    ):
+        try:
+            await query.answer("⛔️ ربات موقتاً غیرفعال است.", show_alert=True)
+        except Exception:
+            pass
+        return
+    await query.answer()
     chat_id = query.message.chat_id
     user_data_store.setdefault(user_id, {})
-
-    admin_posting = bool(context.user_data.get("admin_post_advert_for"))
     owner_id, full_name = resolve_channel_advert_identity(context, user_id)
     try:
         owner_id = int(owner_id)
@@ -425,9 +469,7 @@ async def confirm_and_post_advert(update: Update, context: ContextTypes.DEFAULT_
             chat_id=ADVERT_CHANNEL_ID,
             text=ad_text,
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(
-                [[offer_proposal_inline_button(int(advert_id), bot_uname)]]
-            ),
+            reply_markup=channel_ad_reply_markup(int(advert_id), bot_uname),
             disable_web_page_preview=True,
         )
 
@@ -488,17 +530,19 @@ async def confirm_and_post_advert(update: Update, context: ContextTypes.DEFAULT_
         )
         return
 
-    # One final chat message: delete the whole flow, then success + main menu (no duplicate bubbles).
-    ids = user_data_store.get(user_id, {}).pop(_EURO_CLEANUP_KEY, [])
-    await cleanup_ids(context.bot, chat_id=chat_id, ids=ids)
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
+    extra = [query.message.message_id] if query.message else []
+    await cleanup_transient_dm_messages(
+        context.bot,
+        chat_id=chat_id,
+        user_id=user_id,
+        store=user_data_store,
+        context_user_data=context.user_data,
+        extra_message_ids=extra,
+    )
     await try_open_telegram_url(query, real_link)
 
     rm = admin_home_inline_keyboard() if admin_posting else main_menu_inline_keyboard
-    await send_or_replace_main_menu(
+    menu_mid = await send_or_replace_main_menu(
         context.bot,
         chat_id=chat_id,
         user_id=user_id,
@@ -507,6 +551,7 @@ async def confirm_and_post_advert(update: Update, context: ContextTypes.DEFAULT_
         reply_markup=rm,
         parse_mode=ParseMode.HTML,
     )
+    mark_flow_keep_message(user_data_store, user_id, context.user_data, menu_mid)
 
     context.user_data.clear()
     context.user_data["state"] = UserState.ADMIN_MENU.name if admin_posting else UserState.MAIN_MENU.name

@@ -113,16 +113,7 @@ def format_bonbast_channel_html(
     FA: پیام HTML برای کانال؛ ستون فروش = {code}1 ، خرید = {code}2.
     """
     codes = currency_codes or list(CURRENCY_LABELS.keys())
-    updated = (data.get("last_modified") or data.get("created") or "").strip()
-    lines = [
-        "📊 <b>نرخ ارز بازار آزاد (تومان)</b>",
-        "🕐 <b>به‌روزرسانی روزانه — ساعت ۱۲ ظهر به وقت ایران</b>",
-    ]
-    if updated:
-        lines.append(f"🗓 <i>{updated}</i>")
-    lines.append("")
-    lines.append("<b>ارز</b> — <b>فروش</b> | <b>خرید</b>")
-    lines.append("")
+    lines = ["📊 <b>نرخ ارز بازار آزاد (تومان)</b>", ""]
 
     for code in codes:
         c = code.lower().strip()
@@ -137,10 +128,13 @@ def format_bonbast_channel_html(
             f"<b>{_fmt_toman(sell)}</b> | <b>{_fmt_toman(buy)}</b>"
         )
 
-    lines.append("")
     lines.append('📎 منبع: <a href="https://www.bonbast.com">bonbast.com</a>')
-    lines.append("<i>قیمت‌ها صرفاً اطلاع‌رسانی است؛ مسئولیت معامله با طرفین می‌باشد.</i>")
 
     from utils.channel_format import format_channel_ad_footer
 
-    return "\n".join(lines) + format_channel_ad_footer(rate_toman=0)
+    footer = format_channel_ad_footer(rate_toman=0)
+    # Footer starts with \n\n (boundary block). For rates post we want only one blank
+    # line between source and bot/channel lines.
+    if footer.startswith("\n\n"):
+        footer = footer[1:]
+    return "\n".join(lines) + footer

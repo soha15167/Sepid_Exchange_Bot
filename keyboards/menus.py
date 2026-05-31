@@ -35,13 +35,15 @@ CONFIRM_SELECTION_CALLBACK = "confirm_methods"
 PAYMENT_SELECTION_TEXT = (
     "💳 روش‌های پرداخت را انتخاب کنید:\n"
     "• چندانتخابی: IBAN / PayPal / Wise / Revolut\n"
-    "• تک‌انتخابی: معاوضه Euro به Euro"
+    "• تک‌انتخابی: معاوضه Euro به Euro\n\n"
+    "پس از انتخاب، دکمهٔ <b>✅ آماده</b> را بزنید."
 )
 
 RECEIVE_SELECTION_TEXT = (
     "📥 روش‌های دریافت را انتخاب کنید:\n"
     "• چندانتخابی: IBAN / PayPal / Wise / Revolut\n"
-    "• تک‌انتخابی: معاوضه Euro به Euro"
+    "• تک‌انتخابی: معاوضه Euro به Euro\n\n"
+    "پس از انتخاب، دکمهٔ <b>✅ آماده</b> را بزنید."
 )
 
 
@@ -76,7 +78,7 @@ def generate_inline_keyboard(selected_methods):
     exchange_selected = EXCHANGE_OPTION in selected_set
     label = f"✅ {EXCHANGE_OPTION}" if exchange_selected else EXCHANGE_OPTION
     keyboard.append([InlineKeyboardButton(label, callback_data=CALLBACK_BY_METHOD[EXCHANGE_OPTION])])
-    keyboard.append([InlineKeyboardButton("➡️ ادامه با انتخاب فعلی", callback_data=CONFIRM_SELECTION_CALLBACK)])
+    keyboard.append([InlineKeyboardButton("✅ آماده", callback_data=CONFIRM_SELECTION_CALLBACK)])
     keyboard.append([InlineKeyboardButton("❌ انصراف", callback_data="cancel")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -88,7 +90,7 @@ def inline_cancel_keyboard(callback_data: str = "inline_cancel"):
 
 # 🔘 کیبوردهای reply ثابت
 main_menu_keyboard = ReplyKeyboardMarkup([
-    ["🚀 ثبت درخواست خدمات"],
+    ["🚀 درخواست خدمات"],
     ["🧾 مشاهده پروفایل"],
     [MY_OFFERS_REPLY_BUTTON_TEXT],
     [MY_ADVERTS_REPLY_BUTTON_TEXT],
@@ -100,7 +102,7 @@ main_menu_keyboard = ReplyKeyboardMarkup([
 main_menu_inline_keyboard = InlineKeyboardMarkup(
     [
         [
-            InlineKeyboardButton("🚀 ثبت درخواست خدمات", callback_data="main_services"),
+            InlineKeyboardButton("🚀 درخواست خدمات", callback_data="main_services"),
             InlineKeyboardButton("🧾 مشاهده پروفایل", callback_data="main_profile"),
         ],
         [
@@ -155,11 +157,32 @@ terms_inline_keyboard = InlineKeyboardMarkup([
     [InlineKeyboardButton(TERMS_DECLINE_BUTTON_TEXT, callback_data="terms_decline")],
 ])
 
-# وقتی پیامک نرسید — کاربر خودش درخواست کد در تلگرام می‌دهد
-registration_otp_fallback_keyboard = InlineKeyboardMarkup([
-    [InlineKeyboardButton("📲 ارسال کد در تلگرام", callback_data="reg_otp_telegram")],
-    [InlineKeyboardButton("🔄 ارسال مجدد پیامک", callback_data="reg_otp_resend_sms")],
-])
+REGISTRATION_CANCEL_REPLY_TEXT = "❌ انصراف از ثبت‌نام"
+
+registration_cancel_inline_keyboard = InlineKeyboardMarkup(
+    [[InlineKeyboardButton(REGISTRATION_CANCEL_REPLY_TEXT, callback_data="reg_cancel")]]
+)
+
+def registration_otp_keyboard(
+    *, show_telegram: bool, countdown: int | None = None
+) -> InlineKeyboardMarkup:
+    """شمارنده تا صفر؛ بعد ارسال مجدد + تلگرام + انصراف."""
+    rows: list[list[InlineKeyboardButton]] = []
+    if countdown is not None and countdown >= 0:
+        rows.append(
+            [InlineKeyboardButton(f"⏳ {countdown}", callback_data="reg_otp_wait")]
+        )
+    if show_telegram:
+        rows.append(
+            [InlineKeyboardButton("🔄 ارسال مجدد پیامک", callback_data="reg_otp_resend_sms")]
+        )
+        rows.append(
+            [InlineKeyboardButton("📲 ارسال کد در تلگرام", callback_data="reg_otp_telegram")]
+        )
+    rows.append(
+        [InlineKeyboardButton(REGISTRATION_CANCEL_REPLY_TEXT, callback_data="reg_cancel")]
+    )
+    return InlineKeyboardMarkup(rows)
 
 services_keyboard = ReplyKeyboardMarkup([
     ["💶 خرید/فروش یورو"],

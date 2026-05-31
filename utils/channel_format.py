@@ -17,6 +17,12 @@ _VSEP = f" {_RTL}│{_RTL} "
 # Invisible boundary: offer lists are inserted immediately before the footer (ربات/کانال).
 CHANNEL_OFFERS_BOUNDARY = "\u2063"
 CHANNEL_AD_FOOTER_MARKER = CHANNEL_OFFERS_BOUNDARY
+CHANNEL_POST_TEMPLATE_VERSION = 2
+
+
+def bot_maintenance_channel_notice_html() -> str:
+    """Shown on channel posts while bot is disabled."""
+    return f"{_RTL}⛔️ <i>ثبت پیشنهاد موقتاً بسته است.</i>\n"
 
 
 def is_euro_to_euro_advert(advert: dict | None = None, *, operation: str | None = None, euro_exchange: bool = False) -> bool:

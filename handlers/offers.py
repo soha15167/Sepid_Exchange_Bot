@@ -1,6 +1,8 @@
 """
 handlers/offers.py — Offers on ads / پیشنهاد به آگهی
 
+OFFER_RATE_REJECTION_BUILD = "2026-05-21-r4"  # برای تأیید deploy در journalctl
+
 EN:
   Gate (agree/custom), rate, country, description, preview, confirm;
   owner accept/reject; channel post refresh; negotiation messages.
@@ -12,27 +14,37 @@ FA:
 from __future__ import annotations
 
 import html as html_module
+import logging
 import re
 import time
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, Message
 from telegram.constants import ParseMode
+from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import ApplicationHandlerStop, ContextTypes
 
 from config.settings import (
     ADMIN_IDS,
+    ADMIN_NOTIFY_CHAT_IDS,
     ADVERT_CHANNEL_ID,
     BOT_USERNAME,
     CHANNEL_USERNAME,
     DEAL_NEXT_STEPS_ADMIN,
+    LIST_RECENT_LIMIT,
 )
+
+logger = logging.getLogger(__name__)
 from database.db import (
     delete_advert_offer_if_pending,
     delete_pending_offers_for_proposer_on_advert,
     get_advert_offer_joined,
     get_euro_advert_by_rowid,
     get_last_rejected_offer_rate_toman,
+    rejected_offer_same_rate_and_euro,
+    rejected_offer_rate_and_proposed_euro,
+    classify_proposer_rate_rejection,
     get_user,
+    effective_offer_euro_amount_for_advert,
     insert_advert_offer,
     list_accepted_offers_for_advert,
     list_my_advert_offers,
@@ -57,6 +69,7 @@ from utils.telegram_utils import (
     remove_main_menu_anchor_message,
     send_or_replace_main_menu,
     cleanup_transient_dm_messages,
+    mark_flow_keep_message,
 )
 from telegram.error import BadRequest
 
@@ -207,7 +220,7 @@ def neg_transcript_get(app_data: dict, offer_db_id: int) -> list[dict]:
 def neg_transcript_append(app_data: dict, offer_db_id: int, from_role: str, text: str) -> list[dict]:
     _ = app_data
     return negotiation_transcript_append_line(
-        int(offer_db_id), from_role, text, max_lines=_NEG_MAX_LINES
+        int(offer_db_id), from_role, text, max_lines=None
     )
 
 
@@ -519,8 +532,14 @@ def _format_my_offers_list_text(sent: list[dict] | None = None) -> str:
                 f"{_RTL}• آگهی #{o['advert_rowid']} — پیشنهاد {o['seq_in_advert']} — {rate_part}"
             )
         lines.append("")
+        lines.append(f"{_RTL}راهنما:")
+        lines.append(f"{_RTL}• حذف — دکمه «🗑 آگهی …»")
         lines.append(
-            f"{_RTL}با دکمه‌ها پیشنهاد را حذف کنید؛ ویرایش نرخ فقط برای پیشنهادهای با نرخ تومان است."
+            f"{_RTL}• ویرایش نرخ — تا قبل از تأیید یا رد آگهی‌دهنده "
+            f"(فقط اگر نرخ به تومان ثبت شده)"
+        )
+        lines.append(
+            f"{_RTL}• در این لیست حداکثر {LIST_RECENT_LIMIT} پیشنهاد ارسالی آخر شما دیده می‌شود."
         )
 
     if not sent:
@@ -528,9 +547,17 @@ def _format_my_offers_list_text(sent: list[dict] | None = None) -> str:
     return "\n".join(lines)
 
 
-def _my_offers_inline_keyboard(rows: list[dict]) -> InlineKeyboardMarkup:
+def _my_offers_inline_keyboard(
+    rows: list[dict], *, page: int = 0, total: int | None = None
+) -> InlineKeyboardMarkup:
+    from utils.pagination import clamp_page, pagination_nav_row
+
+    total_n = total if total is not None else len(rows)
+    page, pages = clamp_page(page, total_n)
+    start = page * LIST_RECENT_LIMIT
+    chunk = rows[start : start + LIST_RECENT_LIMIT]
     keyboard = []
-    for o in rows:
+    for o in chunk:
         aid = int(o["advert_rowid"])
         row_btns = [
             InlineKeyboardButton(
@@ -540,9 +567,20 @@ def _my_offers_inline_keyboard(rows: list[dict]) -> InlineKeyboardMarkup:
         ]
         if not (bool(o.get("skips_toman_rate_offer")) and int(o.get("rate_toman") or 0) == 0):
             row_btns.append(
-                InlineKeyboardButton("✏️ نرخ", callback_data=f"offer_edit|{o['id']}")
+                InlineKeyboardButton(
+                    "ویرایش نرخ",
+                    callback_data=f"offer_edit|{o['id']}",
+                )
             )
         keyboard.append(row_btns)
+    nav = pagination_nav_row(
+        prev_cb=f"my_off|p|{page - 1}" if page > 0 else None,
+        next_cb=f"my_off|p|{page + 1}" if page < pages - 1 else None,
+        page=page,
+        total_pages=pages,
+    )
+    if nav:
+        keyboard.append(nav)
     keyboard.append([InlineKeyboardButton("✖️ بستن", callback_data="my_offers_close")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -570,10 +608,11 @@ async def _present_my_pending_offers_list(
     chat_id: int,
     uid: int,
     menu_inline_message: Message | None,
+    page: int = 0,
 ) -> bool:
     """اگر پیام لیست پیشنهادهای ارسالی ارسال شود True."""
     try:
-        sent_rows = list_my_pending_offers_all(uid)
+        sent_rows = list_my_pending_offers_all(uid, limit=80)
     except Exception:
         sent_rows = []
 
@@ -693,6 +732,37 @@ async def handle_my_offers_callback(update: Update, context: ContextTypes.DEFAUL
             )
         except Exception:
             pass
+
+
+async def handle_my_offers_page_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    q = update.callback_query
+    if not q or not q.from_user:
+        return
+    m = re.match(r"^my_off\|p\|(\d+)$", q.data or "")
+    if not m:
+        return
+    page = int(m.group(1))
+    uid = q.from_user.id
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    sent_rows = list_my_pending_offers_all(uid, limit=80)
+    if not sent_rows:
+        await q.answer("لیست خالی است.", show_alert=True)
+        return
+    try:
+        await q.edit_message_text(
+            _format_my_offers_list_text(sent_rows),
+            reply_markup=_my_offers_inline_keyboard(
+                sent_rows, page=page, total=len(sent_rows)
+            ),
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        pass
 
 
 async def handle_my_offers_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -816,8 +886,16 @@ async def handle_offer_edit_rate_message(
         raise ApplicationHandlerStop
     advert_edit = get_euro_advert_by_rowid(aid_advert)
     if advert_edit:
+        pe_edit = int(row.get("proposed_euro_amount") or 0)
+        eff_edit = _offer_effective_euro_amount(
+            advert_edit, pe_edit if pe_edit > 0 else None
+        )
         rej_err = _offer_rate_after_rejection_error(
-            advert_edit, rate, proposer_telegram_id=user_id
+            advert_edit,
+            rate,
+            proposer_telegram_id=user_id,
+            effective_euro_amount=eff_edit,
+            proposed_euro_amount=pe_edit if pe_edit > 0 else None,
         )
         if rej_err:
             await update.message.reply_text(
@@ -896,6 +974,32 @@ def _offer_requires_proposer_bank_country(advert: dict) -> bool:
     return True
 
 
+def _advert_seller_can_bank_deposit(advert: dict) -> bool:
+    """آگهی‌دهنده (فروشنده) امکان واریز به حساب بانکی دارد."""
+    methods = (advert.get("methods") or "").strip()
+    if not methods or "واریز ندارم" in methods:
+        return False
+    return "واریز" in methods
+
+
+def _offer_requires_proposer_recipient_country(advert: dict) -> bool:
+    """
+    معاوضهٔ یورو به یورو (آگهی فروش): فروشنده واریز دارد →
+    پیشنهاددهنده (خریدار) کشور حساب دریافت را وارد می‌کند.
+    """
+    if not _is_hybrid_euro_exchange_advert(advert):
+        return False
+    if (advert.get("operation") or "").strip() != "فروش":
+        return False
+    return _advert_seller_can_bank_deposit(advert)
+
+
+def _offer_requires_proposer_country_step(advert: dict) -> bool:
+    return _offer_requires_proposer_bank_country(advert) or _offer_requires_proposer_recipient_country(
+        advert
+    )
+
+
 def _offer_country_display_text(raw) -> str:
     c = (raw or "").strip()
     if not c or c in ("—", "-", "–"):
@@ -922,7 +1026,11 @@ def _offer_euro_buyer_seller_country_texts(
 
 
 def _offer_bank_country_lines_html(advert: dict, proposer_bank_country: str | None) -> str:
-    if not _offer_requires_proposer_bank_country(advert):
+    show = _offer_requires_proposer_bank_country(advert) or (
+        _offer_requires_proposer_recipient_country(advert)
+        and (proposer_bank_country or "").strip()
+    )
+    if not show:
         return ""
     buyer, seller = _offer_euro_buyer_seller_country_texts(advert, proposer_bank_country)
     return (
@@ -936,15 +1044,153 @@ def _ltr_rate_toman_html(rate: int) -> str:
     return f"\u202a<b>{int(rate):,}</b> تومان\u202c"
 
 
+def _offer_flow_effective_euro(advert: dict, context_user_data: dict) -> int:
+    """مقدار یوروی مؤثر در فلو پیشنهاد (کل آگهی یا مقدار دلخواه)."""
+    try:
+        aid = int(advert.get("rowid") or advert.get("id") or 0)
+    except (TypeError, ValueError):
+        aid = 0
+    pe: int | None = None
+    if bool(context_user_data.get("offer_counter_mode")):
+        draft = context_user_data.get("offer_draft_euro_amount")
+        if isinstance(draft, int) and draft > 0:
+            pe = draft
+    if aid > 0:
+        return effective_offer_euro_amount_for_advert(aid, pe)
+    return _offer_effective_euro_amount(advert, pe)
+
+
+def _offer_rejection_scope_html(advert: dict, effective_euro: int) -> str:
+    adv_e = _advert_euro_amount_int(advert)
+    if effective_euro > 0 and adv_e > 0 and effective_euro < adv_e:
+        return f"برای مقدار <b>{effective_euro:,}</b> یورو"
+    return "برای همین مقدار یورو"
+
+
+def _proposer_last_rejected_rate_for_euro(
+    advert_rowid: int,
+    proposer_id: int,
+    *,
+    target_euro: int,
+    advert: dict,
+) -> int | None:
+    """آخرین نرخ رد‌شدهٔ همین کاربر برای همان مقدار یورو (جدیدترین id)."""
+    try:
+        aid = int(advert_rowid)
+        uid = int(proposer_id)
+        target = int(target_euro)
+    except (TypeError, ValueError):
+        return None
+    adv_e = _advert_euro_amount_int(advert)
+    if aid <= 0 or uid <= 0 or target <= 0:
+        return None
+    rows = list_my_advert_offers(aid, uid, limit=50)
+    last_id = -1
+    last_rate: int | None = None
+    for row in rows:
+        st = str(row[4] if len(row) > 4 else "pending").strip().lower()
+        if st != "rejected":
+            continue
+        try:
+            oid = int(row[0])
+            rt = int(row[1] or 0)
+            pe_row = int(row[6] or 0) if len(row) > 6 else 0
+        except (TypeError, ValueError):
+            continue
+        if rt <= 0:
+            continue
+        row_euro = pe_row if pe_row > 0 else adv_e
+        if row_euro != target:
+            continue
+        if oid >= last_id:
+            last_id = oid
+            last_rate = rt
+    return last_rate
+
+
+def _offer_rate_rejection_rule_hint_html(
+    advert: dict, proposer_id: int, *, target_euro: int | None = None
+) -> str:
+    """راهنمای ثابت در مرحله نرخ — بالاتر/پایین‌تر از آخرین رد."""
+    op = (advert.get("operation") or "").strip()
+    if op not in ("خرید", "فروش"):
+        return ""
+    adv_e = _advert_euro_amount_int(advert)
+    tgt = int(target_euro or 0) if target_euro else adv_e
+    if tgt <= 0:
+        return ""
+    aid = int(advert.get("rowid") or 0)
+    if aid <= 0:
+        return ""
+    last = _proposer_last_rejected_rate_for_euro(
+        aid, proposer_id, target_euro=tgt, advert=advert
+    )
+    if last is None:
+        return ""
+    scope = _offer_rejection_scope_html(advert, tgt)
+    last_h = f"<b>{last:,}</b>"
+    if op == "فروش":
+        return (
+            f"\n\n{_RTL}📌 <b>قانون پس از رد پیشنهاد</b> ({scope}):\n"
+            f"{_RTL}آخرین نرخ رد‌شده: {last_h} تومان\n"
+            f"{_RTL}🔺 برای <b>فروش</b> فقط پیشنهاد <b>بالاتر</b> از {last_h} تومان "
+            f"قابل ارسال است.\n"
+        )
+    return (
+        f"\n\n{_RTL}📌 <b>قانون پس از رد پیشنهاد</b> ({scope}):\n"
+        f"{_RTL}آخرین نرخ رد‌شده: {last_h} تومان\n"
+        f"{_RTL}🔻 برای <b>خرید</b> فقط پیشنهاد <b>پایین‌تر</b> از {last_h} تومان "
+        f"قابل ارسال است.\n"
+    )
+
+
+def _offer_rate_rejection_error_html(
+    op: str,
+    kind: str,
+    *,
+    scope: str,
+    new_rate: int,
+    last_rej: int,
+) -> str:
+    """پیام کوتاه خطا — جدا زیر ورودی کاربر (نه داخل پرامپت)."""
+    new_h = f"<b>{new_rate:,}</b>"
+    last_h = f"<b>{last_rej:,}</b>"
+    if kind == "exact":
+        if op == "فروش":
+            hint = f"بالاتر از {last_h}"
+        else:
+            hint = f"پایین‌تر از {last_h}"
+        return (
+            f"{_RTL}❌ {new_h} تومان قبلاً رد شده ({scope}).\n"
+            f"{_RTL}نرخ دیگری بفرستید — برای <b>{op}</b>: <b>{hint}</b> تومان."
+        )
+    if kind == "sell_low":
+        suggest = last_rej + 1000
+        return (
+            f"{_RTL}❌ {new_h} برای <b>فروش</b> کافی نیست.\n"
+            f"{_RTL}رد شده: {last_h} — باید <b>بالاتر</b> باشد "
+            f"(مثلاً <code>{suggest}</code>)."
+        )
+    suggest_lo = max(last_rej - 1000, 1)
+    return (
+        f"{_RTL}❌ {new_h} برای <b>خرید</b> زیاد است.\n"
+        f"{_RTL}رد شده: {last_h} — باید <b>پایین‌تر</b> باشد "
+        f"(مثلاً <code>{suggest_lo}</code>)."
+    )
+
+
 def _offer_rate_after_rejection_error(
-    advert: dict | None, new_rate: int, *, proposer_telegram_id: int | None = None
+    advert: dict | None,
+    new_rate: int,
+    *,
+    proposer_telegram_id: int | None = None,
+    effective_euro_amount: int | None = None,
+    proposed_euro_amount: int | None = None,
 ) -> str | None:
-    """برای آگهی خرید/فروش با نرخ تومان: محدودیت نسبت به آخرین پیشنهاد رد‌شده (معاوضهٔ یورو به یورو مستثنی). ادمین بدون خطا."""
+    """پس از رد: همان نرخ+مقدار یورو ممنوع؛ فروش → نرخ بالاتر؛ خرید → نرخ پایین‌تر از آخرین رد."""
     if not advert:
         return None
     if _offer_skips_toman_rate_step(advert):
-        return None
-    if proposer_telegram_id is not None and int(proposer_telegram_id) in set(ADMIN_IDS or []):
         return None
     op = (advert.get("operation") or "").strip()
     if op not in ("خرید", "فروش"):
@@ -957,24 +1203,61 @@ def _offer_rate_after_rejection_error(
         return None
     if proposer_telegram_id is None:
         return None
-    last = get_last_rejected_offer_rate_toman(
-        aid, proposer_telegram_id=int(proposer_telegram_id)
+    eff = int(effective_euro_amount or 0)
+    if eff <= 0:
+        eff = _advert_euro_amount_int(advert)
+    if eff <= 0:
+        return None
+    scope = _offer_rejection_scope_html(advert, eff)
+    pid = int(proposer_telegram_id)
+    adv_e = _advert_euro_amount_int(advert)
+    try:
+        draft_pe = int(proposed_euro_amount or 0)
+    except (TypeError, ValueError):
+        draft_pe = 0
+    target_euro = draft_pe if draft_pe > 0 else adv_e
+    if target_euro <= 0:
+        return None
+
+    kind = classify_proposer_rate_rejection(
+        aid,
+        pid,
+        new_rate,
+        target_euro_amount=target_euro,
+        advert_total_euro=adv_e,
+        operation=op,
     )
-    if last is None:
-        return None
-    # فروش: نرخ پایین‌تر از پیشنهاد رد‌شده مجاز نیست (حداقل همان سطح یا بالاتر).
-    if op == "فروش":
-        if new_rate < last:
-            return (
-                f"{_RTL}❌ برای آگهی <b>فروش</b>، بعد از رد پیشنهاد، نرخ پیشنهادی باید "
-                f"حداقل <b>{last:,}</b> تومان باشد؛ نرخ <b>پایین‌تر</b> از این مجاز نیست."
+    if kind is None and rejected_offer_rate_and_proposed_euro(aid, new_rate, draft_pe):
+        kind = "exact"
+    if kind is None and rejected_offer_same_rate_and_euro(aid, new_rate, eff):
+        kind = "exact"
+    if kind is None:
+        last = get_last_rejected_offer_rate_toman(
+            aid, proposer_telegram_id=pid, effective_euro_amount=eff
+        )
+        if last is not None:
+            if op == "فروش" and new_rate <= last:
+                kind = "sell_low"
+            elif op == "خرید" and new_rate >= last:
+                kind = "buy_high"
+
+    last_rej = _proposer_last_rejected_rate_for_euro(
+        aid, pid, target_euro=target_euro, advert=advert
+    )
+    if kind == "exact":
+        last_rej = last_rej or new_rate
+        return _offer_rate_rejection_error_html(
+            op, "exact", scope=scope, new_rate=new_rate, last_rej=last_rej
+        )
+    if kind in ("sell_low", "buy_high"):
+        if last_rej is None:
+            last_rej = get_last_rejected_offer_rate_toman(
+                aid, proposer_telegram_id=pid, effective_euro_amount=target_euro
             )
-        return None
-    # خرید: باید از آخرین نرخ رد‌شدهٔ همین پیشنهاددهنده پایین‌تر باشد (مساوی هم مجاز نیست).
-    if new_rate >= last:
-        return (
-            f"{_RTL}❌ برای آگهی <b>خرید</b>، بعد از رد پیشنهاد، نرخ جدید باید "
-            f"از <b>{last:,}</b> تومان <b>پایین‌تر</b> باشد (نرخ مساوی یا بالاتر مجاز نیست)."
+        if last_rej is None:
+            return None
+        return _offer_rate_rejection_error_html(
+            op, kind, scope=scope, new_rate=new_rate, last_rej=int(last_rej)
         )
     return None
 
@@ -1239,6 +1522,52 @@ _OFFER_FLOW_STEP_STATE: dict[str, UserState] = {
     "preview": UserState.OFFER_PREVIEW,
 }
 
+def _offer_flow_active(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    st = (context.user_data.get("state") or "").strip()
+    if st.startswith("OFFER_"):
+        return True
+    return bool((context.user_data.get("offer_flow_step") or "").strip())
+
+
+async def route_offer_flow_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    """
+    هدایت پیام متنی در فلو پیشنهاد. True = پردازش شد (یا راهنما فرستاده شد).
+    """
+    if not update.message:
+        return False
+    if not _offer_flow_active(context):
+        return False
+
+    step = (context.user_data.get("offer_flow_step") or "").strip()
+    state = (context.user_data.get("state") or "").strip()
+
+    if step == "counter_euro" or state == UserState.OFFER_COUNTER_EURO.name:
+        await handle_offer_counter_amount_message(update, context)
+        return True
+    if step == "rate" or state == UserState.OFFER_RATE.name:
+        await handle_offer_rate_message(update, context)
+        return True
+    if step == "account_country" or state == UserState.OFFER_ACCOUNT_COUNTRY.name:
+        await handle_offer_account_country_message(update, context)
+        return True
+    if step == "description" or state == UserState.OFFER_DESCRIPTION.name:
+        await handle_offer_description_message(update, context)
+        return True
+    if step == "preview" or state == UserState.OFFER_PREVIEW.name:
+        await handle_offer_preview_idle_message(update, context)
+        return True
+    if step == "gate" or state == UserState.OFFER_ADVERT_ID.name:
+        await update.message.reply_text(
+            f"{_RTL}لطفاً با دکمه‌های «موافقم» یا «مقدار دیگر» در پیام بالا ادامه دهید."
+        )
+        return True
+    await update.message.reply_text(
+        f"{_RTL}⚠️ مرحلهٔ پیشنهاد نامشخص است. /menu بزنید و دوباره از دکمهٔ «ثبت پیشنهاد» شروع کنید."
+    )
+    return True
+
 
 async def _finish_offer_flow_abort(
     context: ContextTypes.DEFAULT_TYPE,
@@ -1389,11 +1718,136 @@ async def _offer_flow_mark_gate_message(
 
 
 def _build_offer_rate_prompt_html(
-    advert: dict, proposer_id: int, *, counter_mode: bool
+    advert: dict,
+    proposer_id: int,
+    *,
+    counter_mode: bool,
+    target_euro: int | None = None,
 ) -> str:
     if counter_mode:
-        return build_offer_counter_rate_step_html(advert)
-    return build_offer_rate_step_html(advert, proposer_id)
+        return build_offer_counter_rate_step_html(
+            advert, proposer_id, target_euro=target_euro
+        )
+    return build_offer_rate_step_html(advert, proposer_id, target_euro=target_euro)
+
+
+def _offer_rate_step_prompt_html(
+    advert: dict,
+    proposer_id: int,
+    *,
+    counter_mode: bool,
+    target_euro: int | None = None,
+) -> str:
+    return _build_offer_rate_prompt_html(
+        advert, proposer_id, counter_mode=counter_mode, target_euro=target_euro
+    )
+
+
+async def _offer_rate_step_refresh_prompt(
+    context: ContextTypes.DEFAULT_TYPE,
+    bot,
+    *,
+    chat_id: int,
+    user_id: int,
+    advert_id: int,
+    advert: dict,
+) -> None:
+    """پرامپت مرحله نرخ را بدون خطا به‌روز/بازسازی می‌کند."""
+    counter = bool(context.user_data.get("offer_counter_mode"))
+    tgt = _offer_flow_euro_draft_int(context) or _advert_euro_amount_int(advert)
+    text = _offer_rate_step_prompt_html(
+        advert,
+        user_id,
+        counter_mode=counter,
+        target_euro=tgt if tgt > 0 else None,
+    )
+    kb = _offer_rate_step_keyboard(advert_id, counter_mode=counter)
+    pmid = context.user_data.get("offer_flow_prompt_mid")
+    if pmid:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=int(pmid),
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+            return
+        except Exception:
+            pass
+    await _offer_flow_clear_prompt(context, bot, chat_id=chat_id)
+    await _offer_flow_prompt(
+        context,
+        bot,
+        chat_id=chat_id,
+        step="rate",
+        text=text,
+        reply_markup=kb,
+    )
+
+
+async def _offer_rate_step_present(
+    context: ContextTypes.DEFAULT_TYPE,
+    bot,
+    *,
+    chat_id: int,
+    user_id: int,
+    advert_id: int,
+    advert: dict,
+    user_input_mid: int | None = None,
+) -> None:
+    """مرحله نرخ — فقط پرامپت ثابت (خطا جدا زیر ورودی)."""
+    context.user_data.pop("offer_draft_rate", None)
+    context.user_data.pop("offer_draft_description", None)
+    context.user_data["offer_flow_step"] = "rate"
+    context.user_data["state"] = UserState.OFFER_RATE.name
+    if user_input_mid:
+        _offer_flow_track_input(context, user_input_mid)
+    await _offer_rate_step_refresh_prompt(
+        context,
+        bot,
+        chat_id=chat_id,
+        user_id=user_id,
+        advert_id=advert_id,
+        advert=advert,
+    )
+
+
+async def _offer_rate_step_reply_error(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    err_html: str,
+    advert_id: int,
+    advert: dict,
+    user_id: int,
+    input_mid: int,
+) -> None:
+    """خطای کوتاه بلافاصله بعد از پیام عددی کاربر."""
+    chat_id = update.effective_chat.id
+    context.user_data.pop("offer_draft_rate", None)
+    context.user_data.pop("offer_draft_description", None)
+    context.user_data["offer_flow_step"] = "rate"
+    context.user_data["state"] = UserState.OFFER_RATE.name
+    _offer_flow_track_input(context, input_mid)
+    counter = bool(context.user_data.get("offer_counter_mode"))
+    kb = _offer_rate_step_keyboard(advert_id, counter_mode=counter)
+    await _offer_rate_step_refresh_prompt(
+        context,
+        context.bot,
+        chat_id=chat_id,
+        user_id=user_id,
+        advert_id=advert_id,
+        advert=advert,
+    )
+    err_msg = await update.message.reply_text(
+        err_html,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+        reply_markup=kb,
+    )
+    _offer_flow_track(context, err_msg.message_id)
 
 
 def _proposer_same_rate_blocked(
@@ -1533,13 +1987,337 @@ def _acceptance_role_label(advert: dict, row: dict, viewer_telegram_id: int) -> 
     return "آگهی‌دهنده" if is_owner else "پیشنهاددهنده"
 
 
+def _format_telegram_user_identity_html(
+    telegram_id: int, tg_user=None, *, prefix: str = "فرستنده"
+) -> str:
+    """نام نمایشی، یوزرنیم، آیدی و لینک تماس برای ادمین."""
+    urow = get_user(int(telegram_id))
+    display = ""
+    if urow:
+        display = (urow.get("display_name") or urow.get("full_name") or "").strip()
+    if not display and tg_user:
+        display = (tg_user.full_name or "").strip()
+    if not display:
+        display = str(telegram_id)
+    uname = ""
+    if tg_user and tg_user.username:
+        uname = tg_user.username.strip().lstrip("@")
+    elif urow and urow.get("username"):
+        uname = str(urow.get("username") or "").strip().lstrip("@")
+    lines = [
+        f"{_RTL}👤 <b>{html_module.escape(prefix)}:</b> "
+        f"<b>{html_module.escape(display)}</b>\n",
+    ]
+    if uname:
+        esc_u = html_module.escape(uname, quote=False)
+        lines.append(
+            f'{_RTL}🧪 <b>یوزرنیم:</b> <a href="https://t.me/{esc_u}">@{esc_u}</a>\n'
+        )
+    lines.append(
+        f'{_RTL}🆔 <b>شناسه:</b> <code>{int(telegram_id)}</code> · '
+        f'<a href="tg://user?id={int(telegram_id)}">تماس در تلگرام</a>\n'
+    )
+    return "".join(lines)
+
+
+def _offer_buyer_seller_telegram_ids(advert: dict, row: dict) -> tuple[int, int]:
+    """آیدی تلگرام خریدار و فروشندهٔ یورو بر اساس نوع آگهی."""
+    owner_id = int(row.get("owner_id") or 0)
+    proposer_id = int(row.get("proposer_telegram_id") or 0)
+    op = (advert.get("operation") or "").strip()
+    if op == "خرید":
+        return owner_id, proposer_id
+    if op == "فروش":
+        return proposer_id, owner_id
+    return proposer_id, owner_id
+
+
+def _financial_party_summary_html(
+    advert: dict, rate: int, eur_amt: int, *, party: str
+) -> str:
+    """خلاصهٔ مالی یک طرف برای اعلان ادمین (party: buyer | seller)."""
+    op = (advert.get("operation") or "").strip()
+    if party == "buyer":
+        owner_view = op == "خرید"
+    elif party == "seller":
+        owner_view = op == "فروش"
+    else:
+        owner_view = True
+    body = _financial_accept_summary_html(
+        advert, rate, eur_amt, owner_view=owner_view
+    )
+    party_fa = "خریدار" if party == "buyer" else "فروشنده"
+    return (
+        body.replace("کارمزد شما", f"کارمزد {party_fa}")
+        .replace("واریز به شما", f"واریز به {party_fa}")
+        .replace("مبلغ واریز شما", f"مبلغ واریز {party_fa}")
+    )
+
+
+def _format_deal_party_identity_html(telegram_id: int, *, title: str) -> str:
+    """شناسهٔ کامل یک طرف معامله برای ادمین."""
+    if not telegram_id:
+        return f"{_RTL}👤 <b>{html_module.escape(title)}:</b> —\n"
+    urow = get_user(int(telegram_id))
+    display = ""
+    if urow:
+        display = (urow.get("display_name") or urow.get("full_name") or "").strip()
+    if not display:
+        display = str(telegram_id)
+    uname = ""
+    if urow and urow.get("username"):
+        uname = str(urow.get("username") or "").strip().lstrip("@")
+    lines = [
+        f"{_RTL}👤 <b>{html_module.escape(title)}</b>\n",
+        f"{_RTL}• نام: <b>{html_module.escape(display)}</b>\n",
+    ]
+    if uname:
+        esc_u = html_module.escape(uname, quote=False)
+        lines.append(
+            f'{_RTL}• یوزرنیم: <a href="https://t.me/{esc_u}">@{esc_u}</a>\n'
+        )
+    lines.append(
+        f'{_RTL}• شناسه: <code>{int(telegram_id)}</code> · '
+        f'<a href="tg://user?id={int(telegram_id)}">تماس</a>\n'
+    )
+    if urow:
+        phone = (urow.get("phone_number") or "").strip()
+        if phone:
+            lines.append(
+                f"{_RTL}• تلفن: <code>{html_module.escape(phone)}</code>\n"
+            )
+        email = (urow.get("email") or "").strip()
+        if email:
+            lines.append(
+                f"{_RTL}• ایمیل: <code>{html_module.escape(email)}</code>\n"
+            )
+    return "".join(lines)
+
+
+def _post_acceptance_admin_party_section_html(
+    advert: dict,
+    row: dict,
+    *,
+    party: str,
+    buyer_country: str,
+    seller_country: str,
+    fin_html: str,
+    accounts_text: str | None = None,
+    accounts_status_mode: bool = False,
+) -> str:
+    """بلوک یک طرف (خریدار/فروشنده) در پیام ادمین."""
+    buyer_id, seller_id = _offer_buyer_seller_telegram_ids(advert, row)
+    tid = buyer_id if party == "buyer" else seller_id
+    title = "خریدار یورو" if party == "buyer" else "فروشنده یورو"
+    country = buyer_country if party == "buyer" else seller_country
+    op = (advert.get("operation") or "").strip()
+    methods_raw = (advert.get("methods") or "").strip() or "—"
+    if op == "فروش":
+        methods_lbl = (
+            "روش‌های پرداخت (طبق آگهی)"
+            if party == "buyer"
+            else "روش‌های دریافت"
+        )
+    elif op == "خرید":
+        methods_lbl = (
+            "روش‌های پرداخت" if party == "buyer" else "روش‌های دریافت (طبق آگهی)"
+        )
+    else:
+        methods_lbl = "روش‌ها"
+    role_note = ""
+    if tid == int(row.get("owner_id") or 0):
+        role_note = "آگهی‌دهنده"
+    elif tid == int(row.get("proposer_telegram_id") or 0):
+        role_note = "پیشنهاددهنده"
+    role_line = (
+        f"{_RTL}• نقش در ربات: <b>{html_module.escape(role_note)}</b>\n"
+        if role_note
+        else ""
+    )
+    acct_blk = ""
+    acct_raw = (accounts_text or "").strip()
+    if acct_raw:
+        acct_blk = (
+            f"\n{_RTL}📝 <b>اطلاعات حساب (لمس = کپی یکجا)</b>\n"
+            f"<pre>{html_module.escape(acct_raw)}</pre>\n"
+        )
+    elif accounts_status_mode:
+        acct_blk = f"\n{_RTL}📝 <b>اطلاعات حساب:</b> ⏳ در انتظار ارسال کاربر\n"
+    return (
+        f"{_RTL}━━━━━━━━━━━━━━━━\n"
+        f"{_RTL}🛒 <b>{title}</b>\n\n"
+        f"{_format_deal_party_identity_html(tid, title=title)}\n"
+        f"{role_line}"
+        f"{_RTL}• کشور حساب بانکی: {country}\n"
+        f"{_RTL}• {html_module.escape(methods_lbl)}:\n"
+        f"<code>{html_module.escape(methods_raw)}</code>\n\n"
+        f"{fin_html}"
+        f"{acct_blk}"
+    )
+
+
+def _post_acceptance_admin_message_html(
+    advert: dict,
+    row: dict,
+    seq: int,
+    aid: int,
+    *,
+    accepter_tg_user=None,
+    buyer_accounts_text: str | None = None,
+    seller_accounts_text: str | None = None,
+    accounts_status_mode: bool = False,
+    deal_complete: bool = False,
+) -> str:
+    """اعلان کامل معامله برای ادمین — ابتدا فروشنده، سپس خریدار."""
+    rate = int(row["rate_toman"])
+    try:
+        pe_raw = int(row.get("proposed_euro_amount") or 0)
+    except (TypeError, ValueError):
+        pe_raw = 0
+    pe_kw = pe_raw if pe_raw > 0 else None
+    eur_amt = _offer_effective_euro_amount(advert, pe_kw)
+    ad_link = advert_public_link_html(advert, aid)
+    amt_line = _offer_amount_line_html(advert, pe_kw)
+    prop_ct = row.get("proposer_account_country")
+    buyer_ct, seller_ct = _offer_euro_buyer_seller_country_texts(advert, prop_ct)
+    buyer_fin = _financial_party_summary_html(advert, rate, eur_amt, party="buyer")
+    seller_fin = _financial_party_summary_html(advert, rate, eur_amt, party="seller")
+
+    if deal_complete:
+        title_line = f"{_RTL}📩 <b>اعلان معامله — تکمیل شد (هر دو حساب)</b>\n\n"
+    elif accounts_status_mode:
+        title_line = (
+            f"{_RTL}📩 <b>اعلان معامله — تأیید نهایی دوطرف</b>\n\n"
+        )
+    else:
+        title_line = f"{_RTL}📩 <b>اعلان معامله — پیشنهاد پذیرفته شد</b>\n\n"
+    hdr = (
+        f"{title_line}"
+        f"{_RTL}✅ پیشنهاد <b>{seq}</b> برای {ad_link}\n\n"
+        f"{amt_line}"
+    )
+    if accounts_status_mode:
+        ba = bool((buyer_accounts_text or "").strip())
+        sa = bool((seller_accounts_text or "").strip())
+        hdr += (
+            f"{_RTL}📊 <b>وضعیت حساب:</b> "
+            f"خریدار {'✅' if ba else '⏳'} · "
+            f"فروشنده {'✅' if sa else '⏳'}\n\n"
+        )
+    buyer_sec = _post_acceptance_admin_party_section_html(
+        advert,
+        row,
+        party="buyer",
+        buyer_country=buyer_ct,
+        seller_country=seller_ct,
+        fin_html=buyer_fin,
+        accounts_text=buyer_accounts_text,
+        accounts_status_mode=accounts_status_mode,
+    )
+    seller_sec = _post_acceptance_admin_party_section_html(
+        advert,
+        row,
+        party="seller",
+        buyer_country=buyer_ct,
+        seller_country=seller_ct,
+        fin_html=seller_fin,
+        accounts_text=seller_accounts_text,
+        accounts_status_mode=accounts_status_mode,
+    )
+    desc = (row.get("description") or "").strip()
+    desc_blk = ""
+    if desc:
+        desc_blk = (
+            f"{_RTL}━━━━━━━━━━━━━━━━\n"
+            f"{_RTL}📝 <b>توضیحات پیشنهاد</b>\n"
+            f"<code>{html_module.escape(desc)}</code>\n\n"
+        )
+    owner_id = int(row.get("owner_id") or 0)
+    foot = (
+        f"{_RTL}━━━━━━━━━━━━━━━━\n"
+        f"{_RTL}✅ <b>پذیرش</b> توسط صاحب آگهی\n"
+    )
+    if accepter_tg_user and owner_id:
+        foot += _format_telegram_user_identity_html(
+            owner_id, accepter_tg_user, prefix="پذیرنده"
+        )
+    elif owner_id:
+        foot += _format_deal_party_identity_html(owner_id, title="پذیرنده (صاحب آگهی)")
+    if deal_complete:
+        foot += (
+            f"\n{_RTL}✅ <b>هر دو طرف حساب را ارسال کردند — آماده هماهنگی.</b>"
+        )
+    return hdr + seller_sec + buyer_sec + desc_blk + foot
+
+
+def _deal_admin_username() -> str:
+    return (DEAL_NEXT_STEPS_ADMIN or "").strip().lstrip("@")
+
+
+def _deal_admin_direct_url() -> str | None:
+    adm = _deal_admin_username()
+    return f"https://t.me/{adm}" if adm else None
+
+
+def _post_acceptance_admin_received_footer_html(
+    viewer_telegram_id: int,
+    row: dict,
+    tg_user=None,
+) -> str:
+    """پایان پیام خودکار ادمین پس از پذیرش پیشنهاد."""
+    owner_id = int(row.get("owner_id") or 0)
+    proposer_id = int(row.get("proposer_telegram_id") or 0)
+    role = ""
+    if owner_id == int(viewer_telegram_id):
+        role = "آگهی‌دهنده"
+    elif proposer_id == int(viewer_telegram_id):
+        role = "پیشنهاددهنده"
+    lines = [
+        f"{_RTL}📩 <b>اعلان معامله</b> — صاحب آگهی پیشنهاد را "
+        f"<b>پذیرفت</b>.\n\n",
+        _format_telegram_user_identity_html(
+            viewer_telegram_id, tg_user, prefix="صاحب آگهی (پذیرنده)"
+        ),
+    ]
+    if role:
+        lines.append(f"{_RTL}📋 <b>نقش فرستنده در معامله:</b> {role}\n")
+    if owner_id and owner_id != int(viewer_telegram_id):
+        lines.append(_format_peer_user_line_html("آگهی‌دهنده", owner_id))
+    if proposer_id and proposer_id != int(viewer_telegram_id):
+        lines.append(_format_peer_user_line_html("پیشنهاددهنده", proposer_id))
+    return "".join(lines)
+
+
+def _format_peer_user_line_html(label: str, telegram_id: int) -> str:
+    urow = get_user(int(telegram_id))
+    name = ""
+    if urow:
+        name = (urow.get("display_name") or urow.get("full_name") or "").strip()
+    uname = ""
+    if urow and urow.get("username"):
+        uname = str(urow.get("username") or "").strip().lstrip("@")
+    name_part = html_module.escape(name) if name else "—"
+    line = (
+        f"{_RTL}📌 <b>{html_module.escape(label)}:</b> {name_part} · "
+        f"<code>{int(telegram_id)}</code>"
+    )
+    if uname:
+        esc_u = html_module.escape(uname, quote=False)
+        line += f' · <a href="https://t.me/{esc_u}">@{esc_u}</a>'
+    line += (
+        f' · <a href="tg://user?id={int(telegram_id)}">تماس</a>\n'
+    )
+    return line
+
+
 def _post_acceptance_account_context_html(
-    advert: dict, row: dict, viewer_telegram_id: int
+    advert: dict, row: dict, viewer_telegram_id: int, *, for_admin: bool = False
 ) -> str:
     """کشور خریدار و فروشنده برای هر دو طرف؛ روش‌ها بر اساس نقش بیننده."""
     op = (advert.get("operation") or "").strip()
     is_owner = int(viewer_telegram_id) == int(row["owner_id"])
     role = _acceptance_role_label(advert, row, viewer_telegram_id)
+    role_lbl = "نقش فرستنده" if for_admin else "نقش شما"
     prop_ct = row.get("proposer_account_country")
     buyer_ct, seller_ct = _offer_euro_buyer_seller_country_texts(advert, prop_ct)
 
@@ -1553,7 +2331,7 @@ def _post_acceptance_account_context_html(
 
     return (
         f"{_RTL}📋 <b>اطلاعات معامله</b>\n"
-        f"{_RTL}• نقش شما: <b>{html_module.escape(role)}</b>\n"
+        f"{_RTL}• {role_lbl}: <b>{html_module.escape(role)}</b>\n"
         f"{_RTL}• کشور حساب <b>خریدار یورو:</b> {buyer_ct}\n"
         f"{_RTL}• کشور حساب <b>فروشنده یورو:</b> {seller_ct}\n"
         f"{_RTL}• {html_module.escape(methods_lbl)}:\n"
@@ -1598,6 +2376,105 @@ def _financial_accept_summary_html(
     return "".join(lines)
 
 
+def _deal_admin_recipient_ids() -> list[int]:
+    """چت‌های مقصد اعلان: ادمین(ها) + چت/گروه اختیاری از env."""
+    out: list[int] = []
+    seen: set[int] = set()
+    for raw in (ADMIN_IDS or []) + (ADMIN_NOTIFY_CHAT_IDS or []):
+        try:
+            uid = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if uid == 0 or uid in seen:
+            continue
+        seen.add(uid)
+        out.append(uid)
+    return out
+
+
+async def _send_deal_admin_notifications(
+    bot,
+    text_html: str,
+    *,
+    log_tag: str = "deal_admin",
+    reply_markup=None,
+) -> int:
+    """
+    ارسال به چت خصوصی ادمین با @Sepid_Group_Bot (ADMIN_USER_ID) و چت‌های اضافه.
+    برمی‌گرداند تعداد ارسال موفق.
+    """
+    recipients = _deal_admin_recipient_ids()
+    if not recipients:
+        logger.warning("%s: no ADMIN_USER_ID / DEAL_ADMIN_NOTIFY_CHAT_ID configured", log_tag)
+        return 0
+    plain = re.sub(r"<[^>]+>", "", text_html or "")
+    sent = 0
+    for chat_id in recipients:
+        try:
+            await bot.send_message(
+                chat_id,
+                text_html,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=reply_markup,
+            )
+            sent += 1
+            logger.info("%s: sent ok chat_id=%s", log_tag, chat_id)
+        except BadRequest:
+            try:
+                await bot.send_message(
+                    chat_id,
+                    plain,
+                    disable_web_page_preview=True,
+                )
+                sent += 1
+                logger.info("%s: sent plain ok chat_id=%s", log_tag, chat_id)
+            except TelegramError as e2:
+                logger.warning(
+                    "%s: send failed chat_id=%s: %s", log_tag, chat_id, e2
+                )
+        except Forbidden:
+            logger.warning(
+                "%s: forbidden chat_id=%s (ادمین باید /start به ربات بزند)",
+                log_tag,
+                chat_id,
+            )
+        except TelegramError as e:
+            logger.warning("%s: send failed chat_id=%s: %s", log_tag, chat_id, e)
+    return sent
+
+
+def _deal_admin_contact_footer_html(viewer_telegram_id: int) -> str:
+    """پایان پیام تأیید برای کاربر — هماهنگی با ادمین."""
+    from utils.channel_format import format_contact_line_html
+
+    lines = [
+        f"{_RTL}⚠️ بدون هماهنگی مدیریت مبلغی پرداخت یا واریز نکنید.\n",
+        f"{_RTL}خلاصهٔ معامله برای ادمین <b>خودکار</b> ارسال شد؛ "
+        f"در صورت نیاز با ادمین تماس بگیرید.\n",
+    ]
+    adm = _deal_admin_username()
+    adm_line = format_contact_line_html("👤 <b>ادمین (چت مستقیم):</b>", adm) if adm else ""
+    if adm_line:
+        lines.append(f"{adm_line}\n")
+    else:
+        for raw in ADMIN_IDS or []:
+            try:
+                admin_uid = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if admin_uid > 0:
+                lines.append(
+                    f'{_RTL}👤 <b>ادمین:</b> '
+                    f'<a href="tg://user?id={admin_uid}">تماس با ادمین</a>\n'
+                )
+                break
+    lines.append(
+        f"{_RTL}📌 شناسه شما: <code>{int(viewer_telegram_id)}</code>"
+    )
+    return "".join(lines)
+
+
 def _post_acceptance_message_html(
     advert: dict,
     row: dict,
@@ -1605,7 +2482,7 @@ def _post_acceptance_message_html(
     seq: int,
     aid: int,
 ) -> str:
-    """پیام تأیید معامله برای آگهی‌دهنده یا پیشنهاددهنده با خلاصه مالی و راهنمای ادمین."""
+    """پیام تأیید معامله برای صاحب آگهی یا پیشنهاددهنده."""
     rate = int(row["rate_toman"])
     try:
         pe_raw = int(row.get("proposed_euro_amount") or 0)
@@ -1624,46 +2501,41 @@ def _post_acceptance_message_html(
         f"{_RTL}✅ پیشنهاد <b>{seq}</b> برای {ad_link} تأیید شد.\n\n"
         f"{amt_line}"
     )
-    acct = _post_acceptance_account_context_html(advert, row, viewer_telegram_id)
-    adm = (DEAL_NEXT_STEPS_ADMIN or "").strip()
-    if adm:
-        adm_esc = html_module.escape(adm)
-        foot = (
-            f"{_RTL}⚠️ بدون هماهنگی مدیریت مبلغی پرداخت یا واریز نکنید.\n"
-            f"{_RTL}همین پیام را به ادمین فوروارد کنید: <b>{adm_esc}</b>\n"
-            f"{_RTL}📌 شناسه تلگرام: <code>{viewer_telegram_id}</code>"
-        )
-    else:
-        foot = (
-            f"{_RTL}⚠️ بدون هماهنگی مدیریت مبلغی پرداخت یا واریز نکنید.\n"
-            f"{_RTL}همین پیام را به ادمین فوروارد کنید.\n"
-            f"{_RTL}📌 شناسه تلگرام: <code>{viewer_telegram_id}</code>"
-        )
+    acct = _post_acceptance_account_context_html(
+        advert, row, viewer_telegram_id, for_admin=False
+    )
+    foot = _deal_admin_contact_footer_html(viewer_telegram_id)
     return hdr + fin + acct + foot
 
 
 def _post_acceptance_reply_markup(advert: dict | None) -> InlineKeyboardMarkup | None:
-    """دکمه‌های اینلاین بعد از تأیید پیشنهاد (لینک کانال + ورود به ربات)."""
-    if not advert:
-        return None
+    """دکمه‌های اینلاین بعد از تأیید: لینک ادمین و کانال."""
     rows: list[list[InlineKeyboardButton]] = []
-    ch = (CHANNEL_USERNAME or "").strip().lstrip("@")
-    mid = advert.get("channel_message_id")
-    if ch and mid is not None:
-        try:
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        "📌 مشاهدهٔ آگهی در کانال",
-                        url=f"https://t.me/{ch}/{int(mid)}",
-                    )
-                ]
-            )
-        except (TypeError, ValueError):
-            pass
-    un = (BOT_USERNAME or "").strip().lstrip("@")
-    if un:
-        rows.append([InlineKeyboardButton("🤖 باز کردن ربات", url=f"https://t.me/{un}")])
+    adm_url = _deal_admin_direct_url()
+    if adm_url:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "💬 چت مستقیم با ادمین",
+                    url=adm_url,
+                )
+            ]
+        )
+    if advert:
+        ch = (CHANNEL_USERNAME or "").strip().lstrip("@")
+        mid = advert.get("channel_message_id")
+        if ch and mid is not None:
+            try:
+                rows.append(
+                    [
+                        InlineKeyboardButton(
+                            "📌 مشاهدهٔ آگهی در کانال",
+                            url=f"https://t.me/{ch}/{int(mid)}",
+                        )
+                    ]
+                )
+            except (TypeError, ValueError):
+                pass
     return InlineKeyboardMarkup(rows) if rows else None
 
 
@@ -1764,6 +2636,7 @@ async def dispatch_offer_created_notifications(
             register_offer_thread_message(
                 user_data_store, owner_id, row_id, om.message_id
             )
+            mark_flow_keep_message(user_data_store, owner_id, None, om.message_id)
         except Exception:
             pass
         try:
@@ -1798,6 +2671,7 @@ async def dispatch_offer_created_notifications(
                 disable_web_page_preview=True,
             )
             register_offer_thread_message(user_data_store, uid, row_id, pm.message_id)
+            mark_flow_keep_message(user_data_store, uid, None, pm.message_id)
         except Exception:
             pass
         try:
@@ -1828,6 +2702,7 @@ async def dispatch_offer_created_notifications(
                 disable_web_page_preview=True,
             )
             register_offer_thread_message(user_data_store, uid, row_id, pm.message_id)
+            mark_flow_keep_message(user_data_store, uid, None, pm.message_id)
         except Exception:
             pass
         if not skip_main_menu_refresh_for_proposer:
@@ -1918,12 +2793,7 @@ def append_offer_lists_to_channel_html(base_html: str, advert_rowid: int) -> str
             u = get_user(int(r["proposer_telegram_id"]))
             label = _esc_html(_display_name_for_channel(u, int(r["proposer_telegram_id"])))
         pe = int(r.get("proposed_euro_amount") or 0)
-        if st == "pending":
-            prefix = "• "
-        elif st == "rejected":
-            prefix = "❌ "
-        else:
-            prefix = "✅ "
+        prefix = "• "
         inner = _channel_offer_line_inner_html(
             seq=seq,
             label=label,
@@ -1932,6 +2802,7 @@ def append_offer_lists_to_channel_html(base_html: str, advert_rowid: int) -> str
             advert=advert_for_list,
             hybrid=hybrid_list,
             status_prefix=prefix,
+            offer_status=st,
         )
         lines.append(_channel_offer_line_rtl(inner))
     offers_body = "\n".join(lines) if lines else ""
@@ -1963,6 +2834,46 @@ def append_offer_lists_to_channel_html(base_html: str, advert_rowid: int) -> str
     return base_html + "\n\n" + block
 
 
+def _inject_channel_bot_maintenance(html: str) -> str:
+    from database.db import is_bot_enabled
+    from utils.channel_format import (
+        CHANNEL_AD_FOOTER_MARKER,
+        bot_maintenance_channel_notice_html,
+    )
+
+    if is_bot_enabled():
+        return html
+    notice = bot_maintenance_channel_notice_html()
+    marker = CHANNEL_AD_FOOTER_MARKER
+    if marker in html:
+        idx = html.find(marker)
+        return html[:idx] + notice + html[idx:]
+    return html.rstrip() + "\n\n" + notice
+
+
+def channel_ad_reply_markup(
+    advert_rowid: int, bot_username: str | None
+) -> InlineKeyboardMarkup:
+    from database.db import is_bot_enabled
+
+    if not is_bot_enabled():
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "⛔️ ربات موقتاً غیرفعال",
+                        callback_data="bot_closed",
+                    )
+                ]
+            ]
+        )
+    if list_accepted_offers_for_advert(int(advert_rowid)):
+        return InlineKeyboardMarkup([])
+    return InlineKeyboardMarkup(
+        [[offer_proposal_inline_button(int(advert_rowid), bot_username)]]
+    )
+
+
 async def refresh_advert_channel_post(bot, advert_rowid: int) -> None:
     from handlers import admin
 
@@ -1983,13 +2894,10 @@ async def refresh_advert_channel_post(bot, advert_rowid: int) -> None:
         uname = (me.username or "").strip().lstrip("@")
         advert["bot_username"] = uname
         base = admin._build_channel_ad_text(advert)
-        full = append_offer_lists_to_channel_html(base, advert_rowid)
-        if list_accepted_offers_for_advert(int(advert_rowid)):
-            rk = InlineKeyboardMarkup([])
-        else:
-            rk = InlineKeyboardMarkup(
-                [[offer_proposal_inline_button(int(advert_rowid), uname)]]
-            )
+        full = _inject_channel_bot_maintenance(
+            append_offer_lists_to_channel_html(base, advert_rowid)
+        )
+        rk = channel_ad_reply_markup(int(advert_rowid), uname)
         await bot.edit_message_text(
             chat_id=cid_i,
             message_id=mid_i,
@@ -2052,8 +2960,8 @@ async def deliver_offer_proposal_gate(
             chat_id=user_id,
             user_id=user_id,
             store=user_data_store,
-            context=context,
         )
+        context.user_data["state"] = UserState.OFFER_ADVERT_ID.name
         return
 
     advert = get_euro_advert_by_rowid(advert_id)
@@ -2173,11 +3081,13 @@ def build_offer_gate_html(advert: dict) -> str:
             f"طبق این آگهی (کشور آگهی‌دهنده: {country}) مایل به ادامه هستید؟"
         )
     elif op == "خرید" and not is_exchange:
+        # آگهی «خرید» = آگهی‌دهنده یورو می‌خرد → پیشنهاددهنده فروشنده است.
         q = (
-            f"آیا شما فروشندهٔ یورو هستید و امکان پرداخت {amt} یورو "
-            f"به حساب بانکی شخصی در کشور {country} را دارید؟"
+            f"آیا شما <b>فروشندهٔ</b> یورو هستید و امکان واریز {amt} یورو "
+            f"به حساب بانکی آگهی‌دهنده در کشور {country} را دارید؟"
         )
     elif op == "فروش" and not is_exchange:
+        # آگهی «فروش» = آگهی‌دهنده یورو می‌فروشد → پیشنهاددهنده خریدار است.
         rate = advert.get("rate_toman")
         try:
             rate_s = (
@@ -2188,8 +3098,9 @@ def build_offer_gate_html(advert: dict) -> str:
         except (TypeError, ValueError):
             rate_s = str(rate)
         q = (
-            f"آیا شما قصد <b>فروش</b> {amt} یورو به صورت حواله بانکی را دارید؟\n"
-            f"(نرخ در آگهی: {rate_s} تومان)"
+            f"آیا شما قصد <b>خرید</b> {amt} یورو از این آگهی‌دهنده "
+            f"(حواله بانکی، کشور: {country}) را دارید؟\n"
+            f"(نرخ در آگهی: {rate_s} تومان — نرخ پیشنهادی شما در مرحله بعد)"
         )
     else:
         q = f"آیا مایلید برای این آگهی به مقدار {amt} یورو پیشنهاد خود را ادامه دهید؟"
@@ -2274,6 +3185,7 @@ def _channel_offer_line_inner_html(
     advert: dict | None,
     hybrid: bool,
     status_prefix: str,
+    offer_status: str = "pending",
 ) -> str:
     """یک خط پیشنهاد برای کانال: نرخ+تومان قبل از نام (جلوگیری از چسبیدن «تومان» به نام در RTL)."""
     adv = advert or {}
@@ -2287,6 +3199,11 @@ def _channel_offer_line_inner_html(
     euro_seg = ""
     if eff_e > 0 and pe > 0 and pe != adv_e:
         euro_seg = f" — <b>{eff_e:,}</b> یورو"
+    st = (offer_status or "pending").strip().lower()
+    if st == "rejected":
+        status_prefix = "❌ <b>رد شده</b> — "
+    elif st == "accepted":
+        status_prefix = "✅ <b>پذیرفته</b> — "
     return f"{status_prefix}<b>{seq}</b> — {rate_seg}{euro_seg} — {label}"
 
 
@@ -2305,50 +3222,125 @@ def _advert_requester_rate_line_html(advert: dict) -> str:
     return f"{_RTL}نرخ پیشنهادی درخواست‌کننده در آگهی: <b>{r:,}</b> تومان"
 
 
-def _my_sent_offers_block_html(advert_rowid: int, proposer_id: int) -> str:
+def _my_sent_offers_block_html(
+    advert_rowid: int, proposer_id: int, *, field: str = "euro"
+) -> str:
+    """field: euro = فقط مقدار یورو؛ rate = فقط نرخ تومان."""
     rows = list_my_advert_offers(advert_rowid, proposer_id)
     adv = get_euro_advert_by_rowid(int(advert_rowid))
     ex = _offer_skips_toman_rate_step(adv) if adv else False
+    adv_e = _advert_euro_amount_int(adv) if adv else 0
     if not rows:
-        return f"{_RTL}❌ هنوز پیشنهادی ارسال نشده است."
-    lines = [f"{_RTL}<b>پیشنهادهای ارسال‌شده توسط شما برای این آگهی</b> (قدیمی‌تر بالا، جدیدتر پایین):"]
+        return ""
+    header = (
+        f"{_RTL}<b>پیشنهادهای قبلی شما (مقدار یورو)</b> — آخرین {LIST_RECENT_LIMIT}:"
+        if field == "euro"
+        else f"{_RTL}<b>پیشنهادهای قبلی شما (نرخ تومان)</b> — آخرین {LIST_RECENT_LIMIT}:"
+    )
+    lines = [header]
     for row in rows:
         _oid, rt, ct = row[0], row[1], row[2]
-        des = row[3] if len(row) > 3 else None
+        des = (row[3] if len(row) > 3 else None) or ""
+        des = str(des).strip()
         st_raw = row[4] if len(row) > 4 else "pending"
         st = str(st_raw or "pending").strip().lower()
-        seq_disp = int(_oid)
-        if len(row) > 5:
-            seq_disp = int(row[5])
+        seq_disp = int(row[5]) if len(row) > 5 else int(_oid)
+        pe = 0
+        if len(row) > 6:
+            try:
+                pe = int(row[6] or 0)
+            except (TypeError, ValueError):
+                pe = 0
         ts = (ct or "").replace("T", " ").replace("-", "/")[:16]
-        tail = ""
-        if des:
-            short = (des[:35] + "…") if len(des) > 35 else des
-            tail = f" — {_esc_html(short)}"
         if st == "accepted":
             st_lbl = "✅ <b>پذیرفته</b>"
         elif st == "rejected":
             st_lbl = "❌ <b>رد شده</b>"
         else:
             st_lbl = "⏳ <b>در انتظار</b>"
-        rt_i = int(rt)
-        if ex and rt_i == 0:
-            rate_disp = f"{_RTL}معاوضهٔ یورو به یورو (بدون نرخ تومان)"
+        rt_i = int(rt or 0)
+        eff_e = _offer_effective_euro_amount(adv or {}, pe if pe > 0 else None)
+        if field == "euro":
+            if eff_e > 0 and pe > 0 and adv_e > 0 and eff_e != adv_e:
+                main = f"<b>{eff_e:,}</b> یورو (کل آگهی: <b>{adv_e:,}</b>)"
+            elif eff_e > 0:
+                main = f"<b>{eff_e:,}</b> یورو"
+            else:
+                main = "—"
         else:
-            rate_disp = f"<b>{rt_i:,}</b> تومان"
-        lines.append(
-            f"{_RTL}• پیشنهاد <b>{seq_disp}</b> — {st_lbl} — {rate_disp} — <i>{ts}</i>{tail}"
-        )
+            if ex and rt_i == 0:
+                main = "معاوضهٔ یورو به یورو"
+            elif rt_i > 0:
+                main = _ltr_rate_toman_html(rt_i)
+                if pe > 0 and adv_e > 0 and pe != adv_e:
+                    main += f" — <b>{pe:,}</b> یورو"
+            else:
+                main = "—"
+        lines.append(f"{_RTL}• پیشنهاد <b>{seq_disp}</b> — {st_lbl} — {main} — <i>{ts}</i>")
     return "\n".join(lines)
 
 
-def build_offer_rate_step_html(advert: dict, proposer_id: int) -> str:
-    _ = proposer_id
+def _offer_sent_offers_section_html(
+    advert: dict, proposer_id: int, *, field: str
+) -> str:
+    block = _my_sent_offers_block_html(
+        int(advert.get("rowid") or 0), proposer_id, field=field
+    )
+    if not block:
+        return ""
+    return f"\n\n{block}\n"
+
+
+def _offer_step_cancel_keyboard(advert_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    _OFFER_STEP_CANCEL_LABEL,
+                    callback_data=f"offer_rate_cancel|{advert_id}",
+                )
+            ]
+        ]
+    )
+
+
+def _offer_rate_step_keyboard(
+    advert_id: int, *, counter_mode: bool = False
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                _OFFER_STEP_CANCEL_LABEL,
+                callback_data=f"offer_rate_cancel|{advert_id}",
+            )
+        ]
+    ]
+    if counter_mode:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "↩️ تغییر مقدار یورو",
+                    callback_data=f"offer_back_euro|{advert_id}",
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
+
+
+def build_offer_rate_step_html(
+    advert: dict, proposer_id: int, *, target_euro: int | None = None
+) -> str:
     rate_hint = _advert_requester_rate_line_html(advert)
+    rule_hint = _offer_rate_rejection_rule_hint_html(
+        advert, proposer_id, target_euro=target_euro
+    )
+    sent = _offer_sent_offers_section_html(advert, proposer_id, field="rate")
     return (
         f"{_RTL}💰 لطفاً <b>نرخ پیشنهادی</b> را به تومان وارد کنید (فقط عدد):\n"
-        f"{_RTL}<i>مثال: 210000</i>\n\n"
+        f"{_RTL}<i>مثال: 210000</i>"
+        f"{rule_hint}\n\n"
         f"{rate_hint}"
+        f"{sent}"
     )
 
 
@@ -2362,21 +3354,15 @@ def build_offer_exchange_description_step_html(advert: dict, proposer_id: int) -
 
 
 def _offer_rate_cancel_keyboard(advert_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(_OFFER_STEP_CANCEL_LABEL, callback_data=f"offer_rate_cancel|{advert_id}")]]
-    )
+    return _offer_step_cancel_keyboard(advert_id)
 
 
 def _offer_desc_cancel_keyboard(advert_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(_OFFER_STEP_CANCEL_LABEL, callback_data=f"offer_desc_cancel|{advert_id}")]]
-    )
+    return _offer_step_cancel_keyboard(advert_id)
 
 
 def _offer_country_cancel_keyboard(advert_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(_OFFER_STEP_CANCEL_LABEL, callback_data=f"offer_country_cancel|{advert_id}")]]
-    )
+    return _offer_step_cancel_keyboard(advert_id)
 
 
 def _offer_preview_keyboard() -> InlineKeyboardMarkup:
@@ -2412,6 +3398,7 @@ def build_offer_preview_html(
         if counter_mode
         else f"{_RTL}📋 <b>پیش‌نمایش پیشنهاد شما</b>\n"
     )
+    desc_show = _normalize_offer_description(description)
     return (
         f"{title}"
         f"{_RTL}━━━━━━━━━━━━━━━━━━\n\n"
@@ -2419,7 +3406,7 @@ def build_offer_preview_html(
         f"{amt_block}"
         f"{rate_block}"
         f"{bank}"
-        f"{_RTL}📝 <b>توضیحات:</b>\n{_esc_html(description)}\n\n"
+        f"{_RTL}📝 <b>توضیحات:</b>\n{_esc_html(desc_show)}\n\n"
         f"{_RTL}یکی از گزینه‌ها را بزنید:"
     )
 
@@ -2441,28 +3428,38 @@ def _offer_gate_keyboard(advert_id: int) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    "❌ لغو پیشنهاد",
-                    callback_data=f"offer_gate_back|{advert_id}",
+                    _OFFER_STEP_CANCEL_LABEL,
+                    callback_data=f"offer_rate_cancel|{advert_id}",
                 )
             ],
         ]
     )
 
 
-def build_offer_counter_amount_step_html(advert: dict) -> str:
+def build_offer_counter_amount_step_html(advert: dict, proposer_id: int) -> str:
     adv_amt = _format_eur_amount(advert.get("euro_amount"))
+    sent = _offer_sent_offers_section_html(advert, proposer_id, field="euro")
     return (
         f"{_RTL}💶 لطفاً <b>مقدار یورو</b> پیشنهادی را وارد کنید (فقط عدد):\n"
         f"{_RTL}<i>مقدار در آگهی: {adv_amt} — مثال: 900</i>"
+        f"{sent}"
     )
 
 
-def build_offer_counter_rate_step_html(advert: dict) -> str:
+def build_offer_counter_rate_step_html(
+    advert: dict, proposer_id: int, *, target_euro: int | None = None
+) -> str:
     rate_line = _advert_requester_rate_line_html(advert)
+    rule_hint = _offer_rate_rejection_rule_hint_html(
+        advert, proposer_id, target_euro=target_euro
+    )
+    sent = _offer_sent_offers_section_html(advert, proposer_id, field="rate")
     return (
         f"{_RTL}💰 لطفاً <b>نرخ پیشنهادی</b> را به تومان وارد کنید (فقط عدد):\n"
-        f"{_RTL}<i>مثال: 210000</i>\n\n"
+        f"{_RTL}<i>مثال: 210000</i>"
+        f"{rule_hint}\n\n"
         f"{rate_line}"
+        f"{sent}"
     )
 
 
@@ -2470,6 +3467,17 @@ def build_offer_account_country_step_html() -> str:
     return (
         f"{_RTL}🌍 لطفاً <b>کشور حساب بانکی</b> خود را وارد کنید:\n"
         f"{_RTL}<i>مثال: آلمان</i>"
+    )
+
+
+def build_offer_recipient_country_step_html(advert: dict) -> str:
+    seller_ct = _offer_country_display_text(advert.get("account_country"))
+    return (
+        f"{_RTL}🏦 آگهی‌دهنده (فروشنده) می‌تواند یورو را به حساب شما <b>واریز</b> کند.\n\n"
+        f"{_RTL}لطفاً <b>کشور حساب دریافت‌کننده</b> را بنویسید "
+        f"(کشوری که می‌خواهید یورو را در آن دریافت کنید):\n"
+        f"{_RTL}<i>کشور حساب فروشنده در آگهی: {seller_ct}</i>\n"
+        f"{_RTL}<i>مثال: فرانسه</i>"
     )
 
 
@@ -2484,11 +3492,104 @@ def build_offer_description_only_step_html(*, saved_rate: int | None = None) -> 
     )
 
 
-def _offer_ack_description_text(desc: str) -> str:
+def _normalize_offer_description(desc: str | None) -> str:
     d = (desc or "").strip()
+    if not d or d.lower() == "none":
+        return "ندارد"
+    return d
+
+
+def _offer_ack_description_text(desc: str) -> str:
+    d = _normalize_offer_description(desc)
     if len(d) <= 100:
         return f"✅ توضیحات: {d}"
     return f"✅ توضیحات: {d[:97]}…"
+
+
+def _offer_flow_euro_draft_int(context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    draft = context.user_data.get("offer_draft_euro_amount")
+    try:
+        d = int(draft)
+    except (TypeError, ValueError):
+        return None
+    return d if d > 0 else None
+
+
+async def _offer_back_to_rate_step(
+    context: ContextTypes.DEFAULT_TYPE,
+    bot,
+    *,
+    chat_id: int,
+    user_id: int,
+    advert_id: int,
+    advert: dict,
+    error_html: str | None = None,
+    user_input_mid: int | None = None,
+) -> None:
+    """بازگشت به مرحله نرخ — پرامپت ثابت؛ خطا پیام جدا."""
+    await _offer_rate_step_present(
+        context,
+        bot,
+        chat_id=chat_id,
+        user_id=user_id,
+        advert_id=advert_id,
+        advert=advert,
+        user_input_mid=user_input_mid,
+    )
+    if not error_html:
+        return
+    counter = bool(context.user_data.get("offer_counter_mode"))
+    kb = _offer_rate_step_keyboard(advert_id, counter_mode=counter)
+    kwargs: dict = {
+        "chat_id": chat_id,
+        "text": error_html,
+        "parse_mode": ParseMode.HTML,
+        "reply_markup": kb,
+        "disable_web_page_preview": True,
+    }
+    if user_input_mid:
+        kwargs["reply_to_message_id"] = int(user_input_mid)
+    sent = await bot.send_message(**kwargs)
+    _offer_flow_track(context, sent.message_id)
+
+
+async def handle_offer_back_euro_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """بازگشت از مرحله نرخ به ورود مقدار یورو (فقط پیشنهاد با مقدار جدید)."""
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    if not re.match(r"^offer_back_euro\|\d+$", query.data or ""):
+        return
+    if not context.user_data.get("offer_counter_mode"):
+        return
+    uid = query.from_user.id
+    cid = query.message.chat_id if query.message else uid
+    advert_id = context.user_data.get("offer_advert_id")
+    if not isinstance(advert_id, int):
+        return
+    advert = get_euro_advert_by_rowid(advert_id)
+    if not advert:
+        return
+    context.user_data.pop("offer_draft_rate", None)
+    context.user_data.pop("offer_draft_description", None)
+    context.user_data["offer_flow_step"] = "counter_euro"
+    context.user_data["state"] = UserState.OFFER_COUNTER_EURO.name
+    await _offer_flow_clear_prompt(context, context.bot, chat_id=cid)
+    if query.message:
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+    text = build_offer_counter_amount_step_html(advert, uid)
+    await _offer_flow_prompt(
+        context,
+        context.bot,
+        chat_id=cid,
+        step="counter_euro",
+        text=text,
+        reply_markup=_offer_step_cancel_keyboard(advert_id),
+    )
 
 
 async def handle_offer_advert_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2557,15 +3658,25 @@ async def handle_offer_gate_agree(update: Update, context: ContextTypes.DEFAULT_
     context.user_data["offer_counter_mode"] = False
     if _offer_skips_toman_rate_step(advert):
         context.user_data["offer_draft_rate"] = 0
-        text = build_offer_exchange_description_step_html(advert, user_id)
-        kb = _offer_desc_cancel_keyboard(advert_id)
-        st_next = UserState.OFFER_DESCRIPTION.name
+        if _offer_requires_proposer_recipient_country(advert):
+            text = build_offer_recipient_country_step_html(advert)
+            kb = _offer_country_cancel_keyboard(advert_id)
+            st_next = UserState.OFFER_ACCOUNT_COUNTRY.name
+        else:
+            text = build_offer_exchange_description_step_html(advert, user_id)
+            kb = _offer_desc_cancel_keyboard(advert_id)
+            st_next = UserState.OFFER_DESCRIPTION.name
     else:
         text = build_offer_rate_step_html(advert, user_id)
-        kb = _offer_rate_cancel_keyboard(advert_id)
+        kb = _offer_rate_step_keyboard(advert_id, counter_mode=False)
         st_next = UserState.OFFER_RATE.name
     context.user_data["offer_advert_id"] = advert_id
-    flow_step = "description" if st_next == UserState.OFFER_DESCRIPTION.name else "rate"
+    if st_next == UserState.OFFER_ACCOUNT_COUNTRY.name:
+        flow_step = "account_country"
+    elif st_next == UserState.OFFER_DESCRIPTION.name:
+        flow_step = "description"
+    else:
+        flow_step = "rate"
     await _offer_flow_mark_gate_message(
         query,
         advert,
@@ -2629,8 +3740,8 @@ async def handle_offer_gate_custom(update: Update, context: ContextTypes.DEFAULT
     context.user_data.pop("offer_draft_euro_amount", None)
     context.user_data["offer_counter_mode"] = True
     context.user_data["offer_advert_id"] = advert_id
-    text = build_offer_counter_amount_step_html(advert)
-    kb = _offer_rate_cancel_keyboard(advert_id)
+    text = build_offer_counter_amount_step_html(advert, user_id)
+    kb = _offer_step_cancel_keyboard(advert_id)
     await _offer_flow_mark_gate_message(
         query,
         advert,
@@ -2664,6 +3775,7 @@ async def handle_offer_counter_amount_message(
     if amt is None or amt <= 0:
         await update.message.reply_text(
             f"{_RTL}❌ لطفاً یک مقدار یورو معتبر (بزرگ‌تر از صفر) وارد کنید.",
+            reply_markup=_offer_step_cancel_keyboard(advert_id),
         )
         return
     advert = get_euro_advert_by_rowid(advert_id)
@@ -2676,15 +3788,26 @@ async def handle_offer_counter_amount_message(
     context.user_data["offer_draft_euro_amount"] = amt
     if _offer_skips_toman_rate_step(advert):
         context.user_data["offer_draft_rate"] = 0
-        await _offer_flow_advance(
-            context,
-            context.bot,
-            chat_id=chat_id,
-            ack_text=f"✅ مقدار یورو: {amt:,}",
-            step="description",
-            prompt_html=build_offer_exchange_description_step_html(advert, user_id),
-            reply_markup=_offer_desc_cancel_keyboard(advert_id),
-        )
+        if _offer_requires_proposer_recipient_country(advert):
+            await _offer_flow_advance(
+                context,
+                context.bot,
+                chat_id=chat_id,
+                ack_text=f"✅ مقدار یورو: {amt:,}",
+                step="account_country",
+                prompt_html=build_offer_recipient_country_step_html(advert),
+                reply_markup=_offer_country_cancel_keyboard(advert_id),
+            )
+        else:
+            await _offer_flow_advance(
+                context,
+                context.bot,
+                chat_id=chat_id,
+                ack_text=f"✅ مقدار یورو: {amt:,}",
+                step="description",
+                prompt_html=build_offer_exchange_description_step_html(advert, user_id),
+                reply_markup=_offer_desc_cancel_keyboard(advert_id),
+            )
         return
     await _offer_flow_advance(
         context,
@@ -2692,8 +3815,10 @@ async def handle_offer_counter_amount_message(
         chat_id=chat_id,
         ack_text=f"✅ مقدار یورو: {amt:,}",
         step="rate",
-        prompt_html=build_offer_counter_rate_step_html(advert),
-        reply_markup=_offer_rate_cancel_keyboard(advert_id),
+        prompt_html=build_offer_counter_rate_step_html(
+            advert, user_id, target_euro=amt
+        ),
+        reply_markup=_offer_rate_step_keyboard(advert_id, counter_mode=True),
     )
 
 
@@ -2706,20 +3831,62 @@ async def handle_offer_rate_message(update: Update, context: ContextTypes.DEFAUL
         return
     if context.user_data.get("offer_flow_step") == "description":
         return await handle_offer_description_message(update, context)
-    advert_chk = get_euro_advert_by_rowid(advert_id)
-    if advert_chk and _offer_skips_toman_rate_step(advert_chk):
+    context.user_data["offer_flow_step"] = "rate"
+    context.user_data["state"] = UserState.OFFER_RATE.name
+    advert = get_euro_advert_by_rowid(advert_id)
+    if not advert:
+        _clear_offer_flow(context)
+        await update.message.reply_text(f"{_RTL}آگهی پیدا نشد.")
         return
     chat_id = update.effective_chat.id
+    if _offer_skips_toman_rate_step(advert):
+        context.user_data["offer_draft_rate"] = 0
+        if _offer_requires_proposer_bank_country(advert):
+            await _offer_flow_advance(
+                context,
+                context.bot,
+                chat_id=chat_id,
+                ack_text="✅ ادامه پیشنهاد",
+                step="account_country",
+                prompt_html=build_offer_account_country_step_html(),
+                reply_markup=_offer_country_cancel_keyboard(advert_id),
+            )
+        elif _offer_requires_proposer_recipient_country(advert):
+            await _offer_flow_advance(
+                context,
+                context.bot,
+                chat_id=chat_id,
+                ack_text="✅ ادامه پیشنهاد",
+                step="account_country",
+                prompt_html=build_offer_recipient_country_step_html(advert),
+                reply_markup=_offer_country_cancel_keyboard(advert_id),
+            )
+        else:
+            await _offer_flow_advance(
+                context,
+                context.bot,
+                chat_id=chat_id,
+                ack_text="✅ ادامه پیشنهاد",
+                step="description",
+                prompt_html=build_offer_exchange_description_step_html(
+                    advert, user_id
+                ),
+                reply_markup=_offer_desc_cancel_keyboard(advert_id),
+            )
+        return
     rate = _parse_int_toman(update.message.text or "")
+    input_mid = update.message.message_id
 
     async def _rate_step_error(err_html: str) -> None:
-        _offer_flow_track_input(context, update.message.message_id)
-        err_msg = await update.message.reply_text(
-            err_html,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
+        await _offer_rate_step_reply_error(
+            update,
+            context,
+            err_html=err_html,
+            advert_id=advert_id,
+            advert=advert,
+            user_id=user_id,
+            input_mid=input_mid,
         )
-        _offer_flow_track(context, err_msg.message_id)
 
     if rate is None or rate <= 0:
         await _rate_step_error(f"{_RTL}❌ لطفاً یک عدد تومان معتبر (بزرگ‌تر از صفر) وارد کنید.")
@@ -2729,18 +3896,23 @@ async def handle_offer_rate_message(update: Update, context: ContextTypes.DEFAUL
             f"{_RTL}❌ با این نرخ قبلاً برای همین آگهی پیشنهاد داده‌اید. نرخ متفاوتی وارد کنید."
         )
         return
-    advert = get_euro_advert_by_rowid(advert_id)
-    if not advert:
-        _clear_offer_flow(context)
-        await update.message.reply_text(f"{_RTL}آگهی پیدا نشد.")
-        return
+    draft_pe = _offer_flow_euro_draft_int(context)
+    eff_eur = effective_offer_euro_amount_for_advert(advert_id, draft_pe)
     rej_err = _offer_rate_after_rejection_error(
-        advert, rate, proposer_telegram_id=user_id
+        advert,
+        rate,
+        proposer_telegram_id=user_id,
+        effective_euro_amount=eff_eur,
+        proposed_euro_amount=draft_pe,
     )
     if rej_err:
+        print(
+            f"❌ offer rate blocked advert={advert_id} user={user_id} "
+            f"rate={rate} draft_pe={draft_pe} eff={eff_eur}"
+        )
         await _rate_step_error(rej_err)
         return
-    _offer_flow_track_input(context, update.message.message_id)
+    _offer_flow_track_input(context, input_mid)
     context.user_data["offer_draft_rate"] = rate
     if _offer_requires_proposer_bank_country(advert):
         await _offer_flow_advance(
@@ -2771,11 +3943,50 @@ async def handle_offer_account_country_message(
         return
     user_id = update.effective_user.id
     advert_id = context.user_data.get("offer_advert_id")
-    rate = context.user_data.get("offer_draft_rate")
-    if not isinstance(advert_id, int) or not isinstance(rate, int):
+    if not isinstance(advert_id, int):
+        await update.message.reply_text(
+            f"{_RTL}⚠️ فلو پیشنهاد منقضی شده — /menu و دوباره «ثبت پیشنهاد».",
+        )
         return
     advert = get_euro_advert_by_rowid(advert_id)
-    if not advert or not _offer_requires_proposer_bank_country(advert):
+    if not advert or not _offer_requires_proposer_country_step(advert):
+        await update.message.reply_text(
+            f"{_RTL}⚠️ این مرحله فعال نیست — /menu و دوباره شروع کنید.",
+        )
+        return
+    rate = context.user_data.get("offer_draft_rate")
+    if not isinstance(rate, int):
+        if _offer_skips_toman_rate_step(advert):
+            rate = 0
+            context.user_data["offer_draft_rate"] = 0
+        else:
+            await update.message.reply_text(
+                f"{_RTL}❌ ابتدا <b>نرخ</b> را در مرحلهٔ قبل وارد کنید.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+    chat_id = update.effective_chat.id
+    recipient_step = _offer_requires_proposer_recipient_country(advert)
+    draft_pe = _offer_flow_euro_draft_int(context)
+    eff_eur = effective_offer_euro_amount_for_advert(advert_id, draft_pe)
+    rej_err = _offer_rate_after_rejection_error(
+        advert,
+        int(rate),
+        proposer_telegram_id=user_id,
+        effective_euro_amount=eff_eur,
+        proposed_euro_amount=draft_pe,
+    )
+    if rej_err:
+        await _offer_back_to_rate_step(
+            context,
+            context.bot,
+            chat_id=chat_id,
+            user_id=user_id,
+            advert_id=advert_id,
+            advert=advert,
+            error_html=rej_err,
+            user_input_mid=update.message.message_id,
+        )
         return
     raw = (update.message.text or "").strip()
     if _message_looks_like_toman_amount(raw) or raw.isdigit():
@@ -2794,18 +4005,25 @@ async def handle_offer_account_country_message(
     if len(raw) > 120:
         await update.message.reply_text(f"{_RTL}❌ متن کوتاه‌تر وارد کنید (حداکثر ۱۲۰ نویسه).")
         return
-    chat_id = update.effective_chat.id
     _offer_flow_track_input(context, update.message.message_id)
     context.user_data["offer_draft_account_country"] = raw
     saved_rate = context.user_data.get("offer_draft_rate")
     sr = int(saved_rate) if isinstance(saved_rate, int) else None
+    if recipient_step:
+        desc_prompt = build_offer_exchange_description_step_html(
+            advert, update.effective_user.id
+        )
+        ack = f"✅ کشور دریافت حساب: {raw}"
+    else:
+        desc_prompt = build_offer_description_only_step_html(saved_rate=sr)
+        ack = f"✅ کشور حساب بانکی: {raw}"
     await _offer_flow_advance(
         context,
         context.bot,
         chat_id=chat_id,
-        ack_text=f"✅ کشور حساب بانکی: {raw}",
+        ack_text=ack,
         step="description",
-        prompt_html=build_offer_description_only_step_html(saved_rate=sr),
+        prompt_html=desc_prompt,
         reply_markup=_offer_desc_cancel_keyboard(advert_id),
     )
 
@@ -2821,27 +4039,38 @@ async def handle_offer_description_message(update: Update, context: ContextTypes
     if not isinstance(advert_id, int):
         return
     if not isinstance(rate, int):
+        adv_tmp = get_euro_advert_by_rowid(advert_id) or {}
+        pe_tmp = _offer_flow_euro_draft_int(context)
         await _offer_flow_prompt(
             context,
             context.bot,
             chat_id=chat_id,
             step="rate",
             text=_build_offer_rate_prompt_html(
-                get_euro_advert_by_rowid(advert_id) or {},
+                adv_tmp,
                 update.effective_user.id,
                 counter_mode=bool(context.user_data.get("offer_counter_mode")),
+                target_euro=pe_tmp,
             ),
-            reply_markup=_offer_rate_cancel_keyboard(advert_id),
+            reply_markup=_offer_rate_step_keyboard(
+                advert_id,
+                counter_mode=bool(context.user_data.get("offer_counter_mode")),
+            ),
         )
         return
     advert = get_euro_advert_by_rowid(advert_id)
     if not advert:
         return
-    if _offer_requires_proposer_bank_country(advert):
+    if _offer_requires_proposer_country_step(advert):
         cc = context.user_data.get("offer_draft_account_country")
         if not isinstance(cc, str) or len(cc.strip()) < 2:
+            hint = (
+                "کشور دریافت حساب را در مرحلهٔ قبل وارد کنید"
+                if _offer_requires_proposer_recipient_country(advert)
+                else "کشور حساب بانکی را در مرحلهٔ قبل وارد کنید"
+            )
             await update.message.reply_text(
-                f"{_RTL}ابتدا کشور حساب بانکی را در مرحلهٔ قبل وارد کنید یا با /menu از اول شروع کنید.",
+                f"{_RTL}ابتدا {hint} یا با /menu از اول شروع کنید.",
             )
             return
     raw = (update.message.text or "").strip()
@@ -2864,13 +4093,32 @@ async def handle_offer_description_message(update: Update, context: ContextTypes
         await update.message.reply_text(f"{_RTL}❌ توضیحات خیلی طولانی است. کوتاه‌تر کنید.")
         return
     _offer_flow_track_input(context, update.message.message_id)
-    context.user_data["offer_draft_description"] = desc
+    context.user_data["offer_draft_description"] = _normalize_offer_description(desc)
+    pe_kw = _offer_flow_euro_draft_int(context)
+    eff = effective_offer_euro_amount_for_advert(advert_id, pe_kw)
+    rej_err = _offer_rate_after_rejection_error(
+        advert,
+        int(rate),
+        proposer_telegram_id=update.effective_user.id,
+        effective_euro_amount=eff,
+        proposed_euro_amount=pe_kw,
+    )
+    if rej_err:
+        await _offer_back_to_rate_step(
+            context,
+            context.bot,
+            chat_id=chat_id,
+            user_id=update.effective_user.id,
+            advert_id=advert_id,
+            advert=advert,
+            error_html=rej_err,
+            user_input_mid=update.message.message_id,
+        )
+        return
     pbc = None
-    if _offer_requires_proposer_bank_country(advert):
+    if _offer_requires_proposer_country_step(advert):
         pbc = (context.user_data.get("offer_draft_account_country") or "").strip()
     counter = bool(context.user_data.get("offer_counter_mode"))
-    draft_euro = context.user_data.get("offer_draft_euro_amount")
-    pe_kw = int(draft_euro) if isinstance(draft_euro, int) and draft_euro > 0 else None
     preview = build_offer_preview_html(
         advert_id,
         rate,
@@ -2882,7 +4130,10 @@ async def handle_offer_description_message(update: Update, context: ContextTypes
     )
     await _offer_flow_clear_prompt(context, context.bot, chat_id=chat_id)
     await _offer_flow_ack(
-        context, context.bot, chat_id=chat_id, text=_offer_ack_description_text(desc)
+        context,
+        context.bot,
+        chat_id=chat_id,
+        text=_offer_ack_description_text(context.user_data["offer_draft_description"]),
     )
     await _offer_flow_prompt(
         context,
@@ -2951,20 +4202,6 @@ async def handle_offer_final_confirm(update: Update, context: ContextTypes.DEFAU
         negotiation_cleanup_for_offer(context.application.bot_data, int(meta["id"]))
     if deleted_pending:
         await refresh_advert_channel_post(context.bot, aid)
-    rej_err = _offer_rate_after_rejection_error(advert, rate, proposer_telegram_id=uid)
-    if rej_err:
-        plain = re.sub(r"<[^>]+>", "", rej_err).replace("\u200f", "").strip()
-        if len(plain) > 180:
-            plain = plain[:177] + "…"
-        await query.answer(plain, show_alert=True)
-        return
-    prop_ctry = None
-    if _offer_requires_proposer_bank_country(advert):
-        raw_c = context.user_data.get("offer_draft_account_country")
-        if not isinstance(raw_c, str) or len(raw_c.strip()) < 2:
-            await query.answer("کشور حساب بانکی ثبت نشده است.", show_alert=True)
-            return
-        prop_ctry = raw_c.strip()
     counter = bool(context.user_data.get("offer_counter_mode"))
     proposed_euro: int | None = None
     if counter:
@@ -2984,6 +4221,50 @@ async def handle_offer_final_confirm(update: Update, context: ContextTypes.DEFAU
             return
         if amount_changed:
             proposed_euro = int(draft_amt)
+    eff_confirm = effective_offer_euro_amount_for_advert(aid, proposed_euro)
+    rej_err = _offer_rate_after_rejection_error(
+        advert,
+        rate,
+        proposer_telegram_id=uid,
+        effective_euro_amount=eff_confirm,
+        proposed_euro_amount=proposed_euro,
+    )
+    if rej_err:
+        await query.answer()
+        cid = query.message.chat_id if query.message else uid
+        if query.message:
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+        await _offer_back_to_rate_step(
+            context,
+            context.bot,
+            chat_id=cid,
+            user_id=uid,
+            advert_id=aid,
+            advert=advert,
+            error_html=rej_err,
+        )
+        return
+    prop_ctry = None
+    if _offer_requires_proposer_country_step(advert):
+        raw_c = context.user_data.get("offer_draft_account_country")
+        if not isinstance(raw_c, str) or len(raw_c.strip()) < 2:
+            alert = (
+                "کشور دریافت حساب ثبت نشده است."
+                if _offer_requires_proposer_recipient_country(advert)
+                else "کشور حساب بانکی ثبت نشده است."
+            )
+            await query.answer(alert, show_alert=True)
+            return
+        prop_ctry = raw_c.strip()
+    from utils.rate_limit import check_rate_limit, offer_bucket
+    from messages.user_errors import RATE_LIMIT_OFFER
+
+    if not check_rate_limit(offer_bucket(uid, aid), max_events=12, window_sec=3600):
+        await query.answer(RATE_LIMIT_OFFER.replace(_RTL, "").strip(), show_alert=True)
+        return
     ins = insert_advert_offer(
         aid,
         uid,
@@ -2993,7 +4274,36 @@ async def handle_offer_final_confirm(update: Update, context: ContextTypes.DEFAU
         proposed_euro_amount=proposed_euro,
     )
     if ins is None:
-        await query.answer("ذخیره نشد.", show_alert=True)
+        await query.answer()
+        cid = query.message.chat_id if query.message else uid
+        if query.message:
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+        if rejected_offer_same_rate_and_euro(aid, rate, eff_confirm):
+            err_html = _offer_rate_after_rejection_error(
+                advert,
+                rate,
+                proposer_telegram_id=uid,
+                effective_euro_amount=eff_confirm,
+                proposed_euro_amount=proposed_euro,
+            )
+            await _offer_back_to_rate_step(
+                context,
+                context.bot,
+                chat_id=cid,
+                user_id=uid,
+                advert_id=aid,
+                advert=advert,
+                error_html=err_html,
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=cid,
+                text=f"{_RTL}❌ ذخیره پیشنهاد انجام نشد. دوباره تلاش کنید یا انصراف بزنید.",
+                reply_markup=_offer_step_cancel_keyboard(aid),
+            )
         return
     row_id, offer_seq = ins
     await query.answer()
@@ -3103,6 +4413,10 @@ async def handle_offer_gate_back(update: Update, context: ContextTypes.DEFAULT_T
 async def handle_advert_owner_offer_action(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
+    from handlers.access_gate import ensure_registered_or_redirect
+
+    if await ensure_registered_or_redirect(update, context):
+        return
     query = update.callback_query
     if not query or not query.from_user:
         return
@@ -3136,42 +4450,68 @@ async def handle_advert_owner_offer_action(
         proposer_id = int(row["proposer_telegram_id"])
         aid = int(row["advert_rowid"])
         seq = int(row.get("seq_in_advert") or offer_id)
+        auto_rejected = 0
         for other_oid in reject_other_pending_offers_for_advert(aid, offer_id):
             ometa = get_advert_offer_joined(other_oid)
-            if ometa:
-                await purge_offer_thread_messages(
-                    context.bot,
-                    user_data_store,
-                    int(ometa["owner_id"]),
-                    int(ometa["proposer_telegram_id"]),
-                    other_oid,
+            if not ometa:
+                continue
+            auto_rejected += 1
+            await purge_offer_thread_messages(
+                context.bot,
+                user_data_store,
+                int(ometa["owner_id"]),
+                int(ometa["proposer_telegram_id"]),
+                other_oid,
+            )
+            negotiation_cleanup_for_offer(
+                context.application.bot_data, other_oid
+            )
+            opid = int(ometa["proposer_telegram_id"])
+            oseq = int(ometa.get("seq_in_advert") or other_oid)
+            if opid and opid != proposer_id:
+                try:
+                    await context.bot.send_message(
+                        opid,
+                        f"{_RTL}پیشنهاد شماره <b>{oseq}</b> برای آگهی <b>{aid}</b> "
+                        f"<b>رد شد</b> (پیشنهاد دیگری پذیرفته شد).",
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    pass
+                try:
+                    await send_or_replace_main_menu(
+                        context.bot,
+                        chat_id=opid,
+                        user_id=opid,
+                        store=user_data_store,
+                    )
+                except Exception:
+                    pass
+        if auto_rejected > 0:
+            try:
+                await context.bot.send_message(
+                    owner_id,
+                    f"{_RTL}ℹ️ <b>{auto_rejected}</b> پیشنهاد دیگر به‌صورت خودکار "
+                    f"<b>رد شد</b> و پیام‌هایشان از چت شما پاک شد.",
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
                 )
-                negotiation_cleanup_for_offer(
-                    context.application.bot_data, other_oid
-                )
-                opid = int(ometa["proposer_telegram_id"])
-                oseq = int(ometa.get("seq_in_advert") or other_oid)
-                if opid and opid != proposer_id:
-                    try:
-                        await context.bot.send_message(
-                            opid,
-                            f"{_RTL}پیشنهاد شماره <b>{oseq}</b> برای آگهی <b>{aid}</b> به‌صورت خودکار رد شد "
-                            f"(پیشنهاد دیگری برای این آگهی پذیرفته شد).",
-                            parse_mode=ParseMode.HTML,
-                            disable_web_page_preview=True,
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        await send_or_replace_main_menu(
-                            context.bot,
-                            chat_id=opid,
-                            user_id=opid,
-                            store=user_data_store,
-                        )
-                    except Exception:
-                        pass
+            except Exception:
+                pass
         advert = get_euro_advert_by_rowid(aid)
+        neg_transcript_append(
+            context.application.bot_data,
+            offer_id,
+            "owner",
+            f"صاحب آگهی پیشنهاد #{seq} را پذیرفت (آگهی #{aid})",
+        )
+        neg_transcript_append(
+            context.application.bot_data,
+            offer_id,
+            "system",
+            "پیام‌های چت این پیشنهاد پاک شد؛ ادامه در تأیید نهایی و آرشیو DB",
+        )
         await purge_offer_thread_messages(
             context.bot,
             user_data_store,
@@ -3182,11 +4522,13 @@ async def handle_advert_owner_offer_action(
         negotiation_cleanup_for_offer(context.application.bot_data, offer_id)
         await refresh_advert_channel_post(context.bot, aid)
         if advert:
-            acc_owner = _post_acceptance_message_html(
-                advert, row, owner_id, seq, aid
-            )
-            acc_prop = _post_acceptance_message_html(
-                advert, row, proposer_id, seq, aid
+            from handlers.deal_gate import start_deal_final_gate
+
+            await start_deal_final_gate(
+                context,
+                offer_id=offer_id,
+                row=row,
+                advert=advert,
             )
         else:
             acc_owner = (
@@ -3196,34 +4538,53 @@ async def handle_advert_owner_offer_action(
             acc_prop = (
                 f"{_RTL}✅ صاحب آگهی، پیشنهاد شماره <b>{seq}</b> (آگهی <b>{aid}</b>) را پذیرفت."
             )
-        acc_kb = _post_acceptance_reply_markup(advert) if advert else None
-        for u, txt in ((owner_id, acc_owner), (proposer_id, acc_prop)):
-            if not u:
-                continue
-            try:
-                await context.bot.send_message(
-                    u,
-                    txt,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=acc_kb,
-                    disable_web_page_preview=True,
-                )
-            except Exception:
-                await context.bot.send_message(
-                    u,
-                    txt.replace("<b>", "").replace("</b>", ""),
-                    reply_markup=acc_kb,
-                    disable_web_page_preview=True,
-                )
-            try:
-                await send_or_replace_main_menu(
-                    context.bot,
-                    chat_id=u,
-                    user_id=u,
-                    store=user_data_store,
-                )
-            except Exception:
-                pass
+        if not advert:
+            for u, txt in ((owner_id, acc_owner), (proposer_id, acc_prop)):
+                if not u:
+                    continue
+                acc_kb = None
+                sent_acc = None
+                try:
+                    sent_acc = await context.bot.send_message(
+                        u,
+                        txt,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=acc_kb,
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    sent_acc = await context.bot.send_message(
+                        u,
+                        txt.replace("<b>", "").replace("</b>", ""),
+                        reply_markup=acc_kb,
+                        disable_web_page_preview=True,
+                    )
+                if sent_acc:
+                    mark_flow_keep_message(
+                        user_data_store, u, context.user_data, sent_acc.message_id
+                    )
+                try:
+                    await send_or_replace_main_menu(
+                        context.bot,
+                        chat_id=u,
+                        user_id=u,
+                        store=user_data_store,
+                    )
+                except Exception:
+                    pass
+        else:
+            for u in (owner_id, proposer_id):
+                if not u:
+                    continue
+                try:
+                    await send_or_replace_main_menu(
+                        context.bot,
+                        chat_id=u,
+                        user_id=u,
+                        store=user_data_store,
+                    )
+                except Exception:
+                    pass
         return
 
     if action == "no":
@@ -3373,6 +4734,18 @@ async def handle_negotiation_message(
             )
         except Exception:
             pass
+    from utils.rate_limit import check_rate_limit, negotiation_bucket
+    from messages.user_errors import RATE_LIMIT_GENERIC
+
+    if not check_rate_limit(
+        negotiation_bucket(update.effective_user.id, int(oid)),
+        max_events=30,
+        window_sec=3600,
+    ):
+        await context.bot.send_message(
+            update.effective_chat.id, RATE_LIMIT_GENERIC, parse_mode=ParseMode.HTML
+        )
+        return
     row = get_advert_offer_joined(oid)
     if not row:
         await context.bot.send_message(
