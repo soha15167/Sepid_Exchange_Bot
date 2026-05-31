@@ -21,6 +21,7 @@ import time
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, Message
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, TelegramError
+from utils.telegram_utils import is_message_not_modified_error
 from telegram.ext import ApplicationHandlerStop, ContextTypes
 
 from config.settings import (
@@ -761,8 +762,9 @@ async def handle_my_offers_page_callback(
             ),
             disable_web_page_preview=True,
         )
-    except Exception:
-        pass
+    except BadRequest as exc:
+        if not is_message_not_modified_error(exc):
+            raise
 
 
 async def handle_my_offers_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1991,6 +1993,8 @@ def _format_telegram_user_identity_html(
     telegram_id: int, tg_user=None, *, prefix: str = "فرستنده"
 ) -> str:
     """نام نمایشی، یوزرنیم، آیدی و لینک تماس برای ادمین."""
+    from utils.channel_format import _telegram_at_link_html
+
     urow = get_user(int(telegram_id))
     display = ""
     if urow:
@@ -2009,10 +2013,8 @@ def _format_telegram_user_identity_html(
         f"<b>{html_module.escape(display)}</b>\n",
     ]
     if uname:
-        esc_u = html_module.escape(uname, quote=False)
-        lines.append(
-            f'{_RTL}🧪 <b>یوزرنیم:</b> <a href="https://t.me/{esc_u}">@{esc_u}</a>\n'
-        )
+        link = _telegram_at_link_html(uname)
+        lines.append(f"\u202b{_RTL}🧪 <b>یوزرنیم:</b> \u200f {link}\u202c\n")
     lines.append(
         f'{_RTL}🆔 <b>شناسه:</b> <code>{int(telegram_id)}</code> · '
         f'<a href="tg://user?id={int(telegram_id)}">تماس در تلگرام</a>\n'
@@ -2054,8 +2056,33 @@ def _financial_party_summary_html(
     )
 
 
+def buyer_deposit_toman_amount(advert: dict, row: dict) -> int:
+    """مبلغ تومانی که خریدار یورو باید به حساب ادمین واریز کند."""
+    rate = int(row["rate_toman"])
+    pe_raw = int(row.get("proposed_euro_amount") or 0)
+    pe_kw = pe_raw if pe_raw > 0 else None
+    eur_amt = _offer_effective_euro_amount(advert, pe_kw)
+    op = (advert.get("operation") or "").strip()
+    base = int(eur_amt) * int(rate)
+    ov = advert_fee_override_eur(advert)
+    fee_eur = fee_total_eur(eur_amt, ov)
+    fee_toman = int(round(fee_eur * float(rate)))
+    owner_view = op == "خرید"
+    if op == "فروش":
+        return base - fee_toman if owner_view else base + fee_toman
+    if op == "خرید":
+        return base + fee_toman if owner_view else base - fee_toman
+    return base
+
+
 def _format_deal_party_identity_html(telegram_id: int, *, title: str) -> str:
     """شناسهٔ کامل یک طرف معامله برای ادمین."""
+    from utils.channel_format import (
+        format_email_bullet_line_html,
+        format_phone_bullet_line_html,
+        format_username_bullet_line_html,
+    )
+
     if not telegram_id:
         return f"{_RTL}👤 <b>{html_module.escape(title)}:</b> —\n"
     urow = get_user(int(telegram_id))
@@ -2072,10 +2099,7 @@ def _format_deal_party_identity_html(telegram_id: int, *, title: str) -> str:
         f"{_RTL}• نام: <b>{html_module.escape(display)}</b>\n",
     ]
     if uname:
-        esc_u = html_module.escape(uname, quote=False)
-        lines.append(
-            f'{_RTL}• یوزرنیم: <a href="https://t.me/{esc_u}">@{esc_u}</a>\n'
-        )
+        lines.append(format_username_bullet_line_html(uname))
     lines.append(
         f'{_RTL}• شناسه: <code>{int(telegram_id)}</code> · '
         f'<a href="tg://user?id={int(telegram_id)}">تماس</a>\n'
@@ -2083,14 +2107,10 @@ def _format_deal_party_identity_html(telegram_id: int, *, title: str) -> str:
     if urow:
         phone = (urow.get("phone_number") or "").strip()
         if phone:
-            lines.append(
-                f"{_RTL}• تلفن: <code>{html_module.escape(phone)}</code>\n"
-            )
+            lines.append(format_phone_bullet_line_html(phone))
         email = (urow.get("email") or "").strip()
         if email:
-            lines.append(
-                f"{_RTL}• ایمیل: <code>{html_module.escape(email)}</code>\n"
-            )
+            lines.append(format_email_bullet_line_html(email))
     return "".join(lines)
 
 
@@ -2289,6 +2309,8 @@ def _post_acceptance_admin_received_footer_html(
 
 
 def _format_peer_user_line_html(label: str, telegram_id: int) -> str:
+    from utils.channel_format import _telegram_at_link_html
+
     urow = get_user(int(telegram_id))
     name = ""
     if urow:
@@ -2302,8 +2324,7 @@ def _format_peer_user_line_html(label: str, telegram_id: int) -> str:
         f"<code>{int(telegram_id)}</code>"
     )
     if uname:
-        esc_u = html_module.escape(uname, quote=False)
-        line += f' · <a href="https://t.me/{esc_u}">@{esc_u}</a>'
+        line += f" · {_telegram_at_link_html(uname)}"
     line += (
         f' · <a href="tg://user?id={int(telegram_id)}">تماس</a>\n'
     )

@@ -2533,6 +2533,66 @@ def deal_gate_active_for_user(user_id: int) -> dict | None:
     return None
 
 
+def deal_gate_list_for_admin(*, limit: int = 25) -> list[dict]:
+    """معاملات باز و اخیراً تکمیل‌شده برای پنل ادمین."""
+    lim = max(1, min(int(limit), 50))
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT * FROM offer_deal_gates
+            WHERE gate_status IN ('pending', 'accounts', 'completed')
+            ORDER BY
+                CASE gate_status
+                    WHEN 'pending' THEN 0
+                    WHEN 'accounts' THEN 1
+                    WHEN 'completed' THEN 2
+                    ELSE 3
+                END,
+                COALESCE(completed_at, started_at) DESC
+            LIMIT ?
+            """,
+            (lim,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def deal_gate_lookup_for_admin(
+    *,
+    offer_id: int | None = None,
+    advert_rowid: int | None = None,
+) -> dict | None:
+    """جستجوی معامله برای ادمین با offer_id یا advert_rowid."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        if offer_id is not None:
+            try:
+                oid = int(offer_id)
+            except (TypeError, ValueError):
+                return None
+            row = conn.execute(
+                "SELECT * FROM offer_deal_gates WHERE offer_id = ?",
+                (oid,),
+            ).fetchone()
+            return dict(row) if row else None
+        if advert_rowid is not None:
+            try:
+                aid = int(advert_rowid)
+            except (TypeError, ValueError):
+                return None
+            row = conn.execute(
+                """
+                SELECT * FROM offer_deal_gates
+                WHERE advert_rowid = ?
+                ORDER BY COALESCE(completed_at, started_at) DESC
+                LIMIT 1
+                """,
+                (aid,),
+            ).fetchone()
+            return dict(row) if row else None
+    return None
+
+
 @contextmanager
 def get_db():
     """EN: SQLite connection with auto-commit. FA: اتصال با commit خودکار."""

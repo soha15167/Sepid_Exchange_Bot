@@ -23,6 +23,7 @@ from utils.iran_digits import (
     TESSERACT_DIGIT_WHITELIST,
     normalize_digits,
 )
+from utils.receipt_amount import normalize_transfer_amount
 
 _RECEIPT_HINTS = re.compile(
     r"ریال|مبلغ|رسید|حواله|بانک|پایا|پیگیری|خرداد|فروردین|انتقال|موفق",
@@ -38,6 +39,8 @@ _SPACED_RIAL = re.compile(
     re.IGNORECASE,
 )
 _MIN_TRANSFER_RIAL = 10_000_000
+# حداقل مبلغ با ویرگول/ریال در خط «مبلغ» — کارت‌به‌کارت baam گاهی ~۵۸M ریال
+_MIN_MABLAGH_LINE_RIAL = 5_000_000
 
 
 def _normalize_for_amount(text: str) -> str:
@@ -86,7 +89,10 @@ def is_confident_transfer_amount(value: int, token: str = "") -> bool:
     tok = token or f"{v:,}"
     if _comma_groups(tok) >= 2:
         return True
-    return len(str(v)) <= 10 and v >= 100_000_000
+    digits = len(str(v))
+    if digits >= 11:
+        return False
+    return digits >= 7 and v >= _MIN_TRANSFER_RIAL
 
 
 def amount_candidates_from_text(text: str) -> list[int]:
@@ -146,7 +152,7 @@ def amount_candidates_from_text(text: str) -> list[int]:
             v = int(m.group(1))
         except ValueError:
             continue
-        if v < 100_000_000 or v in seen:
+        if v < _MIN_TRANSFER_RIAL or v in seen:
             continue
         ctx = t[max(0, m.start() - 35) : m.end() + 35]
         if not re.search(r"مبلغ|ریال", ctx, re.I):
@@ -169,7 +175,8 @@ def best_amount_from_text(text: str) -> int:
             v = int(token.replace(",", ""))
         except ValueError:
             continue
-        if not is_confident_transfer_amount(v, token):
+        v = normalize_transfer_amount(v, token)
+        if not v or not is_confident_transfer_amount(v, token):
             continue
         ctx = t[max(0, m.start() - 30) : m.end() + 30]
         sc = 100
@@ -178,12 +185,13 @@ def best_amount_from_text(text: str) -> int:
         if _BAD_AMOUNT_CTX.search(ctx):
             sc -= 90
         scored.append((v, sc))
-    for v in _amounts_from_digit_soup(t, require_rial=True):
-        if is_confident_transfer_amount(v):
+    for raw_v in _amounts_from_digit_soup(t, require_rial=True):
+        v = normalize_transfer_amount(raw_v)
+        if v and is_confident_transfer_amount(v):
             scored.append((v, 60))
     if not scored:
         return 0
-    scored.sort(key=lambda x: (x[1], x[0]), reverse=True)
+    scored.sort(key=lambda x: (x[1], -x[0]), reverse=True)
     return scored[0][0] if scored[0][1] >= 50 else 0
 
 
@@ -401,27 +409,27 @@ def _baam_amount_ocr(image_path: str, deadline: float) -> int:
                         if not txt:
                             continue
                         for v in _parse_comma_amounts_from_ocr_text(txt):
-                            if v > best:
-                                best = v
+                            nv = normalize_transfer_amount(v)
+                            if nv > best:
+                                best = nv
                                 logger.info(
                                     "receipt_ocr: baam %s amount=%s sample=%r",
                                     tag,
-                                    v,
+                                    nv,
                                     txt[:70].replace("\n", " "),
                                 )
-                            if is_confident_transfer_amount(v):
-                                return v
-                        # ارقام چسبیده: 287625000
+                            if nv and is_confident_transfer_amount(nv):
+                                return nv
                         blob = _normalize_for_amount(txt)
                         for m in re.finditer(r"(?<!\d)(\d{9})(?!\d)", blob):
-                            v = int(m.group(1))
-                            if is_confident_transfer_amount(v):
+                            nv = normalize_transfer_amount(int(m.group(1)))
+                            if nv and is_confident_transfer_amount(nv):
                                 logger.info(
                                     "receipt_ocr: baam %s compact amount=%s",
                                     tag,
-                                    v,
+                                    nv,
                                 )
-                                return v
+                                return nv
     if not best:
         logger.warning("receipt_ocr: baam amount not found in image")
     return best
@@ -533,7 +541,7 @@ def ocr_best_amount_from_image(image_path: str, *, budget_sec: float = 24) -> in
     if not image_path or not os.path.exists(image_path):
         return 0
     deadline = time.monotonic() + budget_sec
-    baam = _baam_amount_ocr(image_path, deadline)
+    baam = normalize_transfer_amount(_baam_amount_ocr(image_path, deadline))
     if baam:
         return baam
     if time.monotonic() >= deadline:
@@ -541,7 +549,7 @@ def ocr_best_amount_from_image(image_path: str, *, budget_sec: float = 24) -> in
 
     available = _tesseract_langs()
     lang = "fas" if "fas" in available else "eng"
-    full = _full_page_amount_ocr(image_path, deadline, lang)
+    full = normalize_transfer_amount(_full_page_amount_ocr(image_path, deadline, lang))
     if full:
         return full
     if time.monotonic() >= deadline:
@@ -567,7 +575,7 @@ def ocr_best_amount_from_image(image_path: str, *, budget_sec: float = 24) -> in
                 texts.append(txt)
 
     combined = "\n".join(texts)
-    best = best_amount_from_text(combined)
+    best = normalize_transfer_amount(best_amount_from_text(combined))
     if best:
         logger.info("receipt_ocr: image amount=%s", best)
     return best
@@ -598,11 +606,11 @@ def ocr_image_to_text(image_path: str, *, quick: bool = False) -> tuple[bool, st
     chunks: list[str] = []
     tried = 0
 
-    baam_amt = _baam_amount_ocr(image_path, deadline)
+    baam_amt = normalize_transfer_amount(_baam_amount_ocr(image_path, deadline))
     if baam_amt:
         chunks.append(f"مبلغ\n{baam_amt:,} ریال")
     elif time.monotonic() < deadline:
-        fp_amt = _full_page_amount_ocr(image_path, deadline, lang)
+        fp_amt = normalize_transfer_amount(_full_page_amount_ocr(image_path, deadline, lang))
         if fp_amt:
             chunks.append(f"مبلغ حواله\n{fp_amt:,} ریال")
 

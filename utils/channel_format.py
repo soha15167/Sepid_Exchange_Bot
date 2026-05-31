@@ -106,6 +106,36 @@ def format_copyable_toman_html(amount: int | float) -> str:
     return f"<code>{html_module.escape(label, quote=False)}</code>"
 
 
+def format_ltr_code_html(value: str) -> str:
+    """مقدار LTR داخل <code> — + و @ در متن RTL سمت چپ بمانند."""
+    s = str(value or "").strip()
+    if not s:
+        return "—"
+    esc = html_module.escape(s, quote=False)
+    return f"<code>\u200e{_LRI}{esc}{_PDI}</code>"
+
+
+def format_username_bullet_line_html(username: str) -> str:
+    link = _telegram_at_link_html(username)
+    if not link:
+        return ""
+    return f"\u202b{_RTL}• یوزرنیم: \u200f {link}\u202c\n"
+
+
+def format_phone_bullet_line_html(phone: str) -> str:
+    s = (phone or "").strip()
+    if not s:
+        return ""
+    return f"\u202b{_RTL}• تلفن: {format_ltr_code_html(s)}\u202c\n"
+
+
+def format_email_bullet_line_html(email: str) -> str:
+    s = (email or "").strip()
+    if not s:
+        return ""
+    return f"\u202b{_RTL}• ایمیل: {format_ltr_code_html(s)}\u202c\n"
+
+
 def format_channel_line_html(username: str) -> str:
     """خط کانال — لینک t.me (باز شدن کانال، نه حالت کپی مثل code)."""
     link = _telegram_at_link_html(username)

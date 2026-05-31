@@ -138,7 +138,12 @@ from handlers.channel_info import (
     handle_main_rules_callback,
     handle_main_rules_reply_message,
 )
-from handlers.deal_gate import deal_gate_accounts_router, deal_gate_callback
+from handlers.deal_gate import (
+    deal_admin_payment_callback,
+    deal_gate_accounts_photo_router,
+    deal_gate_accounts_router,
+    deal_gate_callback,
+)
 from handlers.error_handler import global_error_handler
 from handlers.access_gate import (
     bot_disabled_gate,
@@ -597,10 +602,11 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_my_offers_page_callback, pattern=r"^my_off\|p\|\d+$"))
     application.add_handler(CallbackQueryHandler(handle_services_menu_callback, pattern="^svc_"))
 
-    # دکمه‌های انصراف و بازگشت
+    # دکمه‌های انصراف و بازگشت به منوی اصلی (نه «بازگشت» تنها — در فلو tx گیج‌کننده است)
     application.add_handler(MessageHandler(
         filters.Regex(
-            "^(?:❌ بازگشت|بازگشت ❌|❌ بازگشت به منوی اصلی|بازگشت به منوی اصلی ❌|❌ انصراف|انصراف ❌|انصراف|بازگشت|بازگشت به منوی اصلی|🏠 بازگشت به منو اصلی)$"
+            "^(?:❌ بازگشت|بازگشت ❌|❌ بازگشت به منوی اصلی|بازگشت به منوی اصلی ❌|❌ انصراف|انصراف ❌|انصراف|"
+            r"بازگشت به منوی اصلی|🏠 بازگشت به منو اصلی)$"
         ),
         handle_cancel
     ))
@@ -610,10 +616,26 @@ def main():
     _private_text = filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND
     _iran_fill_text = filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND
     _iran_txn = filters.ChatType.PRIVATE & ~filters.COMMAND
+    application.add_handler(MessageHandler(_iran_fill_text, iran_panel_fill_router), group=0)
     application.add_handler(MessageHandler(_private_text, wizard_text_router), group=0)
     application.add_handler(MessageHandler(_private_text, deal_gate_accounts_router), group=0)
+    _iran_receipt_media = (
+        filters.ChatType.PRIVATE
+        & (filters.PHOTO | filters.Document.IMAGE)
+        & ~filters.COMMAND
+    )
+    application.add_handler(
+        MessageHandler(_iran_receipt_media, iran_panel_sync_router),
+        group=0,
+    )
+    application.add_handler(
+        MessageHandler(
+            _iran_receipt_media,
+            deal_gate_accounts_photo_router,
+        ),
+        group=0,
+    )
     application.add_handler(MessageHandler(_private_text, euro_flow_router), group=0)
-    application.add_handler(MessageHandler(_iran_fill_text, iran_panel_fill_router), group=0)
     application.add_handler(MessageHandler(_iran_txn, iran_panel_sync_router), group=0)
     # Admin panel: run in later group to avoid hijacking normal flows
     application.add_handler(CallbackQueryHandler(iran_panel_tx_callback, pattern=r"^tx\|"))
@@ -636,6 +658,7 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_confirm_exchange, pattern="^confirm_exchange$"))
     application.add_handler(CallbackQueryHandler(handle_service_operation_callback, pattern="^service_op_"))
     application.add_handler(CallbackQueryHandler(handle_inline_cancel_callback, pattern="^inline_cancel$"))
+    application.add_handler(CallbackQueryHandler(deal_admin_payment_callback, pattern=r"^adm\|pay\|"))
     application.add_handler(CallbackQueryHandler(admin_dashboard_callback, pattern=r"^adm\|"))
     application.add_handler(CallbackQueryHandler(bank_cards_callback, pattern=r"^cards\|"))
     application.add_handler(

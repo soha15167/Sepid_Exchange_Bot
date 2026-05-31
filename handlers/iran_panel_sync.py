@@ -30,6 +30,7 @@ from utils.iran_digits import (
     normalize_digits,
 )
 from utils.iran_panel_client import post_transaction
+from utils.receipt_amount import normalize_transfer_amount, parse_rial_amount_text
 from utils.receipt_ocr import (
     amount_candidates_from_text,
     ocr_best_amount_from_image,
@@ -48,7 +49,8 @@ from utils.telegram_utils import send_or_replace_main_menu
 
 _RTL = "\u200f"
 _TX_CANCEL_TEXT = re.compile(
-    r"^(?:❌\s*)?(?:انصراف|لغو|بازگشت(?:\s*به\s*منوی?\s*اصلی)?|"
+    r"^(?:❌\s*)?(?:انصراف|لغو|"
+    r"بازگشت\s*به\s*منوی?\s*اصلی|"
     r"🏠\s*بازگشت(?:\s*به\s*منو(?:ی?\s*اصلی)?)?)$",
     re.IGNORECASE,
 )
@@ -193,37 +195,60 @@ def _collapse_spaced_thousands(text: str) -> str:
     return s
 
 
-def _fix_amount_missing_zero(value: int) -> int:
-    """OCR گاهی یک صفر از مبلغ ۸ رقمی حذف می‌کند (۱۳۷۷۵۰۰۰ → ۱۳۷۷۵۰۰۰۰)."""
-    v = int(value or 0)
-    if v < 1_000_000:
-        return v
-    s = str(v)
-    if len(s) == 8 and v % 1000 == 0:
-        v10 = v * 10
-        if _is_valid_receipt_transfer_amount(v10) and len(str(v10)) == 9:
-            return v10
-    return v
-
-
-def _fix_amount_extra_zero(value: int) -> int:
-    """Vision گاهی یک صفر اضافه می‌گذارد (۱۳۷۷۵۰۰۰۰ → ۱۳۷۷۵۰۰۰۰۰)."""
-    v = int(value or 0)
-    if v < 10_000_000:
-        return v
-    s = str(v)
-    if len(s) == 10 and v % 10_000 == 0:
-        v9 = v // 10
-        if len(str(v9)) == 9 and _is_valid_receipt_transfer_amount(v9):
-            return v9
-    return v
-
-
 def _normalize_receipt_amount(value: int) -> int:
-    v = _fix_amount_extra_zero(_fix_amount_missing_zero(int(value or 0)))
-    if v >= _MIN_RECEIPT_RIAL and _is_valid_receipt_transfer_amount(v):
-        return v
-    return 0
+    return normalize_transfer_amount(int(value or 0))
+
+
+def _amount_from_mablagh_line(raw: str) -> int:
+    """مبلغ دقیق از خط «مبلغ … ریال» — ارقام فارسی/ویرگول فارسی."""
+    t = _normalize_receipt_text(raw or "")
+    best = 0
+    for line in t.splitlines():
+        if not _MABLAGH_LINE.search(line):
+            continue
+        if re.search(r"حساب|شبا|پیگیری|IR", line, re.I):
+            continue
+        m = re.search(
+            rf"([\d{''.join(_THOUSAND_SEPS)}\s]{{4,24}})\s*ریال",
+            line,
+            re.I,
+        )
+        if m:
+            chunk = m.group(1)
+            v = _normalize_receipt_amount(_parse_amount_rial(chunk))
+            if v > best:
+                best = v
+        blob = re.sub(r"[^\d]", "", line)
+        for width in (8, 9, 10):
+            for i in range(max(0, len(blob) - width + 1)):
+                try:
+                    v = int(blob[i : i + width])
+                except ValueError:
+                    continue
+                v = _normalize_receipt_amount(v)
+                if v > best:
+                    best = v
+    return best
+
+
+def _reconcile_receipt_amount(payload: dict, raw: str) -> dict:
+    """اولویت با خط «مبلغ»؛ اصلاح ۱۰× بودن."""
+    out = dict(payload)
+    line_amt = _amount_from_mablagh_line(raw)
+    try:
+        cur = int(out.get("iran_amount") or 0)
+    except (TypeError, ValueError):
+        cur = 0
+    if line_amt >= _MIN_RECEIPT_RIAL:
+        if cur in (line_amt * 10, line_amt * 100) or not cur:
+            out["iran_amount"] = line_amt
+        elif cur > line_amt * 5 and line_amt >= 5_000_000:
+            out["iran_amount"] = line_amt
+    elif cur >= _MIN_RECEIPT_RIAL:
+        fixed = _normalize_receipt_amount(cur)
+        if fixed:
+            out["iran_amount"] = fixed
+    return out
 
 
 def _maybe_fix_ocr_billion_typo(value: int, token: str = "") -> int:
@@ -269,9 +294,7 @@ def _guess_today_jdate() -> str:
 
 
 def _parse_amount_rial(text: str) -> int:
-    s = _normalize_receipt_text(text or "")
-    s = s.replace(",", "").replace(" ", "")
-    return int(s) if s.isdigit() else 0
+    return parse_rial_amount_text(text)
 
 
 def _parse_fee_tax(text: str) -> int:
@@ -322,6 +345,93 @@ _SHEBA_BANK_NAMES: dict[str, str] = {
     "080": "مشترک ایران-ونزوئلا",
 }
 
+# پیش‌شمارهٔ کارت (۶ رقم) → نام کوتاه بانک
+_CARD_BIN_TO_BANK: dict[str, str] = {
+    "603799": "ملی",
+    "621986": "سامان",
+    "610433": "ملت",
+    "589463": "رفاه",
+    "627353": "تجارت",
+    "585983": "تجارت",
+    "502229": "پاسارگاد",
+    "636214": "آینده",
+    "606373": "مهر",
+    "622106": "پارسیان",
+    "603769": "صادرات",
+    "627412": "اقتصاد نوین",
+    "639607": "سرمایه",
+    "627488": "کارآفرین",
+    "639346": "سینا",
+    "504172": "رسالت",
+    "505416": "گردشگری",
+    "585947": "خاورمیانه",
+    "628023": "مسکن",
+    "639599": "قوامین",
+}
+
+
+def _bank_from_card_number(card: str) -> str:
+    digits = _digits_only(card)
+    if len(digits) < 6:
+        return ""
+    return _CARD_BIN_TO_BANK.get(digits[:6], "")
+
+
+def _extract_labeled_card(raw: str, label_patterns: list[str]) -> str:
+    t = _normalize_receipt_text(raw or "")
+    for pat in label_patterns:
+        m = re.search(
+            rf"{pat}\s*[:：]?\s*([\d\sXx*]{{8,24}})",
+            t,
+            re.I,
+        )
+        if m:
+            chunk = m.group(1)
+            digits = _digits_only(chunk.replace("X", "").replace("x", "").replace("*", ""))
+            if len(digits) >= 8:
+                return digits
+    return ""
+
+
+def _guess_banks_from_cards(raw: str) -> tuple[str, str]:
+    """بانک مبدأ/مقصد از خطوط «از کارت» / «به کارت» (لوگو یا متن)."""
+    to_card = _extract_labeled_card(
+        raw,
+        [r"به\s*کارت", r"کارت\s*مقصد", r"مقصد\s*کارت"],
+    )
+    from_card = _extract_labeled_card(
+        raw,
+        [r"از\s*کارت", r"کارت\s*مبدا", r"مبدا\s*کارت", r"کارت\s*مبدأ"],
+    )
+    src = _bank_from_card_number(from_card) if from_card else ""
+    dest = _bank_from_card_number(to_card) if to_card else ""
+    return src, dest
+
+
+def _normalize_bank_input(val: str) -> str:
+    v = (val or "").strip()
+    if not v or v == "-":
+        return ""
+    v = v.replace("بانک", "").strip()
+    aliases = {
+        "melli": "ملی",
+        "meli": "ملی",
+        "ملی": "ملی",
+        "saman": "سامان",
+        "سامان": "سامان",
+        "mellat": "ملت",
+        "ملت": "ملت",
+        "blu": "بلو",
+        "بلو": "بلو",
+        "baam": "ملی",
+        "bmi": "ملی",
+    }
+    low = v.lower()
+    for key, name in aliases.items():
+        if key in low or v == name:
+            return name
+    return v
+
 
 def _is_plausible_rial_amount(value: int) -> bool:
     return _MIN_RIAL_AMOUNT <= int(value) <= _MAX_RIAL_AMOUNT
@@ -329,7 +439,7 @@ def _is_plausible_rial_amount(value: int) -> bool:
 
 def _is_valid_receipt_transfer_amount(value: int, token: str = "") -> bool:
     """
-    حوالهٔ معمول میلیارد ریال است؛ OCR گاهی 1,199,000 به‌جای 1,999,000,000 می‌دهد.
+    مبلغ معتبر حواله/کارت‌به‌کارت — از چند میلیون تا چند میلیارد ریال.
     """
     v = int(value)
     if not _is_plausible_rial_amount(v):
@@ -338,16 +448,13 @@ def _is_valid_receipt_transfer_amount(value: int, token: str = "") -> bool:
         return False
     groups = _comma_groups(token)
     digits = len(str(v))
-    # مبلغ حواله تقریباً همیشه مضرب ۱۰۰۰ است؛ 70908705013 از رقم‌های شماره/شبا نیست
     if v % 1000 != 0:
         return False
     if groups >= 2:
         return True
     if digits >= 11:
         return False
-    if digits >= 9 and v >= 100_000_000:
-        return True
-    if v >= 100_000_000:
+    if digits >= 7 and v >= 5_000_000:
         return True
     return False
 
@@ -528,7 +635,7 @@ def _extract_compact_rial_near_rial(t: str, raw: str, scored: list[tuple[int, in
         for m in re.finditer(r"(?<!\d)(\d{9,11})(?!\d)", line):
             token = m.group(1)
             v = int(token)
-            if v < 100_000_000:
+            if v < 5_000_000:
                 continue
             if not re.search(r"ریال|مبلغ", line, re.I):
                 continue
@@ -572,8 +679,9 @@ def _merge_payload(base: dict, extra: dict) -> dict:
         if v is None:
             continue
         if k == "iran_amount":
-            if int(v or 0) >= _MIN_RECEIPT_RIAL:
-                out[k] = int(v)
+            nv = _normalize_receipt_amount(int(v or 0))
+            if nv >= _MIN_RECEIPT_RIAL:
+                out[k] = nv
             continue
         if isinstance(v, str):
             if v.strip():
@@ -619,7 +727,7 @@ def _extract_best_amount(raw: str) -> int:
         return 0
 
     # ترجیح: امتیاز بالا + در صورت تساوی، عدد با ویرگول معتبر (نه شماره حساب)
-    scored.sort(key=lambda x: (x[1], x[0]), reverse=True)
+    scored.sort(key=lambda x: (x[1], -x[0]), reverse=True)
     best_val, best_sc = scored[0]
     if best_sc < 50:
         return 0
@@ -632,7 +740,7 @@ def _extract_best_amount(raw: str) -> int:
                 break
     if not _is_valid_receipt_transfer_amount(best_val):
         return 0
-    return best_val
+    return _normalize_receipt_amount(best_val)
 
 
 def _fmt_rial_display(value) -> str:
@@ -735,10 +843,15 @@ def _extract_jdate_from_persian_words(raw: str) -> str:
 
 def _guess_bank_from_receipt(raw: str) -> str:
     t = raw or ""
+    if re.search(r"baam\.bmi|bmi\.ir|\bbaam\b", t, re.I):
+        return "ملی"
+    if re.search(r"بانک\s*ملی", t, re.I):
+        return "ملی"
+    src, _ = _guess_banks_from_cards(t)
+    if src:
+        return src
     if re.search(r"بلو|\bblu\b", t, re.I):
         return "بلو"
-    if re.search(r"بانک\s*ملی|bmi\.ir|baam", t, re.I):
-        return "ملی"
     if re.search(r"سامان", t, re.I):
         return "سامان"
     if re.search(r"صادرات", t, re.I):
@@ -750,10 +863,13 @@ def _guess_bank_from_receipt(raw: str) -> str:
 
 def _guess_dest_bank_from_receipt(raw: str) -> str:
     t = raw or ""
+    _, dest_card = _guess_banks_from_cards(t)
+    if dest_card:
+        return dest_card
     m = re.search(r"بلو\s*به\s*(\S+)", t, re.I)
     if m:
         dest = m.group(1).strip()
-        if dest and len(dest) < 30:
+        if dest and len(dest) < 30 and dest not in ("کارت", "card", "Card"):
             return dest
     m = re.search(
         r"بانک\s*مقصد\s*[:：]?\s*(\S+(?:\s+\S+)?)",
@@ -776,17 +892,19 @@ def _guess_dest_bank_from_receipt(raw: str) -> str:
 
 def _guess_transfer_type_from_receipt(raw: str) -> str:
     t = raw or ""
+    if re.search(r"کارت\s*به\s*کارت|کارتبهکارت", t, re.I):
+        return "کارت به کارت"
     m = re.search(r"بلو\s*به\s*(\S+)", t, re.I)
     if m:
-        return f"بلو به {m.group(1).strip()}"
+        dest = m.group(1).strip()
+        if dest and dest not in ("کارت", "card"):
+            return f"بلو به {dest}"
     if re.search(r"پایا|بین\s*بانک", t, re.I):
         return "بین بانکی (پایا)"
     if re.search(r"\bپل\b|پل\s*پایا", t, re.I):
         return "پل"
     if re.search(r"ساتنا", t, re.I):
         return "ساتنا"
-    if re.search(r"کارت\s*به\s*کارت|کارتبهکارت", t, re.I):
-        return "کارت به کارت"
     return ""
 
 
@@ -994,11 +1112,13 @@ def _payload_from_vision(vision: dict, mode: str) -> dict:
         ttype_raw = _coerce_vision_str(vision.get("transfer_type"))
         if not dest and ttype_raw:
             m = re.search(r"بلو\s*به\s*(\S+)", ttype_raw, re.I)
-            if m:
+            if m and m.group(1).strip() not in ("کارت", "card"):
                 dest = m.group(1).strip()
-        if dest:
+        if dest and dest not in ("کارت", "card"):
             payload["dest_bank"] = dest
-        if not bank and re.search(r"بلو", ttype_raw, re.I):
+        if not bank and re.search(r"بلو", ttype_raw, re.I) and not re.search(
+            r"به\s*کارت", ttype_raw, re.I
+        ):
             payload["bank_name"] = "بلو"
 
     recipient = _coerce_vision_str(vision.get("recipient_name"))
@@ -1025,8 +1145,13 @@ def _payload_from_vision(vision: dict, mode: str) -> dict:
 
 
 def _enrich_payload_from_ocr_text(payload: dict, raw: str, mode: str) -> dict:
-    """مبلغ/تاریخ/نام از OCR — وقتی layout فیش فرق می‌کند یا vision ناقص است."""
+    """مبلغ/تاریخ/نام/بانک از OCR — وقتی layout فیش فرق می‌کند یا vision ناقص است."""
     out = dict(payload)
+    cur = int(out.get("iran_amount") or 0)
+    if cur >= _MIN_RECEIPT_RIAL:
+        fixed = _normalize_receipt_amount(cur)
+        if fixed:
+            out["iran_amount"] = fixed
     if not (raw or "").strip():
         return out
     if int(out.get("iran_amount") or 0) < _MIN_RECEIPT_RIAL:
@@ -1036,13 +1161,27 @@ def _enrich_payload_from_ocr_text(payload: dict, raw: str, mode: str) -> dict:
     jd = _extract_jdate_from_persian_words(raw) or _extract_jdate(raw)
     if jd:
         out["jdate"] = jd
+    ocr_bank = _guess_bank_from_receipt(raw)
+    ocr_dest = _guess_dest_bank_from_receipt(raw) if mode == "out" else ""
+    cur_bank = (out.get("bank_name") or "").strip()
+    if ocr_bank and (not cur_bank or (cur_bank == "بلو" and ocr_bank != "بلو")):
+        out["bank_name"] = ocr_bank
     if mode == "out":
+        cur_dest = (out.get("dest_bank") or "").strip()
+        if ocr_dest and (not cur_dest or cur_dest in ("کارت", "card")):
+            out["dest_bank"] = ocr_dest
         holder = _extract_top_account_holder_name(raw) or _extract_recipient_name_from_receipt(
             raw
         )
         if holder:
             out["depositor_name"] = holder
-    return out
+        if re.search(r"کارت\s*به\s*کارت", raw, re.I):
+            out["transfer_type"] = "کارت به کارت"
+        elif not (out.get("transfer_type") or "").strip():
+            guessed = _guess_transfer_type_from_receipt(raw)
+            if guessed:
+                out["transfer_type"] = guessed
+    return _reconcile_receipt_amount(out, raw)
 
 
 def _salvage_amount_on_payload(payload: dict, path: str) -> dict:
@@ -1153,6 +1292,8 @@ async def _read_receipt_image(path: str, mode: str) -> tuple[dict | None, str, s
             payload = _payload_from_vision(vision, mode)
             if (txt or "").strip():
                 payload = _enrich_payload_from_ocr_text(payload, txt, mode)
+            else:
+                payload = _reconcile_receipt_amount(payload, "")
             logger.info("iran_panel: read source=vision (fast path)")
             return payload, (txt or "").strip(), "vision"
         vision_partial = vision
@@ -1174,12 +1315,13 @@ async def _read_receipt_image(path: str, mode: str) -> tuple[dict | None, str, s
 
     if vision and not vision_partial:
         if _vision_amount_ok(vision):
-            return _payload_from_vision(vision, mode), "", "vision"
+            return _reconcile_receipt_amount(_payload_from_vision(vision, mode), ""), "", "vision"
         vision_partial = vision
 
     raw = (txt or "").strip()
     if baam_amt >= _MIN_RECEIPT_RIAL and not text_has_parseable_amount(raw):
-        raw = f"مبلغ\n{baam_amt:,} ریال\n{raw}".strip()
+        norm_baam = _normalize_receipt_amount(baam_amt) or baam_amt
+        raw = f"مبلغ\n{norm_baam:,} ریال\n{raw}".strip()
 
     if not ok_ocr and not raw:
         if vision_partial:
@@ -1191,7 +1333,7 @@ async def _read_receipt_image(path: str, mode: str) -> tuple[dict | None, str, s
                 payload, _ = _parse_payload_in(raw)
             else:
                 payload, _ = _parse_payload_out(raw)
-            payload["iran_amount"] = baam_amt
+            payload["iran_amount"] = _normalize_receipt_amount(baam_amt) or baam_amt
             logger.info("iran_panel: salvage amount from baam band=%s", baam_amt)
             return payload, raw, "ocr_baam"
         if mode == "in":
@@ -1211,7 +1353,7 @@ async def _read_receipt_image(path: str, mode: str) -> tuple[dict | None, str, s
 
     if int(payload.get("iran_amount") or 0) < _MIN_RECEIPT_RIAL:
         if baam_amt >= _MIN_RECEIPT_RIAL:
-            payload["iran_amount"] = baam_amt
+            payload["iran_amount"] = _normalize_receipt_amount(baam_amt) or baam_amt
             logger.info("iran_panel: amount from baam pass=%s", baam_amt)
         else:
             try:
@@ -1224,7 +1366,7 @@ async def _read_receipt_image(path: str, mode: str) -> tuple[dict | None, str, s
             if img_amt >= _MIN_RECEIPT_RIAL and _is_valid_receipt_transfer_amount(
                 img_amt, f"{img_amt:,}"
             ):
-                payload["iran_amount"] = img_amt
+                payload["iran_amount"] = _normalize_receipt_amount(img_amt) or img_amt
                 logger.info("iran_panel: amount from image band=%s", img_amt)
 
     if vision_partial:
@@ -1665,22 +1807,34 @@ async def iran_panel_sync_router(update: Update, context: ContextTypes.DEFAULT_T
     uid = update.effective_user.id
     if not _is_admin(uid):
         return
-    from handlers.admin import _admin_should_skip_wizard_recovery
-
-    if _admin_should_skip_wizard_recovery(context):
-        return
-    if (context.user_data.get(_AWAIT_FIELD_KEY) or "").strip():
-        return
-    mode = context.user_data.get(_KEY)
     m = update.message
     if not m:
+        return
+
+    has_media = bool(m.photo or m.document)
+    mode = context.user_data.get(_KEY) or (
+        context.user_data.get(_DRAFT_MODE_KEY) if has_media else None
+    )
+
+    from handlers.admin import _admin_should_skip_wizard_recovery
+
+    iran_tx_active = is_iran_tx_flow_active(context) or mode in ("in", "out")
+    if _admin_should_skip_wizard_recovery(context) and not (has_media and iran_tx_active):
+        return
+
+    if (context.user_data.get(_AWAIT_FIELD_KEY) or "").strip():
+        if has_media:
+            await m.reply_text(
+                f"{_RTL}ℹ️ در حال ویرایش یک فیلد هستید.\n"
+                f"{_RTL}متن بفرستید یا «◀️ بازگشت به پیش‌نویس» را بزنید."
+            )
+            raise ApplicationHandlerStop
         return
 
     if m.text and _is_tx_cancel_message(m.text):
         if await abort_iran_tx_flow_if_active(update, context):
             raise ApplicationHandlerStop
 
-    has_media = bool(m.photo or m.document)
     if mode in ("in", "out") or has_media:
         logger.info(
             "iran_panel: uid=%s mode=%s photo=%s doc=%s",
@@ -1691,6 +1845,12 @@ async def iran_panel_sync_router(update: Update, context: ContextTypes.DEFAULT_T
         )
 
     if mode not in ("in", "out"):
+        if has_media:
+            await m.reply_text(
+                f"{_RTL}ℹ️ برای ثبت فیش ابتدا <code>/txin</code> یا <code>/txout</code> بزنید.",
+                parse_mode=ParseMode.HTML,
+            )
+            raise ApplicationHandlerStop
         return
 
     if m.text and (m.text or "").strip().startswith("/"):
@@ -1905,6 +2065,10 @@ async def iran_panel_tx_callback(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data[_AWAIT_FIELD_KEY] = ""
         await _delete_tx_prompt(context, context.bot, chat_id)
         await _show_draft(context.bot, chat_id, context, mode, payload)
+        try:
+            await q.answer("بازگشت به پیش‌نویس")
+        except Exception:
+            pass
         raise ApplicationHandlerStop
 
     if action.startswith("ef|"):
@@ -1949,6 +2113,9 @@ async def iran_panel_fill_router(update: Update, context: ContextTypes.DEFAULT_T
     """
     if not update.effective_user or not update.message:
         return
+    field = (context.user_data.get(_AWAIT_FIELD_KEY) or "").strip()
+    if not field:
+        return
     from utils.flow_guards import user_ad_flow_active
 
     if user_ad_flow_active(context):
@@ -1958,9 +2125,6 @@ async def iran_panel_fill_router(update: Update, context: ContextTypes.DEFAULT_T
     if update.message and _is_tx_cancel_message(update.message.text or ""):
         if await abort_iran_tx_flow_if_active(update, context):
             raise ApplicationHandlerStop
-    field = (context.user_data.get(_AWAIT_FIELD_KEY) or "").strip()
-    if not field:
-        return
     mode = context.user_data.get(_DRAFT_MODE_KEY)
     payload = context.user_data.get(_DRAFT_KEY)
     if mode not in ("in", "out") or not isinstance(payload, dict):
@@ -1972,6 +2136,7 @@ async def iran_panel_fill_router(update: Update, context: ContextTypes.DEFAULT_T
 
     if field == "iran_amount":
         amt = _parse_amount_rial(val) or _extract_best_amount(val)
+        amt = _normalize_receipt_amount(amt)
         if amt < _MIN_RECEIPT_RIAL:
             await update.message.reply_text(
                 f"{_RTL}❌ مبلغ نامعتبر است. مبلغ حواله را به <b>ریال</b> بفرستید "
@@ -1988,11 +2153,11 @@ async def iran_panel_fill_router(update: Update, context: ContextTypes.DEFAULT_T
             raise ApplicationHandlerStop
         payload["jdate"] = jd
     elif field == "bank_name":
-        payload["bank_name"] = val
+        payload["bank_name"] = _normalize_bank_input(val)
     elif field == "depositor_name":
         payload["depositor_name"] = val
     elif field == "dest_bank":
-        payload["dest_bank"] = val
+        payload["dest_bank"] = _normalize_bank_input(val)
     elif field == "transfer_type":
         payload["transfer_type"] = val
     elif field == "description":

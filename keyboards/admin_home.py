@@ -36,6 +36,7 @@ def admin_home_inline_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🔎 جستجوی آگهی", callback_data="adm|sad"),
             ],
             [InlineKeyboardButton("🗣️ مذاکرات آگهی", callback_data="adm|negv")],
+            [InlineKeyboardButton("📊 وضعیت معاملات", callback_data="adm|dgs")],
             [InlineKeyboardButton("🔒 محدودیت دسترسی کاربر", callback_data="adm|rx")],
             [
                 InlineKeyboardButton("⛔️ غیرفعال کردن ربات", callback_data="adm|bot0"),

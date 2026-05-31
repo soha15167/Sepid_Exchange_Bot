@@ -62,22 +62,24 @@ def _vision_prompt(mode: str) -> str:
         name_fields = """
   "depositor_name": "depositor / واریزکننده name","""
 
-    return f"""You read Iranian bank app receipt screenshots (Baam, Blu, dark/light UI).
+    return f"""You read Iranian bank app receipt screenshots (Baam/BMI, Blu, Saman logos, dark/light UI).
 Transaction: {kind_en}.
 
 Return ONLY valid JSON:
 {{
-  "iran_amount": integer Rials, no commas (e.g. 137750000 — exactly 9 digits for that example),
+  "iran_amount": integer Rials, no commas (e.g. 58800000 for «58,800,000 ریال» — do NOT add extra zeros),
   "jdate": "YYYY/MM/DD from «زمان» line; {month_hint}",
-  "bank_name": "source bank (e.g. بلو)",
-  "dest_bank": "destination bank or null",{name_fields}
-  "transfer_type": "e.g. بلو به سامان",
+  "bank_name": "SOURCE bank from logo/app (Baam/bmi.ir → ملی, Blu app → بلو)",
+  "dest_bank": "DESTINATION bank from card logo or «به کارت» BIN (621986→سامان, 603799→ملی) or null",{name_fields}
+  "transfer_type": "e.g. کارت به کارت for Baam card transfer",
   "description": null
 }}
 
 Rules:
-- iran_amount: large «مبلغ انتقال» / «ریال» line only — NOT شماره سند.
-- Do NOT add an extra trailing zero (137750000 is correct, NOT 1377500000).
+- iran_amount: «مبلغ» / «ریال» line ONLY — NOT tracking number.
+- Do NOT add trailing zero (58800000 not 588000000).
+- Baam (baam.bmi.ir) receipts: bank_name=ملی, transfer_type=کارت به کارت; dest from «به کارت» logo/BIN.
+- dest_bank must be bank name (سامان، ملت…) — never the word «کارت» alone.
 - jdate: month from Persian month NAME (خرداد → 03), not the day number.
 - For txout: recipient_name is the prominent top name; sender is انتقال دهنده only.
 - Use null if unsure."""
@@ -85,22 +87,52 @@ Rules:
 
 _AMOUNT_JDATE_RETRY_PROMPT = """Iranian bank transfer receipt (any bank app, any layout).
 Return ONLY JSON:
-{"iran_amount": integer Rials from the LARGEST amount next to «ریال» (all digits, e.g. 570000000),
+{"iran_amount": integer Rials from «مبلغ … ریال» ONLY (Persian digits OK; e.g. 58800000 for «۵۸,۸۰۰,۰۰۰ ریال» — do NOT add extra zero),
  "jdate": "YYYY/MM/DD from «زمان» (خرداد=03, شهریور=06 — use month NAME not day)"}
 If unreadable use null."""
 
 
 def _vision_parsed_amount_ok(parsed: dict) -> bool:
     try:
+        from utils.receipt_amount import normalize_transfer_amount, parse_rial_amount_text
+
         v = parsed.get("iran_amount")
         if v is None:
             return False
         if isinstance(v, str):
-            digits = re.sub(r"\D", "", v)
-            v = int(digits) if digits else 0
-        return int(v) >= 1_000_000
+            n = parse_rial_amount_text(v)
+        else:
+            n = normalize_transfer_amount(int(v))
+        return n >= 1_000_000
     except (TypeError, ValueError):
         return False
+
+
+def _normalize_vision_parsed(parsed: dict | None) -> dict | None:
+    if not parsed:
+        return parsed
+    from utils.receipt_amount import normalize_transfer_amount, parse_rial_amount_text
+    from utils.iran_digits import normalize_digits
+
+    raw = parsed.get("iran_amount")
+    if raw is None:
+        return parsed
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s.lower() in ("", "null", "none", "-"):
+            parsed.pop("iran_amount", None)
+            return parsed
+        n = parse_rial_amount_text(s)
+        if not n:
+            digits = re.sub(r"\D", "", normalize_digits(s))
+            n = normalize_transfer_amount(int(digits)) if digits else 0
+    else:
+        n = normalize_transfer_amount(int(raw))
+    if n >= 1_000_000:
+        parsed["iran_amount"] = n
+    else:
+        parsed.pop("iran_amount", None)
+    return parsed
 
 
 def _parse_json_object(text: str) -> dict | None:
@@ -337,6 +369,7 @@ async def extract_receipt_with_vision(
                         parsed.get("iran_amount"),
                         parsed.get("jdate"),
                     )
+        parsed = _normalize_vision_parsed(parsed)
         if parsed:
             logger.info(
                 "receipt_vision: ok amount=%s jdate=%s",

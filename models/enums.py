@@ -95,6 +95,7 @@ class UserState(Enum):
     ADMIN_SEARCH_USER = auto()
     ADMIN_SEARCH_ADVERT = auto()
     ADMIN_NEG_VIEW_ADVERT = auto()
+    ADMIN_DEAL_GATE_ACCOUNT = auto()
     ADMIN_EXCH_EDIT_FLOW = auto()
     ADMIN_MANAGE_OFFER_ADVERT = auto()
     ADMIN_MANAGE_OFFER_SEQ = auto()

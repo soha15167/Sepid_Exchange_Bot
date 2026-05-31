@@ -12,8 +12,10 @@ import re
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
+from utils.telegram_utils import is_message_not_modified_error
 from config.settings import ADVERT_CHANNEL_ID, LIST_RECENT_LIMIT
 from database.db import (
     count_euro_adverts_owned_by_user,
@@ -184,7 +186,9 @@ async def handle_main_my_adverts_callback(
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
-        except Exception:
+        except BadRequest as exc:
+            if is_message_not_modified_error(exc):
+                return
             try:
                 await q.message.delete()
             except Exception:
@@ -204,7 +208,9 @@ async def handle_main_my_adverts_callback(
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
-    except Exception:
+    except BadRequest as exc:
+        if is_message_not_modified_error(exc):
+            return
         await _send_my_adverts_list(context.bot, q.message.chat_id, uid, page=page)
 
 

@@ -60,6 +60,7 @@ from database.db import (
     list_users_page,
     count_euro_adverts,
     list_euro_adverts_page,
+    deal_gate_get,
 )
 from state import user_data_store
 from keyboards.admin_home import admin_home_inline_keyboard
@@ -1931,6 +1932,7 @@ _ADMIN_WIZARD_STATE_NAMES = frozenset(
         UserState.ADMIN_SEARCH_USER.name,
         UserState.ADMIN_SEARCH_ADVERT.name,
         UserState.ADMIN_NEG_VIEW_ADVERT.name,
+        UserState.ADMIN_DEAL_GATE_ACCOUNT.name,
         UserState.ADMIN_EDIT_ADVERT_ID.name,
         UserState.ADMIN_EDIT_ADVERT_FIELD.name,
         UserState.ADMIN_EDIT_ADVERT_VALUE.name,
@@ -1997,6 +1999,7 @@ _ADMIN_PENDING_LEGACY = {
     "search_user": UserState.ADMIN_SEARCH_USER.name,
     "search_advert": UserState.ADMIN_SEARCH_ADVERT.name,
     "neg_view_advert": UserState.ADMIN_NEG_VIEW_ADVERT.name,
+    "deal_gate_account": UserState.ADMIN_DEAL_GATE_ACCOUNT.name,
     # دیتابیس/نسخهٔ قدیمی enum روی سرور
     "ADMIN_RESTRICT_LEVEL": _ADMIN_RESTRICT_DAYS_STATE_NAME,
 }
@@ -2080,26 +2083,32 @@ def _persist_admin_wizard_state(user_id: int, context: ContextTypes.DEFAULT_TYPE
 
 
 async def _try_restore_admin_dashboard(context: ContextTypes.DEFAULT_TYPE, bot) -> None:
+    from utils.telegram_utils import is_message_not_modified_error, safe_edit_message_text
+
     cid = context.user_data.get("adm_dash_cid")
     mid = context.user_data.get("adm_dash_mid")
     if cid is None or mid is None:
         return
     kb = admin_home_inline_keyboard()
     try:
-        await bot.edit_message_text(
+        await safe_edit_message_text(
+            bot,
             chat_id=int(cid),
             message_id=int(mid),
             text=_admin_welcome_text(),
-            parse_mode=ParseMode.HTML,
             reply_markup=kb,
+            parse_mode=ParseMode.HTML,
         )
-    except Exception:
+    except BadRequest:
         try:
             await bot.edit_message_reply_markup(
                 chat_id=int(cid),
                 message_id=int(mid),
                 reply_markup=kb,
             )
+        except BadRequest as exc:
+            if not is_message_not_modified_error(exc):
+                pass
         except Exception:
             pass
 
@@ -2114,11 +2123,10 @@ async def _admin_edit_dashboard(
 ) -> bool:
     import re
 
+    from utils.telegram_utils import is_message_not_modified_error, safe_edit_message_text
+
     def _strip_html(s: str) -> str:
-        # Telegram HTML parse errors often happen when we truncate mid-tag.
-        # Fallback to plain text by stripping tags.
         s2 = re.sub(r"<[^>]+>", "", s)
-        # Collapse excessive whitespace a bit.
         s2 = re.sub(r"\n{3,}", "\n\n", s2)
         return s2
 
@@ -2126,59 +2134,63 @@ async def _admin_edit_dashboard(
     mid = context.user_data.get("adm_dash_mid")
     if cid is None or mid is None:
         return False
+
+    rm = reply_markup if reply_markup is not None else admin_panel_back_keyboard()
+    chat_id = int(cid)
+    message_id = int(mid)
+    txt = text
+    pm = parse_mode
+
     try:
-        kw: dict = {
-            "chat_id": int(cid),
-            "message_id": int(mid),
-            "text": text[:_ADMIN_EDIT_MAX],
-            "reply_markup": reply_markup if reply_markup is not None else admin_panel_back_keyboard(),
-        }
-        if parse_mode:
-            kw["parse_mode"] = parse_mode
-        await bot.edit_message_text(**kw)
-        return True
+        return await safe_edit_message_text(
+            bot,
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text[:_ADMIN_EDIT_MAX],
+            reply_markup=rm,
+            parse_mode=parse_mode,
+        )
     except BadRequest as exc:
+        err = str(exc).lower()
         logger.warning("admin dashboard edit failed: %s", exc)
-        rm = reply_markup
-        if "button_user_invalid" in str(exc).lower():
+        if "button_user_invalid" in err:
             rm = admin_panel_back_keyboard()
-        # If HTML entities can't be parsed (often due to truncation),
-        # retry sending as plain text to avoid crashing the admin UI.
-        pm = parse_mode
-        txt = text
-        if "can't parse entities" in str(exc).lower():
+        if "can't parse entities" in err and parse_mode:
             pm = None
             txt = _strip_html(text)
         try:
-            sent = await bot.send_message(
-                chat_id=int(cid),
+            return await safe_edit_message_text(
+                bot,
+                chat_id=chat_id,
+                message_id=message_id,
                 text=txt[:4096],
-                reply_markup=rm if rm is not None else admin_panel_back_keyboard(),
+                reply_markup=rm,
                 parse_mode=pm,
             )
-            context.user_data["adm_dash_cid"] = int(cid)
-            context.user_data["adm_dash_mid"] = sent.message_id
-            return True
+        except BadRequest as exc2:
+            if is_message_not_modified_error(exc2):
+                return True
+            logger.warning("admin dashboard plain edit failed: %s", exc2)
         except Exception:
-            logger.exception("admin dashboard send fallback failed")
-            return False
-    except Exception as exc:
-        logger.warning("admin dashboard edit failed: %s", exc)
+            logger.exception("admin dashboard plain edit failed")
+
+    try:
         try:
-            sent = await bot.send_message(
-                chat_id=int(cid),
-                text=text[:4096],
-                reply_markup=reply_markup
-                if reply_markup is not None
-                else admin_panel_back_keyboard(),
-                parse_mode=parse_mode,
-            )
-            context.user_data["adm_dash_cid"] = int(cid)
-            context.user_data["adm_dash_mid"] = sent.message_id
-            return True
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
         except Exception:
-            logger.exception("admin dashboard send fallback failed")
-            return False
+            pass
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            text=txt[:4096],
+            reply_markup=rm,
+            parse_mode=pm,
+        )
+        context.user_data["adm_dash_cid"] = chat_id
+        context.user_data["adm_dash_mid"] = sent.message_id
+        return True
+    except Exception:
+        logger.exception("admin dashboard send fallback failed")
+        return False
 
 
 async def _admin_reply(update: Update, text: str, **kwargs):
@@ -2433,6 +2445,7 @@ async def admin_dashboard_callback(update: Update, context: ContextTypes.DEFAULT
 
     if action == "panel":
         await _admin_cleanup_switch(context, admin_uid, chat_id)
+        context.user_data.pop("admin_deal_gate_browse", None)
         context.user_data["state"] = UserState.ADMIN_MENU.name
         _persist_admin_wizard_state(admin_uid, context)
         await _try_restore_admin_dashboard(context, context.bot)
@@ -2440,6 +2453,7 @@ async def admin_dashboard_callback(update: Update, context: ContextTypes.DEFAULT
 
     if action == "exit":
         await _admin_cleanup_switch(context, admin_uid, chat_id)
+        context.user_data.pop("admin_deal_gate_browse", None)
         await _admin_strip_reply_keyboard(context.bot, chat_id)
         dc = context.user_data.get("adm_dash_cid")
         dm = context.user_data.get("adm_dash_mid")
@@ -2760,6 +2774,81 @@ async def admin_dashboard_callback(update: Update, context: ContextTypes.DEFAULT
         )
         return
 
+    if action == "dgs":
+        from handlers.deal_gate import (
+            admin_show_deal_gate_detail,
+            admin_show_deal_gate_list,
+        )
+
+        if len(parts) > 3 and parts[2] == "resync":
+            try:
+                oid = int(parts[3])
+            except (TypeError, ValueError):
+                await query.answer("شناسه نامعتبر", show_alert=True)
+                return
+            from database.db import deal_gate_get
+            from handlers.deal_gate import sync_deal_admin_notification
+
+            gate = deal_gate_get(oid)
+            if not gate or (gate.get("gate_status") or "").strip().lower() != "completed":
+                await query.answer("فقط برای معاملات تکمیل‌شده", show_alert=True)
+                return
+            await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
+            await query.answer("پیام ادمین بروزرسانی شد", show_alert=True)
+            return
+
+        if len(parts) > 3 and parts[2] in ("bacc", "sacc"):
+            try:
+                oid = int(parts[3])
+            except (TypeError, ValueError):
+                await query.answer("شناسه نامعتبر", show_alert=True)
+                return
+            party = "buyer" if parts[2] == "bacc" else "seller"
+            party_fa = "خریدار یورو" if party == "buyer" else "فروشنده یورو"
+            context.user_data["state"] = UserState.ADMIN_DEAL_GATE_ACCOUNT.name
+            context.user_data["admin_deal_acc_offer_id"] = oid
+            context.user_data["admin_deal_acc_party"] = party
+            _persist_admin_wizard_state(admin_uid, context)
+            await _admin_edit_dashboard(
+                context,
+                context.bot,
+                f"{_RTL}✏️ <b>ثبت حساب {party_fa}</b> — offer <code>{oid}</code>\n\n"
+                f"{_RTL}متن کامل حساب را در یک پیام بفرستید "
+                f"(IBAN، شبا، PayPal…):",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "🔙 جزئیات معامله",
+                                callback_data=f"adm|dgs|{oid}",
+                            )
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                "🔙 پنل مدیریت", callback_data="adm|panel"
+                            )
+                        ],
+                    ]
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        context.user_data["state"] = UserState.ADMIN_MENU.name
+        context.user_data.pop("admin_deal_acc_offer_id", None)
+        context.user_data.pop("admin_deal_acc_party", None)
+        _persist_admin_wizard_state(admin_uid, context)
+        if len(parts) > 2:
+            try:
+                oid = int(parts[2])
+            except (TypeError, ValueError):
+                await query.answer("شناسه نامعتبر", show_alert=True)
+                return
+            await admin_show_deal_gate_detail(update, context, oid)
+            return
+        await admin_show_deal_gate_list(update, context)
+        return
+
     if action == "ea":
         context.user_data["state"] = UserState.ADMIN_EDIT_ADVERT_ID.name
         _persist_admin_wizard_state(admin_uid, context)
@@ -2923,6 +3012,7 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔎 جستجوی کاربر",
         "🔎 جستجوی آگهی",
         "🗣️ مذاکرات آگهی",
+        "📊 وضعیت معاملات",
         "➕ ثبت آگهی",
         "✏️ ویرایش آگهی",
         "🗑️ حذف آگهی",
@@ -2942,6 +3032,7 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         UserState.ADMIN_SEARCH_USER.name,
         UserState.ADMIN_SEARCH_ADVERT.name,
         UserState.ADMIN_NEG_VIEW_ADVERT.name,
+        UserState.ADMIN_DEAL_GATE_ACCOUNT.name,
         UserState.ADMIN_EDIT_ADVERT_ID.name,
         UserState.ADMIN_EDIT_ADVERT_FIELD.name,
         UserState.ADMIN_EDIT_ADVERT_VALUE.name,
@@ -2974,6 +3065,15 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         UserState.ADMIN_PROXY_OFFER_RATE.name,
         UserState.ADMIN_PROXY_OFFER_DESC.name,
     }
+    if context.user_data.get("admin_deal_gate_browse") and text.isdigit():
+        from handlers.deal_gate import admin_deal_gate_search_by_number
+
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        await admin_deal_gate_search_by_number(update, context, int(text))
+        return
     if state not in admin_states and text not in admin_actions:
         # Let normal (non-admin) flows handle this message.
         return
@@ -3343,6 +3443,91 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{RLM}📝 <b>توضیحات:</b> {desc or '—'}\n"
             )
             return await _admin_reply(update,msg, parse_mode="HTML", reply_markup=None, context=context, disable_web_page_preview=True)
+
+        if state == UserState.ADMIN_DEAL_GATE_ACCOUNT.name:
+            from handlers.deal_gate import (
+                admin_save_party_account,
+                admin_show_deal_gate_detail,
+            )
+
+            oid = context.user_data.get("admin_deal_acc_offer_id")
+            party = (context.user_data.get("admin_deal_acc_party") or "").strip()
+            if not isinstance(oid, int):
+                try:
+                    oid = int(oid)
+                except (TypeError, ValueError):
+                    oid = None
+            if oid is None or party not in ("buyer", "seller"):
+                context.user_data["state"] = UserState.ADMIN_MENU.name
+                context.user_data.pop("admin_deal_acc_offer_id", None)
+                context.user_data.pop("admin_deal_acc_party", None)
+                _persist_admin_wizard_state(user_id, context)
+                return await _admin_reply(
+                    update,
+                    f"{_RTL}⚠️ مرحلهٔ ثبت حساب منقضی شد — دوباره از «وضعیت معاملات» شروع کنید.",
+                    reply_markup=admin_panel_back_keyboard(),
+                    context=context,
+                )
+            err = await admin_save_party_account(
+                context, int(oid), party, text
+            )
+            if err:
+                return await _admin_reply(
+                    update,
+                    f"{_RTL}❌ {err}",
+                    reply_markup=InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton(
+                                    "🔙 جزئیات معامله",
+                                    callback_data=f"adm|dgs|{int(oid)}",
+                                )
+                            ]
+                        ]
+                    ),
+                    context=context,
+                )
+            context.user_data["state"] = UserState.ADMIN_MENU.name
+            context.user_data.pop("admin_deal_acc_offer_id", None)
+            context.user_data.pop("admin_deal_acc_party", None)
+            _persist_admin_wizard_state(user_id, context)
+            gate = deal_gate_get(int(oid))
+            both = bool(
+                gate
+                and (gate.get("buyer_accounts_text") or "").strip()
+                and (gate.get("seller_accounts_text") or "").strip()
+            )
+            ok_msg = (
+                f"{_RTL}✅ حساب ثبت شد."
+                + (
+                    f"\n{_RTL}هر دو حساب کامل شد — معامله تکمیل شد."
+                    if both
+                    else f"\n{_RTL}پس از ثبت حساب طرف دیگر، معامله تکمیل می‌شود."
+                )
+            )
+            await _admin_reply(
+                update,
+                ok_msg,
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "📊 جزئیات معامله",
+                                callback_data=f"adm|dgs|{int(oid)}",
+                            )
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                "🔙 پنل مدیریت", callback_data="adm|panel"
+                            )
+                        ],
+                    ]
+                ),
+                context=context,
+            )
+            if both:
+                return
+            return await admin_show_deal_gate_detail(update, context, int(oid))
 
         if state == UserState.ADMIN_NEG_VIEW_ADVERT.name:
             advert_id = _parse_int_from_text(text)
@@ -4538,6 +4723,14 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML,
                 reply_markup=_inline_cancel(),
             )
+
+        if text == "📊 وضعیت معاملات":
+            from handlers.deal_gate import admin_show_deal_gate_list
+
+            context.user_data["state"] = UserState.ADMIN_MENU.name
+            _persist_admin_wizard_state(user_id, context)
+            await admin_show_deal_gate_list(update, context)
+            return
 
         if text == "✏️ ویرایش آگهی":
             context.user_data["state"] = UserState.ADMIN_EDIT_ADVERT_ID.name
