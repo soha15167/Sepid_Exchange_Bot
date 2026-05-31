@@ -1807,6 +1807,10 @@ async def iran_panel_sync_router(update: Update, context: ContextTypes.DEFAULT_T
     uid = update.effective_user.id
     if not _is_admin(uid):
         return
+    from utils.flow_guards import user_flow_text_active
+
+    if user_flow_text_active(context):
+        return
     m = update.message
     if not m:
         return

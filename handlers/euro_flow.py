@@ -130,6 +130,15 @@ async def ask_account_country(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def handle_account_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
+    import logging
+
+    logger = logging.getLogger(__name__)
+    logger.info(
+        "euro_flow: account_country uid=%s state=%r text=%r",
+        update.effective_user.id if update.effective_user else None,
+        context.user_data.get("state"),
+        (update.message.text or "")[:40],
+    )
     if context.user_data.get("state") != UserState.EURO_ACCOUNT_COUNTRY.name:
         await update.message.reply_text(
             "⚠️ مرحلهٔ قبلی منقضی شده.\n"

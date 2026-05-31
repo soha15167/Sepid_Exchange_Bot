@@ -174,6 +174,75 @@ def is_exchange_state(state):
     ]
 
 
+async def _dispatch_user_flow_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    """Route advert / offer / exchange text. Returns True if handled."""
+    if not update.message or context.user_data is None:
+        return False
+    state = context.user_data.get("state")
+
+    if state == UserState.EURO_AMOUNT.name:
+        await ask_euro_rate(update, context)
+        return True
+    if state == UserState.EURO_RATE.name:
+        await ask_euro_description(update, context)
+        return True
+    if state == UserState.EURO_ACCOUNT_COUNTRY.name:
+        await handle_account_country(update, context)
+        return True
+    if state == UserState.EURO_DESCRIPTION.name:
+        await preview_advert(update, context)
+        return True
+    if state == UserState.EURO_INSTANT_TRANSFER.name:
+        await update.message.reply_text(
+            "\u200fلطفاً با دکمه‌های «دارم / ندارم / اطلاعی ندارم» در پیام بالا ادامه دهید."
+        )
+        return True
+    if state == UserState.SERVICE_SELECTION.name:
+        await update.message.reply_text(
+            "\u200fلطفاً روش پرداخت را با دکمه‌های بالا انتخاب کنید."
+        )
+        return True
+    if state == UserState.EURO_CONFIRM_ADVERT.name:
+        await update.message.reply_text(
+            "\u200fلطفاً با دکمه «تایید آگهی» یا «انصراف» ادامه دهید."
+        )
+        return True
+
+    if is_exchange_state(state):
+        if state == UserState.EXCHANGE_AMOUNT.name:
+            await handle_exchange_amount(update, context)
+            return True
+        if state == UserState.EXCHANGE_COUNTRY_INT.name:
+            await handle_exchange_country_int(update, context)
+            return True
+        if state == UserState.EXCHANGE_CITY_INT.name:
+            await handle_exchange_city_int(update, context)
+            return True
+        if state == UserState.EXCHANGE_CITY_IR.name:
+            await handle_exchange_city_ir(update, context)
+            return True
+        if state == UserState.EXCHANGE_DESCRIPTION.name:
+            await handle_exchange_description(update, context)
+            return True
+        if state in (
+            UserState.EXCHANGE_INIT.name,
+            UserState.EXCHANGE_INSTANT_TRANSFER.name,
+        ):
+            await update.message.reply_text(
+                "\u200fلطفاً با دکمه‌های پیام قبلی ادامه دهید."
+            )
+            return True
+
+    if await route_offer_flow_message(update, context):
+        return True
+    if state == UserState.OFFER_EDIT_RATE.name:
+        await handle_offer_edit_rate_message(update, context)
+        return True
+    return False
+
+
 async def wizard_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     ثبت آگهی / پیشنهاد / معاوضه — قبل از deal_gate تا state پاک نشود.
@@ -187,53 +256,29 @@ async def wizard_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     from utils.flow_guards import user_advert_offer_wizard_active
 
-    if not user_advert_offer_wizard_active(context):
+    flow_active = user_advert_offer_wizard_active(context)
+    if not flow_active:
         return
 
-    state = context.user_data.get("state")
-    handled = False
-
-    if state == UserState.EURO_AMOUNT.name:
-        await ask_euro_rate(update, context)
-        handled = True
-    elif state == UserState.EURO_RATE.name:
-        await ask_euro_description(update, context)
-        handled = True
-    elif state == UserState.EURO_ACCOUNT_COUNTRY.name:
-        await handle_account_country(update, context)
-        handled = True
-    elif state == UserState.EURO_DESCRIPTION.name:
-        await preview_advert(update, context)
-        handled = True
-    elif is_exchange_state(state):
-        if state == UserState.EXCHANGE_AMOUNT.name:
-            await handle_exchange_amount(update, context)
-            handled = True
-        elif state == UserState.EXCHANGE_COUNTRY_INT.name:
-            await handle_exchange_country_int(update, context)
-            handled = True
-        elif state == UserState.EXCHANGE_CITY_INT.name:
-            await handle_exchange_city_int(update, context)
-            handled = True
-        elif state == UserState.EXCHANGE_CITY_IR.name:
-            await handle_exchange_city_ir(update, context)
-            handled = True
-        elif state == UserState.EXCHANGE_DESCRIPTION.name:
-            await handle_exchange_description(update, context)
-            handled = True
-    elif await route_offer_flow_message(update, context):
-        handled = True
-    elif state == UserState.OFFER_EDIT_RATE.name:
-        await handle_offer_edit_rate_message(update, context)
-        handled = True
-
+    handled = await _dispatch_user_flow_text(update, context)
     if handled:
         logger.info(
             "wizard_text: uid=%s state=%r handled",
             update.effective_user.id if update.effective_user else None,
-            state,
+            context.user_data.get("state"),
         )
-        raise ApplicationHandlerStop
+    elif flow_active:
+        logger.warning(
+            "wizard_text: unhandled uid=%s state=%r offer_step=%r text=%r",
+            update.effective_user.id if update.effective_user else None,
+            context.user_data.get("state"),
+            (context.user_data.get("offer_flow_step") or "").strip(),
+            (update.message.text or "")[:60],
+        )
+        await update.message.reply_text(
+            "\u200f⚠️ مرحلهٔ فلو شناخته نشد — /menu بزنید و دوباره شروع کنید."
+        )
+    raise ApplicationHandlerStop
 
 
 async def euro_flow_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -266,8 +311,12 @@ async def euro_flow_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await handle_user_own_advert_edit_message(update, context)
 
     from database.db import deal_gate_active_for_user
+    from utils.flow_guards import user_flow_text_active
 
-    if u and deal_gate_active_for_user(u.id):
+    if u and deal_gate_active_for_user(u.id) and not user_flow_text_active(context):
+        return
+
+    if await _dispatch_user_flow_text(update, context):
         return
 
     if state == UserState.NEGOTIATION.name:
@@ -278,10 +327,6 @@ async def euro_flow_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "\u200fلطفاً با دکمهٔ «ارسال پیام» یا «انصراف» ادامه دهید."
             )
         return
-    elif await route_offer_flow_message(update, context):
-        return
-    elif state == UserState.OFFER_EDIT_RATE.name:
-        return await handle_offer_edit_rate_message(update, context)
 
     if not msg or not msg.text:
         return
@@ -616,23 +661,24 @@ def main():
     _private_text = filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND
     _iran_fill_text = filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND
     _iran_txn = filters.ChatType.PRIVATE & ~filters.COMMAND
-    application.add_handler(MessageHandler(_iran_fill_text, iran_panel_fill_router), group=0)
+    # wizard قبل از deal_gate — ثبت آگهی/پیشنهاد؛ deal_gate فقط وقتی wizard فعال نیست
     application.add_handler(MessageHandler(_private_text, wizard_text_router), group=0)
     application.add_handler(MessageHandler(_private_text, deal_gate_accounts_router), group=0)
+    application.add_handler(MessageHandler(_iran_fill_text, iran_panel_fill_router), group=0)
     _iran_receipt_media = (
         filters.ChatType.PRIVATE
         & (filters.PHOTO | filters.Document.IMAGE)
         & ~filters.COMMAND
     )
     application.add_handler(
-        MessageHandler(_iran_receipt_media, iran_panel_sync_router),
-        group=0,
-    )
-    application.add_handler(
         MessageHandler(
             _iran_receipt_media,
             deal_gate_accounts_photo_router,
         ),
+        group=0,
+    )
+    application.add_handler(
+        MessageHandler(_iran_receipt_media, iran_panel_sync_router),
         group=0,
     )
     application.add_handler(MessageHandler(_private_text, euro_flow_router), group=0)
@@ -709,6 +755,9 @@ def main():
 
     # بعد از شروع
     async def post_init(app):
+        logger.info(
+            "flow_routing: wizard_first_v5 (advert/offer before deal_gate accounts)"
+        )
         await auto_start_notify(app)
         _setup_bonbast_daily_job(app)
         _setup_daily_admin_report_job(app)

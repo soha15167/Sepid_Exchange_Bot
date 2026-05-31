@@ -450,6 +450,7 @@ async def _notify_user_account_wait(
     user_id: int,
     *,
     deal_complete: bool,
+    by_admin: bool = False,
 ) -> None:
     from utils.telegram_utils import send_or_replace_main_menu
 
@@ -458,6 +459,12 @@ async def _notify_user_account_wait(
             f"{_RTL}✅ <b>اطلاعات معامله برای ادمین ارسال شد</b>\n\n"
             f"{_RTL}لطفاً صبور باشید؛ مراحل بعدی را ادمین هماهنگ می‌کند.\n\n"
             f"{_RTL}⚠️ <b>بدون هماهنگی ادمین واریز نکنید.</b>"
+        )
+    elif by_admin:
+        text = (
+            f"{_RTL}✅ <b>ادمین اطلاعات حساب شما را ثبت کرد</b>\n\n"
+            f"{_RTL}نیازی به ارسال مجدد حساب نیست.\n"
+            f"{_RTL}پس از ثبت حساب طرف مقابل، مراحل بعدی را ادمین هماهنگ می‌کند."
         )
     else:
         text = (
@@ -473,6 +480,29 @@ async def _notify_user_account_wait(
         text=text,
         parse_mode=ParseMode.HTML,
     )
+
+
+async def _notify_user_other_party_account_ready(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    *,
+    other_party_fa: str,
+) -> None:
+    """طرفی که هنوز حساب نفرستاده — طرف مقابل (یا ادمین) حسابش ثبت شد."""
+    try:
+        await context.bot.send_message(
+            int(user_id),
+            f"{_RTL}ℹ️ <b>حساب {other_party_fa} ثبت شد.</b>\n\n"
+            f"{_RTL}لطفاً اگر هنوز حساب خود را نفرستاده‌اید، "
+            f"اطلاعات دریافت را <b>متنی</b> یا <b>عکس کارت</b> بفرستید.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        logger.warning(
+            "deal_gate: could not notify uid=%s other_party=%s ready",
+            user_id,
+            other_party_fa,
+        )
 
 
 def _track_deal_msg(store: dict, user_id: int, offer_id: int, message_id: int | None) -> None:
@@ -926,8 +956,27 @@ async def admin_save_party_account(
         (gate.get("buyer_accounts_text") or "").strip()
         and (gate.get("seller_accounts_text") or "").strip()
     )
+    party_uid = buyer_id if party == "buyer" else seller_id
+    other_uid = seller_id if party == "buyer" else buyer_id
+    other_party_fa = "فروشنده" if party == "buyer" else "خریدار"
+    other_key = "seller_accounts_text" if party == "buyer" else "buyer_accounts_text"
+    try:
+        from handlers.offers import clear_offer_flow_user_data
+
+        ud = context.application.user_data[party_uid]
+        clear_offer_flow_user_data(ud)
+    except Exception:
+        pass
     if both_done:
         await _complete_deal(context, oid)
+    else:
+        await _notify_user_account_wait(
+            context, party_uid, deal_complete=False, by_admin=True
+        )
+        if other_uid and not (gate.get(other_key) or "").strip():
+            await _notify_user_other_party_account_ready(
+                context, other_uid, other_party_fa=other_party_fa
+            )
     return None
 
 
@@ -1331,11 +1380,22 @@ async def _on_both_yes(
     _log(offer_id, "هر دو طرف تأیید نهایی (بله) زدند — جمع‌آوری حساب")
     _cancel_gate_reminder_jobs(context, offer_id)
     try:
-        from handlers.offers import _clear_offer_flow
+        from handlers.offers import clear_offer_flow_user_data
 
-        _clear_offer_flow(context)
+        for party_uid in (buyer_id, seller_id):
+            if not party_uid:
+                continue
+            try:
+                ud = context.application.user_data[party_uid]
+                clear_offer_flow_user_data(ud)
+            except Exception:
+                logger.exception(
+                    "deal_gate: clear offer flow failed uid=%s offer=%s",
+                    party_uid,
+                    offer_id,
+                )
     except Exception:
-        pass
+        logger.exception("deal_gate: clear offer flow failed offer=%s", offer_id)
     for uid, is_buyer in (
         (buyer_id, True),
         (seller_id, False),
@@ -1695,9 +1755,13 @@ async def deal_gate_accounts_photo_router(
     """عکس کارت/حساب در مرحلهٔ جمع‌آوری — OCR + تأیید کاربر."""
     if not update.message or not update.effective_user:
         return
-    from utils.flow_guards import user_advert_offer_wizard_active
+    uid = update.effective_user.id
+    gate = deal_gate_active_for_user(uid)
+    if not gate or (gate.get("gate_status") or "").strip().lower() != "accounts":
+        return
+    from utils.flow_guards import user_advert_offer_wizard_text_step
 
-    if user_advert_offer_wizard_active(context):
+    if user_advert_offer_wizard_text_step(context):
         return
     from handlers.iran_panel_sync import is_awaiting_iran_panel_field
 
@@ -1710,10 +1774,6 @@ async def deal_gate_accounts_photo_router(
         "in",
         "out",
     ):
-        return
-
-    gate = deal_gate_active_for_user(update.effective_user.id)
-    if not gate or (gate.get("gate_status") or "").strip().lower() != "accounts":
         return
 
     from handlers.offers import _clear_offer_flow
@@ -1888,19 +1948,20 @@ async def _handle_account_confirm_callback(
 async def deal_gate_accounts_router(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """پیام متنی حساب‌ها پس از تأیید دوطرفه."""
+    """پیام متنی حساب‌ها پس از تأیید دوطرفه — اولویت بالاتر از wizard آگهی/پیشنهاد."""
     if not update.message or not update.effective_user:
         return
-    from utils.flow_guards import user_advert_offer_wizard_active
+    uid = update.effective_user.id
+    gate = deal_gate_active_for_user(uid)
+    if not gate or (gate.get("gate_status") or "").strip().lower() != "accounts":
+        return
+    from utils.flow_guards import user_advert_offer_wizard_text_step
 
-    if user_advert_offer_wizard_active(context):
+    if user_advert_offer_wizard_text_step(context):
         return
     from handlers.iran_panel_sync import is_awaiting_iran_panel_field
 
     if is_awaiting_iran_panel_field(context):
-        return
-    gate = deal_gate_active_for_user(update.effective_user.id)
-    if not gate:
         return
     if context.user_data.get(_ACC_PENDING_KEY):
         await update.message.reply_text(

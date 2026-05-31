@@ -1494,6 +1494,12 @@ async def refresh_offer_notification_cards_after_rate_change(
 
 
 def _pop_offer_draft_keys(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.user_data is not None:
+        clear_offer_flow_user_data(context.user_data)
+
+
+def clear_offer_flow_user_data(ud: dict) -> None:
+    """پاک کردن state پیشنهاد/آگهی روی dict کاربر (برای هر دو طرف معامله)."""
     for k in (
         "offer_advert_id",
         "offer_draft_rate",
@@ -1502,17 +1508,18 @@ def _pop_offer_draft_keys(context: ContextTypes.DEFAULT_TYPE) -> None:
         "offer_draft_euro_amount",
         "offer_counter_mode",
     ):
-        context.user_data.pop(k, None)
+        ud.pop(k, None)
+    ud.pop("offer_flow_mids", None)
+    ud.pop("offer_flow_input_mids", None)
+    ud.pop("offer_flow_active_mid", None)
+    ud.pop("offer_flow_prompt_mid", None)
+    ud.pop("offer_flow_step", None)
+    ud["state"] = UserState.MAIN_MENU.name
 
 
 def _clear_offer_flow(context: ContextTypes.DEFAULT_TYPE) -> None:
-    _pop_offer_draft_keys(context)
-    context.user_data.pop("offer_flow_mids", None)
-    context.user_data.pop("offer_flow_input_mids", None)
-    context.user_data.pop("offer_flow_active_mid", None)
-    context.user_data.pop("offer_flow_prompt_mid", None)
-    context.user_data.pop("offer_flow_step", None)
-    context.user_data["state"] = UserState.MAIN_MENU.name
+    if context.user_data is not None:
+        clear_offer_flow_user_data(context.user_data)
 
 
 _OFFER_FLOW_STEP_STATE: dict[str, UserState] = {
@@ -1525,10 +1532,13 @@ _OFFER_FLOW_STEP_STATE: dict[str, UserState] = {
 }
 
 def _offer_flow_active(context: ContextTypes.DEFAULT_TYPE) -> bool:
-    st = (context.user_data.get("state") or "").strip()
+    ud = context.user_data or {}
+    st = (ud.get("state") or "").strip()
     if st.startswith("OFFER_"):
         return True
-    return bool((context.user_data.get("offer_flow_step") or "").strip())
+    if (ud.get("offer_flow_step") or "").strip():
+        return True
+    return ud.get("offer_advert_id") is not None
 
 
 async def route_offer_flow_message(
@@ -3789,8 +3799,14 @@ async def handle_offer_counter_amount_message(
     user_id = update.effective_user.id
     advert_id = context.user_data.get("offer_advert_id")
     if not isinstance(advert_id, int):
+        await update.message.reply_text(
+            f"{_RTL}⚠️ فلو پیشنهاد منقضی شده — /menu و دوباره «ثبت پیشنهاد».",
+        )
         return
     if not context.user_data.get("offer_counter_mode"):
+        await update.message.reply_text(
+            f"{_RTL}لطفاً با دکمه‌های «موافقم» یا «مقدار دیگر» در پیام بالا ادامه دهید.",
+        )
         return
     amt = _parse_int_euro_amount(update.message.text or "")
     if amt is None or amt <= 0:
@@ -3849,6 +3865,9 @@ async def handle_offer_rate_message(update: Update, context: ContextTypes.DEFAUL
     user_id = update.effective_user.id
     advert_id = context.user_data.get("offer_advert_id")
     if not isinstance(advert_id, int):
+        await update.message.reply_text(
+            f"{_RTL}⚠️ فلو پیشنهاد منقضی شده — /menu و دوباره «ثبت پیشنهاد».",
+        )
         return
     if context.user_data.get("offer_flow_step") == "description":
         return await handle_offer_description_message(update, context)
@@ -4058,6 +4077,9 @@ async def handle_offer_description_message(update: Update, context: ContextTypes
     rate = context.user_data.get("offer_draft_rate")
     chat_id = update.effective_chat.id
     if not isinstance(advert_id, int):
+        await update.message.reply_text(
+            f"{_RTL}⚠️ فلو پیشنهاد منقضی شده — /menu و دوباره «ثبت پیشنهاد».",
+        )
         return
     if not isinstance(rate, int):
         adv_tmp = get_euro_advert_by_rowid(advert_id) or {}
