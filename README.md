@@ -6,8 +6,8 @@
   <a href="https://t.me/Sepid_Group_Bot">@Sepid_Group_Bot</a>
 </p>
 
-> **Documentation / مستندات:** All project docs and code section banners use **English + Persian (FA)**.  
-> جستجو در کد: `Section` یا `بخش` — See [docs/DEAL_GATE.md](docs/DEAL_GATE.md) for the payment flow.
+> **EN:** Docs and code use English + Persian. Search code: `Section` or `بخش`.  
+> **FA:** مستندات و کد به دو زبان انگلیسی و فارسی است. در کد: `Section` یا `بخش`. فلو واریز: [docs/DEAL_GATE.md](docs/DEAL_GATE.md)
 
 ---
 
@@ -30,33 +30,47 @@
 
 ## Introduction | معرفی
 
-**EN:** This bot powers **Sepid Exchange**: user registration (SMS), euro buy/sell ads on the channel, offers on posts, and after acceptance a **Deal Gate** for final confirmation, account collection, and staged Toman/Euro payments coordinated by admin.
+### English
 
-**FA:** این ربات **سپید اکسچنج** را پشتیبانی می‌کند: ثبت‌نام با SMS، آگهی خرید/فروش یورو در کانال، پیشنهاد روی پست‌ها، و پس از پذیرش **دروازه معامله (Deal Gate)** برای تأیید نهایی، جمع حساب، و واریز مرحله‌ای تومان/یورو با ادمین.
+This bot runs **Sepid Exchange**: SMS registration, euro buy/sell channel ads, offers on posts, and after acceptance a **Deal Gate** (final OK, accounts, staged Toman/Euro payments with admin).
+
+### فارسی
+
+این ربات **سپید اکسچنج** را اجرا می‌کند: ثبت‌نام با پیامک، آگهی خرید و فروش یورو در کانال، پیشنهاد روی پست‌ها، و بعد از پذیرش پیشنهاد **دروازه معامله** برای تأیید نهایی، دریافت حساب، و هماهنگی واریز تومان و یورو با ادمین.
 
 ---
 
 ## Tech stack | زبان‌ها و فناوری
 
-**EN:** This repository is written almost entirely in **Python 3.10+**. There is no separate frontend (no React/Node for the bot itself).
+### English
 
-**FA:** تقریباً تمام این مخزن با **پایتون ۳.۱۰+** نوشته شده است. فرانت‌اند جدا (مثل React) برای خود ربات وجود ندارد.
+Almost the entire project is **Python 3.10+**. There is no separate web frontend (no React/Node for the bot).
 
-| Kind | EN | FA | Examples in repo |
-|------|----|----|------------------|
-| **Language** | Python 3.10+ | زبان اصلی | `main.py`, `handlers/*.py`, `database/db.py`, `utils/*.py` |
-| **Markup / docs** | Markdown | مستندات | `README.md`, `docs/*.md` |
-| **Shell** | Bash (optional) | اسکریپت سرور | `scripts/*.py` (Python), deploy commands in README |
-| **SQL** | SQLite schema & queries | پایگاه داده | embedded in `database/db.py` |
-| **Config** | `.env` key=value | تنظیمات محیط | `.env.sepid.example` (not committed) |
+| Kind | Role | Examples |
+|------|------|----------|
+| Language | Python 3.10+ | `main.py`, `handlers/`, `database/`, `utils/` |
+| Docs | Markdown | `README.md`, `docs/` |
+| Database | SQLite (SQL in Python) | `database/db.py` |
+| Config | `.env` (not in git) | `.env.sepid.example` |
 
-**EN — Main libraries:** `python-telegram-bot` (Telegram API), `python-dotenv`, `twilio` (SMS OTP). Optional: Pillow, OpenCV, pydantic (receipt/OCR modules).
+**Main libraries:** `python-telegram-bot`, `python-dotenv`, `twilio`.  
+**Optional:** Pillow, OpenCV, pydantic (receipt/OCR).  
+**Not used in the bot core:** JavaScript, TypeScript, Java, C#, PHP, Go.
 
-**FA — کتابخانه‌های اصلی:** `python-telegram-bot` (API تلگرام)، `twilio` (کد ثبت‌نام). اختیاری: Pillow/OpenCV برای OCR فیش.
+### فارسی
 
-**EN — Not used for the bot core:** JavaScript, TypeScript, Java, C#, PHP, Go.
+تقریباً همهٔ پروژه با **پایتون ۳.۱۰ به بالا** نوشته شده است. رابط وب جدا (مثل React) برای خود ربات نداریم.
 
-**FA — در هستهٔ ربات استفاده نشده:** JavaScript، Java، PHP و غیره.
+| مورد | نقش | نمونه در پروژه |
+|------|-----|----------------|
+| زبان | پایتون | `main.py`، پوشهٔ `handlers/`، `database/` |
+| مستندات | مارک‌داون | `README.md`، پوشهٔ `docs/` |
+| دیتابیس | SQLite | فایل `database/db.py` |
+| تنظیمات | فایل `.env` | فقط روی سرور؛ داخل گیت نیست |
+
+**کتابخانه‌های اصلی:** اتصال به تلگرام (`python-telegram-bot`)، خواندن `.env`، ارسال پیامک ثبت‌نام (`twilio`).  
+**اختیاری:** Pillow و OpenCV برای تشخیص متن/عکس فیش.  
+**در هستهٔ ربات به کار نرفته:** جاوااسکریپت، جاوا، PHP، Go و مشابه آن‌ها.
 
 ---
 
@@ -226,52 +240,98 @@ python -c "from database.db import ensure_schema; ensure_schema()"  # after depl
 
 ## Deploy | دیپلوی
 
-**EN:** Production server example: `root@49.13.132.230` → `/root/telegram_bot_project2`.  
-**FA:** سرور نمونه: `root@49.13.132.230` → `/root/telegram_bot_project2`.
+سرور نمونه: `root@49.13.132.230` — مسیر: `/root/telegram_bot_project2`
 
-### Transferring code **with** explanations | انتقال کد **همراه توضیحات**
+### English — How updates reach the server
 
-**EN:**
+| Method | When to use |
+|--------|-------------|
+| **SCP** | Your server folder was copied manually (no `.git`) — **this is your case if `git pull` fails** |
+| **Git pull** | After you connect the folder to GitHub once (see below) |
 
-1. **Git (recommended)** — `git pull` on the server updates **all** source files **and** docs. Inline comments (`# Section N | بخش N`, `# EN:` / `# FA:`) live **inside** `.py` files, so they are on the server as soon as those files are pulled.
-2. **SCP (partial)** — Copying only `handlers/deal_gate.py` (etc.) moves **code + in-file bilingual comments** for that file. Copy `README.md` and `docs/` separately if you want the same guides on the server disk.
-3. **GitHub** — Commits (e.g. `8d21cbc`) include documented code; clone/pull is the easiest way to keep server and docs in sync.
+Comments in code (`# Section | بخش`) travel **inside** each `.py` file you copy.  
+Markdown (`README`, `docs/`) is for reading on the server; the bot does not execute it.
 
-**FA:**
+### فارسی — چطور کد به سرور می‌رسد
 
-1. **Git (پیشنهادی)** — با `git pull` روی سرور، هم **کد** و هم **README/docs** به‌روز می‌شود. توضیحات داخل فایل‌های `.py` (بخش‌ها و EN/FA) **با همان فایل** منتقل می‌شوند.
-2. **SCP (جزئی)** — با `scp` فقط همان فایلی که می‌فرستید می‌رود؛ توضیحات داخل همان `.py` هست. برای README و `docs/` باید جداگانه کپی کنید.
-3. **GitHub** — کامیت‌ها شامل کد مستندشده است؛ clone/pull ساده‌ترین همگام‌سازی است.
+| روش | کی استفاده کنیم |
+|-----|------------------|
+| **SCP** | پوشهٔ سرور با کپی دستی ساخته شده و `git pull` خطا می‌دهد — **احتمالاً وضعیت فعلی شما** |
+| **Git pull** | بعد از یک‌بار وصل کردن پوشه به گیت‌هاب (دستورات پایین) |
 
-| What | On GitHub | On server after `git pull` | On server after `scp` one `.py` |
-|------|-----------|----------------------------|----------------------------------|
-| Python logic | Yes | Yes | Yes (that file only) |
-| In-code EN/FA comments | Yes | Yes | Yes (that file only) |
-| README + `docs/` | Yes | Yes | Only if you copy them |
+توضیحات داخل کد همراه همان فایل `.py` منتقل می‌شود.  
+فایل‌های مارک‌داون فقط برای مطالعهٔ شما روی سرور است؛ ربات آن‌ها را اجرا نمی‌کند.
+
+---
+
+### روش ۱ — SCP (بدون گیت) | Method A — SCP
+
+**فارسی — بعد از هر تغییر در ویندوز:**
+
+```text
+scp "C:\Users\Sohei\Desktop\Desktop\telegram_bot_project2\handlers\deal_gate.py" "root@49.13.132.230:/root/telegram_bot_project2/handlers/"
+scp "C:\Users\Sohei\Desktop\Desktop\telegram_bot_project2\handlers\offers.py" "root@49.13.132.230:/root/telegram_bot_project2/handlers/"
+scp "C:\Users\Sohei\Desktop\Desktop\telegram_bot_project2\database\db.py" "root@49.13.132.230:/root/telegram_bot_project2/database/"
+scp "C:\Users\Sohei\Desktop\Desktop\telegram_bot_project2\main.py" "root@49.13.132.230:/root/telegram_bot_project2/"
+```
+
+**روی سرور:**
 
 ```bash
-# EN: On server — full update with documentation
-# FA: روی سرور — به‌روزرسانی کامل با مستندات
 cd /root/telegram_bot_project2
-git pull origin main
-./venv/bin/python3 -m pip install -r requirements.txt
 ./venv/bin/python3 -c "from database.db import ensure_schema; ensure_schema()"
 systemctl restart telegram-bot
 ```
 
-**EN — SCP example (Windows → server), same files you changed:**
+**English:** Copy changed files from Windows, then `ensure_schema` and restart the service.
 
-**FA — نمونه SCP (ویندوز → سرور)، همان فایل‌های تغییرکرده:**
+---
 
-```text
-scp "C:\Users\Sohei\Desktop\Desktop\telegram_bot_project2\handlers\deal_gate.py" "root@49.13.132.230:/root/telegram_bot_project2/handlers/"
-scp "C:\Users\Sohei\Desktop\Desktop\telegram_bot_project2\README.md" "root@49.13.132.230:/root/telegram_bot_project2/"
-scp "C:\Users\Sohei\Desktop\Desktop\telegram_bot_project2\docs\DEAL_GATE.md" "root@49.13.132.230:/root/telegram_bot_project2/docs/"
+### روش ۲ — یک‌بار گیت روی سرور (بعداً `git pull`) | Method B — Git once
+
+**فارسی:** اگر `fatal: not a git repository` می‌گیرید، یعنی پوشه با SCP ساخته شده و هنوز گیت ندارد.  
+**فقط اگر `eurobot.db` و `.env` را بکاپ گرفتید** می‌توانید پوشه را به ریپو وصل کنید:
+
+```bash
+cd /root/telegram_bot_project2
+# پشتیبان (مهم)
+cp eurobot.db /root/eurobot.db.bak
+cp .env /root/.env.bak
+
+# اتصال به گیت‌هاب (یک‌بار)
+git init
+git remote add origin https://github.com/soha15167/Sepid_Exchange_Bot.git
+git fetch origin
+git checkout -B main origin/main
+
+# بعد از این، به‌روزرسانی:
+git pull origin main
+./venv/bin/python3 -c "from database.db import ensure_schema; ensure_schema()"
+systemctl restart telegram-bot
 ```
 
-**EN:** The running bot uses **Python bytecode from `.py` files**; Markdown on the server is for **humans** (SSH, reading on disk), not executed by the bot.
+**هشدار:** `git checkout` ممکن است فایل‌های محلی را عوض کند؛ حتماً `.env` و `eurobot.db` را نگه دارید.
 
-**FA:** ربات فقط **فایل‌های `.py`** را اجرا می‌کند؛ Markdown روی سرور برای **خواندن توسط شما** است، نه اجرا توسط ربات.
+**English:** `git pull` only works after `git init` + `remote` + `checkout`. Back up `.env` and `eurobot.db` first.
+
+---
+
+### روش ۳ — کلون تازه در مسیر دیگر | Method C — Fresh clone
+
+**فارسی:** امن‌تر اگر نمی‌خواهید روی پوشهٔ فعلی ریسک کنید:
+
+```bash
+cd /root
+git clone https://github.com/soha15167/Sepid_Exchange_Bot.git telegram_bot_project2_git
+cd telegram_bot_project2_git
+cp /root/telegram_bot_project2/.env .
+cp /root/telegram_bot_project2/eurobot.db .
+python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
+./venv/bin/python3 -c "from database.db import ensure_schema; ensure_schema()"
+# سپس مسیر سرویس systemd را به پوشهٔ جدید تغییر دهید
+```
+
+**English:** Clone to a new folder, copy `.env` and DB, point `systemctl` to the new path.
 
 ---
 
