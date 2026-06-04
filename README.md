@@ -16,14 +16,15 @@
 | # | EN | FA |
 |---|----|----|
 | 1 | [Introduction](#introduction--معرفی) | معرفی |
-| 2 | [Features](#features--قابلیت‌ها) | قابلیت‌ها |
-| 3 | [Architecture](#architecture--معماری) | معماری |
-| 4 | [Deal Gate flow](#deal-gate-flow--فلو-معامله) | فلو معامله |
-| 5 | [Project structure](#project-structure--ساختار-پروژه) | ساختار |
-| 6 | [Install & run](#install--run--نصب-و-اجرا) | نصب |
-| 7 | [Deploy](#deploy--دیپلوی) | دیپلوی |
-| 8 | [Code docs](#code-documentation--مستندات-کد) | مستندات کد |
-| 9 | [Security](#security--امنیت) | امنیت |
+| 2 | [Tech stack](#tech-stack--زبان‌ها-و-فناوری) | زبان‌ها و فناوری |
+| 3 | [Features](#features--قابلیت‌ها) | قابلیت‌ها |
+| 4 | [Architecture](#architecture--معماری) | معماری |
+| 5 | [Deal Gate flow](#deal-gate-flow--فلو-معامله) | فلو معامله |
+| 6 | [Project structure](#project-structure--ساختار-پروژه) | ساختار |
+| 7 | [Install & run](#install--run--نصب-و-اجرا) | نصب |
+| 8 | [Deploy](#deploy--دیپلوی) | دیپلوی |
+| 9 | [Code docs](#code-documentation--مستندات-کد) | مستندات کد |
+| 10 | [Security](#security--امنیت) | امنیت |
 
 ---
 
@@ -32,6 +33,30 @@
 **EN:** This bot powers **Sepid Exchange**: user registration (SMS), euro buy/sell ads on the channel, offers on posts, and after acceptance a **Deal Gate** for final confirmation, account collection, and staged Toman/Euro payments coordinated by admin.
 
 **FA:** این ربات **سپید اکسچنج** را پشتیبانی می‌کند: ثبت‌نام با SMS، آگهی خرید/فروش یورو در کانال، پیشنهاد روی پست‌ها، و پس از پذیرش **دروازه معامله (Deal Gate)** برای تأیید نهایی، جمع حساب، و واریز مرحله‌ای تومان/یورو با ادمین.
+
+---
+
+## Tech stack | زبان‌ها و فناوری
+
+**EN:** This repository is written almost entirely in **Python 3.10+**. There is no separate frontend (no React/Node for the bot itself).
+
+**FA:** تقریباً تمام این مخزن با **پایتون ۳.۱۰+** نوشته شده است. فرانت‌اند جدا (مثل React) برای خود ربات وجود ندارد.
+
+| Kind | EN | FA | Examples in repo |
+|------|----|----|------------------|
+| **Language** | Python 3.10+ | زبان اصلی | `main.py`, `handlers/*.py`, `database/db.py`, `utils/*.py` |
+| **Markup / docs** | Markdown | مستندات | `README.md`, `docs/*.md` |
+| **Shell** | Bash (optional) | اسکریپت سرور | `scripts/*.py` (Python), deploy commands in README |
+| **SQL** | SQLite schema & queries | پایگاه داده | embedded in `database/db.py` |
+| **Config** | `.env` key=value | تنظیمات محیط | `.env.sepid.example` (not committed) |
+
+**EN — Main libraries:** `python-telegram-bot` (Telegram API), `python-dotenv`, `twilio` (SMS OTP). Optional: Pillow, OpenCV, pydantic (receipt/OCR modules).
+
+**FA — کتابخانه‌های اصلی:** `python-telegram-bot` (API تلگرام)، `twilio` (کد ثبت‌نام). اختیاری: Pillow/OpenCV برای OCR فیش.
+
+**EN — Not used for the bot core:** JavaScript, TypeScript, Java, C#, PHP, Go.
+
+**FA — در هستهٔ ربات استفاده نشده:** JavaScript، Java، PHP و غیره.
 
 ---
 
@@ -201,16 +226,52 @@ python -c "from database.db import ensure_schema; ensure_schema()"  # after depl
 
 ## Deploy | دیپلوی
 
-**EN:** Example server path `/root/telegram_bot_project2` — install deps in **venv**, run `ensure_schema`, restart `telegram-bot`.
+**EN:** Production server example: `root@49.13.132.230` → `/root/telegram_bot_project2`.  
+**FA:** سرور نمونه: `root@49.13.132.230` → `/root/telegram_bot_project2`.
 
-**FA:** مسیر نمونه `/root/telegram_bot_project2` — وابستگی در **venv**، `ensure_schema`، ری‌استارت سرویس.
+### Transferring code **with** explanations | انتقال کد **همراه توضیحات**
+
+**EN:**
+
+1. **Git (recommended)** — `git pull` on the server updates **all** source files **and** docs. Inline comments (`# Section N | بخش N`, `# EN:` / `# FA:`) live **inside** `.py` files, so they are on the server as soon as those files are pulled.
+2. **SCP (partial)** — Copying only `handlers/deal_gate.py` (etc.) moves **code + in-file bilingual comments** for that file. Copy `README.md` and `docs/` separately if you want the same guides on the server disk.
+3. **GitHub** — Commits (e.g. `8d21cbc`) include documented code; clone/pull is the easiest way to keep server and docs in sync.
+
+**FA:**
+
+1. **Git (پیشنهادی)** — با `git pull` روی سرور، هم **کد** و هم **README/docs** به‌روز می‌شود. توضیحات داخل فایل‌های `.py` (بخش‌ها و EN/FA) **با همان فایل** منتقل می‌شوند.
+2. **SCP (جزئی)** — با `scp` فقط همان فایلی که می‌فرستید می‌رود؛ توضیحات داخل همان `.py` هست. برای README و `docs/` باید جداگانه کپی کنید.
+3. **GitHub** — کامیت‌ها شامل کد مستندشده است؛ clone/pull ساده‌ترین همگام‌سازی است.
+
+| What | On GitHub | On server after `git pull` | On server after `scp` one `.py` |
+|------|-----------|----------------------------|----------------------------------|
+| Python logic | Yes | Yes | Yes (that file only) |
+| In-code EN/FA comments | Yes | Yes | Yes (that file only) |
+| README + `docs/` | Yes | Yes | Only if you copy them |
 
 ```bash
+# EN: On server — full update with documentation
+# FA: روی سرور — به‌روزرسانی کامل با مستندات
 cd /root/telegram_bot_project2
+git pull origin main
 ./venv/bin/python3 -m pip install -r requirements.txt
 ./venv/bin/python3 -c "from database.db import ensure_schema; ensure_schema()"
 systemctl restart telegram-bot
 ```
+
+**EN — SCP example (Windows → server), same files you changed:**
+
+**FA — نمونه SCP (ویندوز → سرور)، همان فایل‌های تغییرکرده:**
+
+```text
+scp "C:\Users\Sohei\Desktop\Desktop\telegram_bot_project2\handlers\deal_gate.py" "root@49.13.132.230:/root/telegram_bot_project2/handlers/"
+scp "C:\Users\Sohei\Desktop\Desktop\telegram_bot_project2\README.md" "root@49.13.132.230:/root/telegram_bot_project2/"
+scp "C:\Users\Sohei\Desktop\Desktop\telegram_bot_project2\docs\DEAL_GATE.md" "root@49.13.132.230:/root/telegram_bot_project2/docs/"
+```
+
+**EN:** The running bot uses **Python bytecode from `.py` files**; Markdown on the server is for **humans** (SSH, reading on disk), not executed by the bot.
+
+**FA:** ربات فقط **فایل‌های `.py`** را اجرا می‌کند؛ Markdown روی سرور برای **خواندن توسط شما** است، نه اجرا توسط ربات.
 
 ---
 
