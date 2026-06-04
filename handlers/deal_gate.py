@@ -25,10 +25,12 @@ from database.db import (
     deal_gate_active_for_user,
     deal_gate_append_buyer_receipt,
     deal_gate_append_seller_receipt,
+    deal_gate_append_seller_toman_admin,
     deal_gate_buyer_receipt_list,
     deal_gate_confirm_seller_receipt_buyer,
     deal_gate_delete,
     deal_gate_seller_receipt_list,
+    deal_gate_seller_toman_admin_list,
     deal_gate_get,
     deal_gate_list_for_admin,
     deal_gate_upsert,
@@ -47,6 +49,7 @@ logger = logging.getLogger(__name__)
 _RTL = "\u200f"
 _ACC_PENDING_KEY = "deal_acc_pending"
 _DEAL_RCPT_KEY = "deal_rcpt_pending"
+_DEAL_ADMIN_STOM_KEY = "deal_admin_stom_pending"
 _ACCOUNT_PHOTO_MARKER = "📷 عکس حساب"
 _REMINDER1_SEC = 3600
 _REMINDER2_SEC = 7200
@@ -366,9 +369,9 @@ async def sync_deal_admin_notification(
     updated = dict(stored)
     plain = re.sub(r"<[^>]+>", "", admin_html or "")
     if deal_complete:
-        reply_markup = deal_admin_completed_keyboard(oid)
+        reply_markup = deal_admin_payment_actions_keyboard(oid, gate)
     elif accounts_mode:
-        reply_markup = deal_admin_payment_actions_keyboard(oid)
+        reply_markup = deal_admin_payment_actions_keyboard(oid, gate)
     else:
         reply_markup = None
 
@@ -409,35 +412,108 @@ async def sync_deal_admin_notification(
         )
 
 
-def deal_admin_payment_actions_keyboard(offer_id: int) -> InlineKeyboardMarkup:
-    """دکمه‌های هماهنگی برای ادمین — مرحلهٔ ثبت حساب و پس از تکمیل."""
+def _first_unconfirmed_seller_euro_index(offer_id: int) -> int | None:
+    for i, r in enumerate(deal_gate_seller_receipt_list(offer_id)):
+        if not int(r.get("buyer_confirmed_at") or 0):
+            return i
+    return None
+
+
+async def _show_user_main_menu(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    *,
+    text: str | None = None,
+    parse_mode: str | None = None,
+) -> None:
+    from config.settings import ADMIN_IDS
+    from keyboards.admin_home import admin_home_inline_keyboard
+    from models.enums import UserState
+    from utils.telegram_utils import send_or_replace_main_menu
+
+    uid = int(user_id)
+    rm = None
+    if uid in set(ADMIN_IDS or []):
+        rm = admin_home_inline_keyboard()
+    await send_or_replace_main_menu(
+        context.bot,
+        chat_id=uid,
+        user_id=uid,
+        store=user_data_store,
+        text=text or f"{_RTL}🏠 منوی اصلی:",
+        parse_mode=parse_mode,
+        reply_markup=rm,
+    )
+    try:
+        context.application.user_data[uid]["state"] = UserState.MAIN_MENU.name
+    except Exception:
+        pass
+
+
+def deal_admin_payment_actions_keyboard(
+    offer_id: int, gate: dict | None = None
+) -> InlineKeyboardMarkup:
+    """دکمه‌های هماهنگی ادمین — وابسته به مرحلهٔ واریز."""
+    from handlers.offers import _seller_euro_fully_confirmed_gate
+
     oid = int(offer_id)
-    return InlineKeyboardMarkup(
+    if gate is None:
+        gate = deal_gate_get(oid) or {}
+    rows: list[list[InlineKeyboardButton]] = [
         [
+            InlineKeyboardButton(
+                "💳 ارسال کارت واریز تومان به خریدار",
+                callback_data=f"adm|pay|{oid}",
+            )
+        ],
+    ]
+    card_sent = int(gate.get("buyer_toman_card_sent_at") or 0) > 0
+    toman_settled = int(gate.get("buyer_toman_settled_at") or 0) > 0
+    if card_sent and not toman_settled:
+        rows.append(
             [
                 InlineKeyboardButton(
-                    "💳 ارسال کارت واریز تومان به خریدار",
-                    callback_data=f"adm|pay|{oid}",
+                    "✅ تومان نشست",
+                    callback_data=f"adm|tomset|{oid}",
                 )
-            ],
+            ]
+        )
+    eur_sent = int(gate.get("seller_eur_account_sent_at") or 0) > 0
+    if eur_sent:
+        uidx = _first_unconfirmed_seller_euro_index(oid)
+        if uidx is not None:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "✅ یورو نشست (ادمین)",
+                        callback_data=f"adm|eurcfm|{oid}|{uidx}",
+                    )
+                ]
+            )
+    if _seller_euro_fully_confirmed_gate(gate):
+        rows.append(
             [
                 InlineKeyboardButton(
-                    "📤 ارسال حساب یوروی خریدار به فروشنده",
-                    callback_data=f"adm|buyeur|{oid}",
+                    "📎 ارسال فیش واریزی تومان به فروشنده",
+                    callback_data=f"adm|stom|{oid}|go",
                 )
-            ],
-            [
-                InlineKeyboardButton(
-                    "📋 پیام‌های ربات به طرفین",
-                    callback_data=f"adm|outlog|{oid}",
-                )
-            ],
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "📋 پیام‌های ربات به طرفین",
+                callback_data=f"adm|outlog|{oid}",
+            )
         ]
     )
+    return InlineKeyboardMarkup(rows)
 
 
-def deal_admin_completed_keyboard(offer_id: int) -> InlineKeyboardMarkup:
-    return deal_admin_payment_actions_keyboard(offer_id)
+def deal_admin_completed_keyboard(
+    offer_id: int, gate: dict | None = None
+) -> InlineKeyboardMarkup:
+    return deal_admin_payment_actions_keyboard(offer_id, gate)
 
 
 def _buyer_toman_pay_keyboard(offer_id: int) -> InlineKeyboardMarkup:
@@ -576,6 +652,34 @@ async def _purge_buyer_pay_on_cancel(
         except Exception:
             pass
     await _purge_user_deal_chat(bot, store, uid, oid, gate)
+
+
+async def _notify_admins_deal_line(
+    bot, *, offer_id: int, gate: dict, line_html: str
+) -> None:
+    from handlers.offers import _deal_admin_recipient_ids
+
+    row = get_advert_offer_joined(offer_id)
+    seq = int((row or {}).get("seq_in_advert") or offer_id)
+    body = f"{_RTL}{line_html}\nپیشنهاد <b>{seq}</b>"
+    stored = _parse_admin_notify_mids(gate)
+    for chat_id in _deal_admin_recipient_ids():
+        reply_to = stored.get(int(chat_id))
+        try:
+            await bot.send_message(
+                int(chat_id),
+                body,
+                parse_mode=ParseMode.HTML,
+                reply_to_message_id=int(reply_to) if reply_to else None,
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            logger.warning(
+                "deal_notify_admin: chat=%s offer=%s: %s",
+                chat_id,
+                offer_id,
+                e,
+            )
 
 
 async def _forward_buyer_receipt_to_admins(
@@ -826,7 +930,9 @@ async def deal_admin_payment_callback(
             pass
         try:
             await q.message.edit_reply_markup(
-                reply_markup=deal_admin_payment_actions_keyboard(oid)
+                reply_markup=deal_admin_payment_actions_keyboard(
+                    oid, deal_gate_get(oid)
+                )
             )
         except Exception:
             pass
@@ -962,12 +1068,19 @@ async def _admin_send_toman_deposit_card(
         await q.answer(f"✅ برای {party_fa} ارسال شد", show_alert=True)
     except Exception:
         pass
+    gate = deal_gate_get(oid) or gate
     try:
         await q.message.edit_reply_markup(
-            reply_markup=deal_admin_payment_actions_keyboard(oid)
+            reply_markup=deal_admin_payment_actions_keyboard(oid, gate)
         )
     except Exception:
         pass
+    await _show_user_main_menu(
+        context,
+        q.from_user.id,
+        text=f"{_RTL}✅ کارت برای خریدار ارسال شد.",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 def _seller_euro_transfer_rules_html() -> str:
@@ -1003,68 +1116,38 @@ def _seller_buyer_euro_account_message_html(
     )
 
 
-async def deal_admin_send_buyer_eur_account_callback(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """ادمین: ارسال حساب دریافت یوروی خریدار (متن/عکس) به فروشنده."""
-    q = update.callback_query
-    if not q or not q.from_user or not q.message:
-        return
-    if q.from_user.id not in set(ADMIN_IDS or []):
-        try:
-            await q.answer("فقط ادمین", show_alert=True)
-        except Exception:
-            pass
-        return
-
-    parts = (q.data or "").split("|")
-    if len(parts) != 3 or parts[0] != "adm" or parts[1] != "buyeur":
-        return
-
-    try:
-        oid = int(parts[2])
-    except (TypeError, ValueError):
-        return
-
-    gate = deal_gate_get(oid)
-    if not gate or not _deal_gate_allows_admin_payment(gate):
-        try:
-            await q.answer("معامله در این مرحله نیست", show_alert=True)
-        except Exception:
-            pass
-        return
-
+async def _send_buyer_eur_account_to_seller(
+    context: ContextTypes.DEFAULT_TYPE,
+    oid: int,
+    gate: dict,
+    *,
+    q=None,
+) -> bool:
+    """ارسال حساب یوروی خریدار به فروشنده (پس از تأیید تومان نشست)."""
     seller_id = int(gate.get("seller_telegram_id") or 0)
     if not seller_id:
-        try:
+        if q:
             await q.answer("فروشنده نامشخص", show_alert=True)
-        except Exception:
-            pass
-        return
+        return False
 
     buyer_acct = (gate.get("buyer_accounts_text") or "").strip()
     buyer_photo_fid = (gate.get("buyer_accounts_photo_file_id") or "").strip()
     has_text = bool(buyer_acct) and not _account_text_is_photo_marker(buyer_acct)
     has_photo = bool(buyer_photo_fid)
-
     if not has_text and not has_photo:
-        try:
+        if q:
             await q.answer(
                 "خریدار هنوز حساب یورو را برای ربات نفرستاده",
                 show_alert=True,
             )
-        except Exception:
-            pass
-        return
+        return False
 
     row = get_advert_offer_joined(oid)
     advert = get_euro_advert_by_rowid(int(row["advert_rowid"])) if row else None
     if not row or not advert:
-        try:
+        if q:
             await q.answer("پیشنهاد پیدا نشد", show_alert=True)
-        except Exception:
-            pass
-        return
+        return False
 
     from handlers.offers import _offer_effective_euro_amount
 
@@ -1074,10 +1157,8 @@ async def deal_admin_send_buyer_eur_account_callback(
     seq = int(row.get("seq_in_advert") or oid)
     aid = int(row["advert_rowid"])
 
-    try:
-        await q.answer()
-    except Exception:
-        pass
+    if int(gate.get("seller_eur_account_sent_at") or 0) > 0:
+        return True
 
     photo_intro = (
         f"{_RTL}📤 <b>حساب دریافت یورو — خریدار</b>\n\n"
@@ -1096,9 +1177,7 @@ async def deal_admin_send_buyer_eur_account_callback(
         seller_telegram_id=seller_id,
         seller_eur_account_sent_at=int(time.time()),
     )
-    gate = deal_gate_get(oid) or gate
     pay_kb = _seller_euro_pay_keyboard(oid)
-
     from utils.deal_outbound import deal_bot_send_message, deal_bot_send_photo
 
     tag = "حساب یوروی خریدار به فروشنده"
@@ -1141,14 +1220,12 @@ async def deal_admin_send_buyer_eur_account_callback(
             )
         _track_pay_card_msg(user_data_store, seller_id, oid, sent.message_id)
     except Forbidden:
-        try:
+        if q:
             await q.answer(
                 "فروشنده ربات را بلاک کرده یا /start نزده",
                 show_alert=True,
             )
-        except Exception:
-            pass
-        return
+        return False
     except TelegramError as e:
         logger.warning(
             "deal_buyeur: send to seller=%s offer=%s: %s",
@@ -1156,28 +1233,446 @@ async def deal_admin_send_buyer_eur_account_callback(
             oid,
             e,
         )
-        try:
+        if q:
             await q.answer("ارسال به فروشنده ناموفق بود", show_alert=True)
-        except Exception:
-            pass
-        return
+        return False
 
-    _log(
-        oid,
-        "ادمین حساب یوروی خریدار را برای فروشنده ارسال کرد",
-        from_role="admin",
-    )
-    await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
+    _log(oid, "حساب یوروی خریدار برای فروشنده ارسال شد", from_role="admin")
+    return True
+
+
+async def deal_admin_toman_settled_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """ادمین: تومان نشست — ارسال خودکار حساب یورو به فروشنده."""
+    q = update.callback_query
+    if not q or not q.from_user or not q.message:
+        return
+    if q.from_user.id not in set(ADMIN_IDS or []):
+        await q.answer("فقط ادمین", show_alert=True)
+        return
+    parts = (q.data or "").split("|")
+    if len(parts) != 3 or parts[0] != "adm" or parts[1] != "tomset":
+        return
     try:
-        await q.answer("✅ حساب یوروی خریدار برای فروشنده ارسال شد", show_alert=True)
-    except Exception:
-        pass
+        oid = int(parts[2])
+    except (TypeError, ValueError):
+        return
+    gate = deal_gate_get(oid)
+    if not gate or not _deal_gate_allows_admin_payment(gate):
+        await q.answer("معامله در این مرحله نیست", show_alert=True)
+        return
+    if not gate.get("buyer_toman_card_sent_at"):
+        await q.answer("ابتدا کارت واریز به خریدار ارسال شود.", show_alert=True)
+        return
+    now = int(time.time())
+    deal_gate_upsert(
+        offer_id=oid,
+        advert_rowid=int(gate["advert_rowid"]),
+        buyer_telegram_id=int(gate["buyer_telegram_id"]),
+        seller_telegram_id=int(gate["seller_telegram_id"]),
+        buyer_toman_settled_at=now,
+    )
+    gate = deal_gate_get(oid) or gate
+    _log(oid, "ادمین تأیید کرد: تومان نشست", from_role="admin")
+    await _notify_admins_deal_line(
+        context.bot,
+        offer_id=oid,
+        gate=gate,
+        line_html="💵 <b>تومان نشست</b> — تأیید ادمین",
+    )
+    ok = await _send_buyer_eur_account_to_seller(context, oid, gate, q=q)
+    if not ok:
+        return
+    await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
+    await q.answer("✅ تومان نشست — حساب یورو برای فروشنده ارسال شد", show_alert=True)
     try:
         await q.message.edit_reply_markup(
-            reply_markup=deal_admin_payment_actions_keyboard(oid)
+            reply_markup=deal_admin_payment_actions_keyboard(
+                oid, deal_gate_get(oid)
+            )
         )
     except Exception:
         pass
+    await _show_user_main_menu(
+        context,
+        q.from_user.id,
+        text=f"{_RTL}✅ <b>تومان نشست</b> ثبت شد.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def deal_admin_send_buyer_eur_account_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """دکمهٔ قدیمی — هدایت به «تومان نشست»."""
+    q = update.callback_query
+    if not q or not q.from_user:
+        return
+    if q.from_user.id not in set(ADMIN_IDS or []):
+        await q.answer("فقط ادمین", show_alert=True)
+        return
+    parts = (q.data or "").split("|")
+    if len(parts) != 3 or parts[0] != "adm" or parts[1] != "buyeur":
+        return
+    try:
+        oid = int(parts[2])
+    except (TypeError, ValueError):
+        return
+    gate = deal_gate_get(oid)
+    if not gate:
+        await q.answer("معامله پیدا نشد", show_alert=True)
+        return
+    if int(gate.get("buyer_toman_settled_at") or 0) > 0:
+        await _send_buyer_eur_account_to_seller(context, oid, gate, q=q)
+        await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
+        await q.answer("حساب یورو قبلاً یا همین الان برای فروشنده ارسال شد", show_alert=True)
+        return
+    await q.answer(
+        "از دکمهٔ «تومان نشست» استفاده کنید (پس از فیش خریدار).",
+        show_alert=True,
+    )
+
+
+async def _apply_euro_settled(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    offer_id: int,
+    receipt_index: int,
+    confirmed_by: str,
+    answer_query=None,
+) -> None:
+    gate = deal_gate_get(offer_id)
+    if not gate:
+        if answer_query:
+            await answer_query.answer("معامله پیدا نشد", show_alert=True)
+        return
+    items = deal_gate_seller_receipt_list(offer_id)
+    if not items:
+        if answer_query:
+            await answer_query.answer("فیشی ثبت نشده", show_alert=True)
+        return
+    if not deal_gate_confirm_seller_receipt_buyer(
+        offer_id, receipt_index, confirmed_by=confirmed_by
+    ):
+        if answer_query:
+            await answer_query.answer("فیش نامعتبر", show_alert=True)
+        return
+    gate = deal_gate_get(offer_id) or gate
+    role = "buyer" if confirmed_by == "buyer" else "admin"
+    who = "خریدار" if confirmed_by == "buyer" else "ادمین"
+    _log(offer_id, "تأیید شد: یورو نشست", from_role=role)
+    seller_id = int(gate.get("seller_telegram_id") or 0)
+    row = get_advert_offer_joined(offer_id)
+    seq = int((row or {}).get("seq_in_advert") or offer_id)
+    if seller_id:
+        from utils.deal_outbound import deal_bot_send_message
+
+        try:
+            await deal_bot_send_message(
+                context.bot,
+                offer_id=offer_id,
+                chat_id=seller_id,
+                party="seller",
+                tag="تأیید نشستن یورو",
+                text=(
+                    f"{_RTL}✅ <b>یورو نشست</b>\n\n"
+                    f"{_RTL}پیشنهاد <b>{seq}</b>\n"
+                    f"{_RTL}{who} تأیید کرد مبلغ یورو به حساب خریدار "
+                    f"واریز شده است."
+                ),
+                disable_web_page_preview=True,
+            )
+            await _show_user_main_menu(
+                context,
+                seller_id,
+                text=f"{_RTL}✅ یورو نشست — منتظر واریز تومان از ادمین باشید.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            logger.warning(
+                "deal_eurset: notify seller=%s offer=%s: %s",
+                seller_id,
+                offer_id,
+                e,
+            )
+    await _notify_admins_deal_line(
+        context.bot,
+        offer_id=offer_id,
+        gate=gate,
+        line_html=f"💶 <b>یورو نشست</b> — تأیید {who}",
+    )
+    await sync_deal_admin_notification(context.bot, offer_id, deal_complete=True)
+    if answer_query:
+        try:
+            await answer_query.answer("✅ یورو نشست ثبت شد", show_alert=True)
+        except Exception:
+            pass
+        try:
+            if answer_query.message:
+                await answer_query.message.edit_reply_markup(reply_markup=None)
+                note = f"{_RTL}✅ <b>تأیید شد:</b> یورو به حساب نشست."
+                if answer_query.message.caption is not None:
+                    cap = (answer_query.message.caption or "") + f"\n\n{note}"
+                    await answer_query.message.edit_caption(
+                        caption=cap[:1024],
+                        parse_mode=ParseMode.HTML,
+                    )
+                elif answer_query.message.text:
+                    await answer_query.message.edit_text(
+                        (answer_query.message.text or "") + f"\n\n{note}",
+                        parse_mode=ParseMode.HTML,
+                    )
+        except Exception:
+            pass
+        await _show_user_main_menu(
+            context,
+            answer_query.from_user.id,
+            text=f"{_RTL}✅ تأیید یورو ثبت شد.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def deal_admin_euro_settled_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """ادمین: تأیید یورو نشست به‌جای خریدار."""
+    q = update.callback_query
+    if not q or not q.from_user:
+        return
+    if q.from_user.id not in set(ADMIN_IDS or []):
+        await q.answer("فقط ادمین", show_alert=True)
+        return
+    parts = (q.data or "").split("|")
+    if len(parts) != 4 or parts[0] != "adm" or parts[1] != "eurcfm":
+        return
+    try:
+        oid = int(parts[2])
+        ridx = int(parts[3])
+    except (TypeError, ValueError):
+        return
+    gate = deal_gate_get(oid)
+    if not gate or not _deal_gate_allows_admin_payment(gate):
+        await q.answer("معامله در این مرحله نیست", show_alert=True)
+        return
+    await _apply_euro_settled(
+        context,
+        offer_id=oid,
+        receipt_index=ridx,
+        confirmed_by="admin",
+        answer_query=q,
+    )
+    try:
+        if q.message:
+            await q.message.edit_reply_markup(
+                reply_markup=deal_admin_payment_actions_keyboard(
+                    oid, deal_gate_get(oid)
+                )
+            )
+    except Exception:
+        pass
+
+
+def _admin_seller_toman_prompt_keyboard(offer_id: int) -> InlineKeyboardMarkup:
+    oid = int(offer_id)
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "❌ انصراف",
+                    callback_data=f"adm|stom|{oid}|cancel",
+                )
+            ],
+        ]
+    )
+
+
+def _clear_deal_admin_stom_pending(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop(_DEAL_ADMIN_STOM_KEY, None)
+
+
+async def deal_admin_seller_toman_receipt_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """ادمین: شروع ارسال فیش تومان به فروشنده."""
+    q = update.callback_query
+    if not q or not q.from_user:
+        return
+    if q.from_user.id not in set(ADMIN_IDS or []):
+        await q.answer("فقط ادمین", show_alert=True)
+        return
+    parts = (q.data or "").split("|")
+    if len(parts) < 4 or parts[0] != "adm" or parts[1] != "stom":
+        return
+    try:
+        oid = int(parts[2])
+    except (TypeError, ValueError):
+        return
+    action = parts[3]
+    gate = deal_gate_get(oid)
+    if not gate or not _deal_gate_allows_admin_payment(gate):
+        await q.answer("معامله در این مرحله نیست", show_alert=True)
+        return
+    from handlers.offers import _seller_euro_fully_confirmed_gate
+
+    if not _seller_euro_fully_confirmed_gate(gate):
+        await q.answer("ابتدا یورو باید نشست تأیید شود.", show_alert=True)
+        return
+    uid = q.from_user.id
+    if action == "cancel":
+        await q.answer("انصراف")
+        _clear_deal_admin_stom_pending(context)
+        await _purge_rcpt_prompt_msgs(context.bot, user_data_store, uid, oid)
+        await _show_user_main_menu(context, uid)
+        return
+    if action != "go":
+        await q.answer()
+        return
+    await q.answer()
+    context.user_data[_DEAL_ADMIN_STOM_KEY] = {"offer_id": oid}
+    try:
+        sent = await context.bot.send_message(
+            uid,
+            f"{_RTL}📎 <b>فیش واریز تومان به فروشنده</b>\n\n"
+            f"{_RTL}عکس یا متن فیش را بفرستید (چند فیش مجاز است).",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_admin_seller_toman_prompt_keyboard(oid),
+        )
+        _track_rcpt_prompt_msg(user_data_store, uid, oid, sent.message_id)
+    except Exception:
+        logger.exception("deal_stom: prompt failed offer=%s", oid)
+
+
+async def _deal_admin_stom_try_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    if not update.message or not update.effective_user:
+        return False
+    pending = context.user_data.get(_DEAL_ADMIN_STOM_KEY)
+    if not isinstance(pending, dict):
+        return False
+    if update.effective_user.id not in set(ADMIN_IDS or []):
+        return False
+    oid = int(pending.get("offer_id") or 0)
+    gate = deal_gate_get(oid)
+    if not gate:
+        _clear_deal_admin_stom_pending(context)
+        return False
+    text = (update.message.text or "").strip()
+    if not text or len(text) < 2:
+        await update.message.reply_text(f"{_RTL}متن فیش را کامل‌تر بفرستید.")
+        return True
+    seller_id = int(gate.get("seller_telegram_id") or 0)
+    deal_gate_append_seller_toman_admin(oid, entry_type="text", text=text)
+    gate = deal_gate_get(oid) or gate
+    row = get_advert_offer_joined(oid)
+    seq = int((row or {}).get("seq_in_advert") or oid)
+    from utils.deal_outbound import deal_bot_send_message
+
+    body = (
+        f"{_RTL}💳 <b>فیش واریز تومان</b>\n\n"
+        f"{_RTL}پیشنهاد <b>{seq}</b>\n\n"
+        f"{_RTL}ادمین فیش واریز تومان به شما را ارسال کرد:\n\n"
+        f"<pre>{html_module.escape(text[:3500])}</pre>"
+    )
+    try:
+        await deal_bot_send_message(
+            context.bot,
+            offer_id=oid,
+            chat_id=seller_id,
+            party="seller",
+            tag="فیش تومان از ادمین",
+            text=body,
+            disable_web_page_preview=True,
+        )
+        await _show_user_main_menu(
+            context,
+            seller_id,
+            text=f"{_RTL}✅ فیش واریز تومان از ادمین دریافت شد.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.warning("deal_stom: send seller=%s: %s", seller_id, e)
+    _log(oid, "ادمین فیش تومان برای فروشنده فرستاد (متن)", from_role="admin")
+    await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
+    uid = update.effective_user.id
+    _track_rcpt_prompt_msg(user_data_store, uid, oid, update.message.message_id)
+    _clear_deal_admin_stom_pending(context)
+    await _purge_rcpt_prompt_msgs(context.bot, user_data_store, uid, oid)
+    await _show_user_main_menu(
+        context,
+        uid,
+        text=f"{_RTL}✅ فیش برای فروشنده ارسال شد.",
+        parse_mode=ParseMode.HTML,
+    )
+    return True
+
+
+async def _deal_admin_stom_try_photo(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    if not update.message or not update.effective_user:
+        return False
+    pending = context.user_data.get(_DEAL_ADMIN_STOM_KEY)
+    if not isinstance(pending, dict):
+        return False
+    if update.effective_user.id not in set(ADMIN_IDS or []):
+        return False
+    oid = int(pending.get("offer_id") or 0)
+    gate = deal_gate_get(oid)
+    if not gate:
+        _clear_deal_admin_stom_pending(context)
+        return False
+    fid = _extract_account_image_file_id(update.message)
+    if not fid:
+        return False
+    cap = (update.message.caption or "").strip()
+    seller_id = int(gate.get("seller_telegram_id") or 0)
+    deal_gate_append_seller_toman_admin(
+        oid, entry_type="photo", text=cap, file_id=fid
+    )
+    row = get_advert_offer_joined(oid)
+    seq = int((row or {}).get("seq_in_advert") or oid)
+    from utils.deal_outbound import deal_bot_send_photo
+
+    body = (
+        f"{_RTL}💳 <b>فیش واریز تومان</b>\n\n"
+        f"{_RTL}پیشنهاد <b>{seq}</b>\n\n"
+        f"{_RTL}ادمین فیش واریز تومان به شما را ارسال کرد."
+    )
+    if cap:
+        body += f"\n\n<i>{html_module.escape(cap[:400])}</i>"
+    try:
+        await deal_bot_send_photo(
+            context.bot,
+            offer_id=oid,
+            chat_id=seller_id,
+            party="seller",
+            tag="فیش تومان از ادمین",
+            photo_file_id=fid,
+            caption=_photo_caption_html(body),
+        )
+        await _show_user_main_menu(
+            context,
+            seller_id,
+            text=f"{_RTL}✅ فیش واریز تومان از ادمین دریافت شد.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.warning("deal_stom: photo to seller=%s: %s", seller_id, e)
+    _log(oid, "ادمین فیش تومان برای فروشنده فرستاد (عکس)", from_role="admin")
+    await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
+    uid = update.effective_user.id
+    _track_rcpt_prompt_msg(user_data_store, uid, oid, update.message.message_id)
+    _clear_deal_admin_stom_pending(context)
+    await _purge_rcpt_prompt_msgs(context.bot, user_data_store, uid, oid)
+    await _show_user_main_menu(
+        context,
+        uid,
+        text=f"{_RTL}✅ فیش برای فروشنده ارسال شد.",
+        parse_mode=ParseMode.HTML,
+    )
+    return True
 
 
 async def deal_admin_view_outbound_logs_callback(
@@ -1620,7 +2115,9 @@ def _deal_gate_admin_detail_keyboard(offer_id: int, gate: dict | None = None) ->
 
 def _deal_gate_admin_completed_keyboard(offer_id: int) -> InlineKeyboardMarkup:
     oid = int(offer_id)
-    rows = list(deal_admin_payment_actions_keyboard(oid).inline_keyboard)
+    rows = list(
+        deal_admin_payment_actions_keyboard(oid, gate).inline_keyboard
+    )
     rows.append(
         [
             InlineKeyboardButton(
@@ -2194,27 +2691,17 @@ async def _finish_buyer_receipt_flow(
     offer_id: int,
     gate: dict,
 ) -> None:
-    from models.enums import UserState
-    from utils.telegram_utils import send_or_replace_main_menu
-
     _clear_deal_receipt_pending(context)
     await _purge_rcpt_prompt_msgs(context.bot, user_data_store, uid, offer_id)
-    await send_or_replace_main_menu(
-        context.bot,
-        chat_id=uid,
-        user_id=uid,
-        store=user_data_store,
+    await _show_user_main_menu(
+        context,
+        uid,
         text=(
             f"{_RTL}✅ <b>فیش به ادمین رسید.</b>\n\n"
-            f"{_RTL}برای ارسال فیش دیگر، دوباره از همان پیام "
-            f"«ارسال فیش واریزی» استفاده کنید یا با ادمین هماهنگ کنید."
+            f"{_RTL}برای فیش دیگر، دوباره «ارسال فیش واریزی» را بزنید."
         ),
         parse_mode=ParseMode.HTML,
     )
-    try:
-        context.application.user_data[uid]["state"] = UserState.MAIN_MENU.name
-    except Exception:
-        pass
 
 
 async def _finish_seller_receipt_flow(
@@ -2223,27 +2710,17 @@ async def _finish_seller_receipt_flow(
     uid: int,
     offer_id: int,
 ) -> None:
-    from models.enums import UserState
-    from utils.telegram_utils import send_or_replace_main_menu
-
     _clear_deal_receipt_pending(context)
     await _purge_rcpt_prompt_msgs(context.bot, user_data_store, uid, offer_id)
-    await send_or_replace_main_menu(
-        context.bot,
-        chat_id=uid,
-        user_id=uid,
-        store=user_data_store,
+    await _show_user_main_menu(
+        context,
+        uid,
         text=(
             f"{_RTL}✅ <b>فیش یورو به ادمین رسید.</b>\n\n"
-            f"{_RTL}برای فیش بعدی، دوباره «ارسال فیش واریزی یورو» "
-            f"را از همان پیام حساب بزنید."
+            f"{_RTL}برای فیش بعدی، «ارسال فیش واریزی یورو» را بزنید."
         ),
         parse_mode=ParseMode.HTML,
     )
-    try:
-        context.application.user_data[uid]["state"] = UserState.MAIN_MENU.name
-    except Exception:
-        pass
 
 
 async def _handle_deal_receipt_callback(
@@ -2270,20 +2747,7 @@ async def _handle_deal_receipt_callback(
         await _purge_buyer_pay_on_cancel(
             context.bot, user_data_store, uid, offer_id, gate
         )
-        from models.enums import UserState
-        from utils.telegram_utils import send_or_replace_main_menu
-
-        await send_or_replace_main_menu(
-            context.bot,
-            chat_id=uid,
-            user_id=uid,
-            store=user_data_store,
-            text=f"{_RTL}🏠 منوی اصلی:",
-        )
-        try:
-            context.application.user_data[uid]["state"] = UserState.MAIN_MENU.name
-        except Exception:
-            pass
+        await _show_user_main_menu(context, uid)
         return
 
     if action != "go":
@@ -2329,7 +2793,10 @@ async def _handle_deal_seller_receipt_callback(
         await q.answer("فقط فروشنده این معامله", show_alert=True)
         return
     if not gate.get("seller_eur_account_sent_at"):
-        await q.answer("ابتدا ادمین حساب یورو را ارسال کند.", show_alert=True)
+        await q.answer(
+            "ادمین هنوز «تومان نشست» را تأیید نکرده.",
+            show_alert=True,
+        )
         return
 
     if action == "cancel":
@@ -2338,20 +2805,7 @@ async def _handle_deal_seller_receipt_callback(
         await _purge_buyer_pay_on_cancel(
             context.bot, user_data_store, uid, offer_id, gate
         )
-        from models.enums import UserState
-        from utils.telegram_utils import send_or_replace_main_menu
-
-        await send_or_replace_main_menu(
-            context.bot,
-            chat_id=uid,
-            user_id=uid,
-            store=user_data_store,
-            text=f"{_RTL}🏠 منوی اصلی:",
-        )
-        try:
-            context.application.user_data[uid]["state"] = UserState.MAIN_MENU.name
-        except Exception:
-            pass
+        await _show_user_main_menu(context, uid)
         return
 
     if action != "go":
@@ -2397,37 +2851,13 @@ async def _handle_buyer_euro_settled_callback(
     if not gate or int(gate.get("buyer_telegram_id") or 0) != uid:
         await q.answer("فقط خریدار این معامله", show_alert=True)
         return
-    items = deal_gate_seller_receipt_list(offer_id)
-    if not items:
-        await q.answer("فیشی ثبت نشده", show_alert=True)
-        return
-    if not deal_gate_confirm_seller_receipt_buyer(offer_id, receipt_index):
-        await q.answer("فیش نامعتبر", show_alert=True)
-        return
-    gate = deal_gate_get(offer_id) or gate
-    _log(offer_id, "خریدار تأیید کرد: یورو نشست", from_role="buyer")
-    await sync_deal_admin_notification(context.bot, offer_id, deal_complete=True)
-    try:
-        await q.answer("✅ تأیید شما ثبت شد", show_alert=True)
-    except Exception:
-        pass
-    try:
-        if q.message:
-            await q.message.edit_reply_markup(reply_markup=None)
-            note = f"{_RTL}✅ <b>تأیید شد:</b> یورو به حساب نشست."
-            if q.message.caption is not None:
-                cap = (q.message.caption or "") + f"\n\n{note}"
-                await q.message.edit_caption(
-                    caption=cap[:1024],
-                    parse_mode=ParseMode.HTML,
-                )
-            elif q.message.text:
-                await q.message.edit_text(
-                    (q.message.text or "") + f"\n\n{note}",
-                    parse_mode=ParseMode.HTML,
-                )
-    except Exception:
-        pass
+    await _apply_euro_settled(
+        context,
+        offer_id=offer_id,
+        receipt_index=receipt_index,
+        confirmed_by="buyer",
+        answer_query=q,
+    )
 
 
 async def _deal_receipt_try_message(
@@ -2584,6 +3014,8 @@ async def _deal_receipt_try_photo(
 async def deal_gate_group0_text_router(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
+    if await _deal_admin_stom_try_message(update, context):
+        raise ApplicationHandlerStop
     if await _deal_receipt_try_message(update, context):
         raise ApplicationHandlerStop
     await deal_gate_accounts_router(update, context)
@@ -2592,6 +3024,8 @@ async def deal_gate_group0_text_router(
 async def deal_gate_group0_photo_router(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
+    if await _deal_admin_stom_try_photo(update, context):
+        raise ApplicationHandlerStop
     if await _deal_receipt_try_photo(update, context):
         raise ApplicationHandlerStop
     await deal_gate_accounts_photo_router(update, context)

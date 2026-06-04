@@ -348,6 +348,8 @@ def ensure_schema() -> None:
             "buyer_toman_card_sent_at",
             "seller_receipt_log",
             "seller_eur_account_sent_at",
+            "buyer_toman_settled_at",
+            "seller_toman_admin_log",
         ):
             try:
                 cur.execute(
@@ -2576,6 +2578,8 @@ def deal_gate_upsert(
             "buyer_toman_card_sent_at",
             "seller_receipt_log",
             "seller_eur_account_sent_at",
+            "buyer_toman_settled_at",
+            "seller_toman_admin_log",
         }
         for key, val in fields.items():
             if key not in allowed:
@@ -2687,9 +2691,12 @@ def deal_gate_append_seller_receipt(
 
 
 def deal_gate_confirm_seller_receipt_buyer(
-    offer_id: int, receipt_index: int
+    offer_id: int,
+    receipt_index: int,
+    *,
+    confirmed_by: str = "buyer",
 ) -> bool:
-    """خریدار «یورو نشست» را برای یک فیش ثبت می‌کند."""
+    """ثبت تأیید «یورو نشست» برای یک فیش فروشنده (خریدار یا ادمین)."""
     import json
 
     gate = deal_gate_get(offer_id)
@@ -2704,7 +2711,11 @@ def deal_gate_confirm_seller_receipt_buyer(
         return False
     if int(items[idx].get("buyer_confirmed_at") or 0) > 0:
         return True
+    by = (confirmed_by or "buyer").strip().lower()
+    if by not in ("buyer", "admin"):
+        by = "buyer"
     items[idx]["buyer_confirmed_at"] = int(time.time())
+    items[idx]["confirmed_by"] = by
     oid = int(offer_id)
     deal_gate_upsert(
         offer_id=oid,
@@ -2714,6 +2725,55 @@ def deal_gate_confirm_seller_receipt_buyer(
         seller_receipt_log=json.dumps(items, ensure_ascii=False),
     )
     return True
+
+
+def _deal_gate_seller_toman_admin_list_raw(gate: dict | None) -> list:
+    import json
+
+    raw = (gate or {}).get("seller_toman_admin_log") or "[]"
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def deal_gate_seller_toman_admin_list(offer_id: int) -> list[dict]:
+    gate = deal_gate_get(offer_id)
+    return _deal_gate_seller_toman_admin_list_raw(gate)
+
+
+def deal_gate_append_seller_toman_admin(
+    offer_id: int,
+    *,
+    entry_type: str,
+    text: str = "",
+    file_id: str = "",
+) -> list[dict]:
+    """فیش واریز تومان ادمین به فروشنده."""
+    import json
+
+    gate = deal_gate_get(offer_id)
+    if not gate:
+        return []
+    items = _deal_gate_seller_toman_admin_list_raw(gate)
+    items.append(
+        {
+            "type": (entry_type or "text").strip().lower(),
+            "text": (text or "")[:2000],
+            "file_id": (file_id or "").strip()[:256],
+            "at": int(time.time()),
+        }
+    )
+    oid = int(offer_id)
+    deal_gate_upsert(
+        offer_id=oid,
+        advert_rowid=int(gate["advert_rowid"]),
+        buyer_telegram_id=int(gate["buyer_telegram_id"]),
+        seller_telegram_id=int(gate["seller_telegram_id"]),
+        seller_toman_admin_log=json.dumps(items, ensure_ascii=False),
+    )
+    return items
 
 
 def deal_gate_delete(offer_id: int) -> None:

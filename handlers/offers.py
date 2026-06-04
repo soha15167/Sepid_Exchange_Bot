@@ -2294,8 +2294,16 @@ def _buyer_toman_receipt_admin_line_html(gate: dict | None) -> str:
     oid = int(gate.get("offer_id") or 0)
     items = deal_gate_buyer_receipt_list(oid) if oid else []
     if not items:
-        return f"{_RTL}📎 <b>فیش واریز تومان:</b> ⏳ در انتظار\n"
-    lines = [f"{_RTL}📎 <b>فیش واریز تومان:</b> <b>{len(items)}</b> مورد ✅"]
+        blk = f"{_RTL}📎 <b>فیش واریز تومان:</b> ⏳ در انتظار\n"
+    else:
+        blk = f"{_RTL}📎 <b>فیش واریز تومان:</b> <b>{len(items)}</b> مورد ✅\n"
+    if int(gate.get("buyer_toman_settled_at") or 0) > 0:
+        blk += f"{_RTL}💵 <b>تومان نشست:</b> ✅ تأیید ادمین\n"
+    elif items:
+        blk += f"{_RTL}💵 <b>تومان نشست:</b> ⏳\n"
+    if not items:
+        return blk
+    lines = [blk.rstrip("\n")]
     for r in items[-2:]:
         if (r.get("type") or "") == "text" and (r.get("text") or "").strip():
             t = (r.get("text") or "").strip()[:120]
@@ -2320,13 +2328,13 @@ def _seller_euro_receipt_admin_line_html(gate: dict | None) -> str:
         f"{_RTL}📎 <b>فیش واریز یورو (فروشنده):</b> <b>{len(items)}</b> مورد ✅"
     ]
     if confirmed >= len(items):
-        lines.append(f"{_RTL}💶 <b>یورو نشست:</b> ✅ تأیید خریدار")
+        lines.append(f"{_RTL}💶 <b>یورو نشست:</b> ✅ تأیید شده")
     elif confirmed > 0:
         lines.append(
-            f"{_RTL}💶 <b>یورو نشست:</b> {confirmed}/{len(items)} تأیید خریدار"
+            f"{_RTL}💶 <b>یورو نشست:</b> {confirmed}/{len(items)} تأیید"
         )
     else:
-        lines.append(f"{_RTL}💶 <b>یورو نشست:</b> ⏳ در انتظار تأیید خریدار")
+        lines.append(f"{_RTL}💶 <b>یورو نشست:</b> ⏳ در انتظار تأیید")
     for r in items[-2:]:
         if (r.get("type") or "") == "text" and (r.get("text") or "").strip():
             t = (r.get("text") or "").strip()[:120]
@@ -2338,6 +2346,42 @@ def _seller_euro_receipt_admin_line_html(gate: dict | None) -> str:
             mark = " ✅ نشست" if int(r.get("buyer_confirmed_at") or 0) > 0 else ""
             lines.append(f"{_RTL}  · 📷 عکس فیش{mark}")
     return "\n".join(lines) + "\n"
+
+
+def _seller_toman_admin_receipt_line_html(gate: dict | None) -> str:
+    """فیش تومان ادمین به فروشنده — زیر بخش خریدار در پیام ادمین."""
+    from database.db import deal_gate_seller_toman_admin_list
+
+    if not gate:
+        return ""
+    oid = int(gate.get("offer_id") or 0)
+    items = deal_gate_seller_toman_admin_list(oid) if oid else []
+    if not items:
+        if not _seller_euro_fully_confirmed_gate(gate):
+            return ""
+        return f"{_RTL}📎 <b>فیش تومان به فروشنده:</b> ⏳ در انتظار\n"
+    lines = [
+        f"{_RTL}📎 <b>فیش تومان به فروشنده:</b> <b>{len(items)}</b> مورد ✅"
+    ]
+    for r in items[-2:]:
+        if (r.get("type") or "") == "text" and (r.get("text") or "").strip():
+            t = (r.get("text") or "").strip()[:120]
+            lines.append(f"{_RTL}  · <code>{html_module.escape(t)}</code>")
+        elif (r.get("type") or "") == "photo":
+            lines.append(f"{_RTL}  · 📷 عکس فیش")
+    return "\n".join(lines) + "\n"
+
+
+def _seller_euro_fully_confirmed_gate(gate: dict | None) -> bool:
+    from database.db import deal_gate_seller_receipt_list
+
+    if not gate or not gate.get("seller_eur_account_sent_at"):
+        return False
+    oid = int(gate.get("offer_id") or 0)
+    items = deal_gate_seller_receipt_list(oid) if oid else []
+    if not items:
+        return False
+    return all(int(r.get("buyer_confirmed_at") or 0) > 0 for r in items)
 
 
 def _post_acceptance_admin_message_html(
@@ -2426,10 +2470,13 @@ def _post_acceptance_admin_message_html(
         euro_rcpt_blk = (
             _seller_euro_receipt_admin_line_html(gate) if deal_complete else ""
         )
+        stom_blk = (
+            _seller_toman_admin_receipt_line_html(gate) if deal_complete else ""
+        )
         foot = ""
         if deal_complete:
             foot = f"\n{_RTL}✅ آماده هماهنگی ادمین"
-        return hdr + buyer_sec + receipt_blk + euro_rcpt_blk + seller_sec + foot
+        return hdr + buyer_sec + receipt_blk + euro_rcpt_blk + stom_blk + seller_sec + foot
 
     ad_link = advert_public_link_html(advert, aid)
     amt_line = _offer_amount_line_html(advert, pe_kw)

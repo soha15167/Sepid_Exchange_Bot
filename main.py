@@ -140,8 +140,11 @@ from handlers.channel_info import (
 )
 from handlers.deal_gate import (
     admin_deal_gate_account_photo_router,
+    deal_admin_euro_settled_callback,
     deal_admin_payment_callback,
+    deal_admin_seller_toman_receipt_callback,
     deal_admin_send_buyer_eur_account_callback,
+    deal_admin_toman_settled_callback,
     deal_admin_view_outbound_logs_callback,
     deal_gate_accounts_photo_router,
     deal_gate_accounts_router,
@@ -711,6 +714,24 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_service_operation_callback, pattern="^service_op_"))
     application.add_handler(CallbackQueryHandler(handle_inline_cancel_callback, pattern="^inline_cancel$"))
     application.add_handler(CallbackQueryHandler(deal_admin_payment_callback, pattern=r"^adm\|pay\|"))
+    application.add_handler(
+        CallbackQueryHandler(
+            deal_admin_toman_settled_callback,
+            pattern=r"^adm\|tomset\|",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            deal_admin_euro_settled_callback,
+            pattern=r"^adm\|eurcfm\|",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            deal_admin_seller_toman_receipt_callback,
+            pattern=r"^adm\|stom\|",
+        )
+    )
     application.add_handler(
         CallbackQueryHandler(
             deal_admin_send_buyer_eur_account_callback,
