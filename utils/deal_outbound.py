@@ -95,12 +95,14 @@ async def deal_bot_send_photo(
     photo_file_id: str,
     caption: str | None = None,
     parse_mode: str | None = ParseMode.HTML,
+    reply_markup=None,
 ):
     sent = await bot.send_photo(
         int(chat_id),
         photo_file_id,
         caption=caption,
         parse_mode=parse_mode,
+        reply_markup=reply_markup,
     )
     try:
         bot_outbound_log_insert(

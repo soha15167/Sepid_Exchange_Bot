@@ -146,6 +146,8 @@ from handlers.deal_gate import (
     deal_gate_accounts_photo_router,
     deal_gate_accounts_router,
     deal_gate_callback,
+    deal_gate_group0_photo_router,
+    deal_gate_group0_text_router,
 )
 from handlers.error_handler import global_error_handler
 from handlers.access_gate import (
@@ -670,7 +672,7 @@ def main():
         & ~filters.COMMAND
     )
     # PTB: فقط یک handler در هر group اجرا می‌شود — deal_gate و wizard باید group جدا باشند.
-    application.add_handler(MessageHandler(_private_text, deal_gate_accounts_router), group=0)
+    application.add_handler(MessageHandler(_private_text, deal_gate_group0_text_router), group=0)
     application.add_handler(MessageHandler(_private_text, wizard_text_router), group=1)
     application.add_handler(MessageHandler(_iran_fill_text, iran_panel_fill_router), group=2)
     application.add_handler(
@@ -678,7 +680,7 @@ def main():
         group=3,
     )
     application.add_handler(
-        MessageHandler(_iran_receipt_media, deal_gate_accounts_photo_router),
+        MessageHandler(_iran_receipt_media, deal_gate_group0_photo_router),
         group=4,
     )
     application.add_handler(

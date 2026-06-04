@@ -344,6 +344,10 @@ def ensure_schema() -> None:
             "buyer_accounts_photo_file_id",
             "seller_accounts_photo_file_id",
             "admin_notify_photo_mids",
+            "buyer_receipt_log",
+            "buyer_toman_card_sent_at",
+            "seller_receipt_log",
+            "seller_eur_account_sent_at",
         ):
             try:
                 cur.execute(
@@ -2568,6 +2572,10 @@ def deal_gate_upsert(
             "completed_at",
             "admin_notify_mids",
             "admin_notify_photo_mids",
+            "buyer_receipt_log",
+            "buyer_toman_card_sent_at",
+            "seller_receipt_log",
+            "seller_eur_account_sent_at",
         }
         for key, val in fields.items():
             if key not in allowed:
@@ -2577,6 +2585,135 @@ def deal_gate_upsert(
                 (val, oid),
             )
         conn.commit()
+
+
+def _deal_gate_receipt_list_raw(gate: dict | None) -> list:
+    import json
+
+    raw = (gate or {}).get("buyer_receipt_log") or "[]"
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def deal_gate_buyer_receipt_list(offer_id: int) -> list[dict]:
+    gate = deal_gate_get(offer_id)
+    return _deal_gate_receipt_list_raw(gate)
+
+
+def deal_gate_append_buyer_receipt(
+    offer_id: int,
+    *,
+    entry_type: str,
+    text: str = "",
+    file_id: str = "",
+) -> list[dict]:
+    """یک فیش واریز خریدار — برمی‌گرداند لیست کامل."""
+    import json
+
+    gate = deal_gate_get(offer_id)
+    if not gate:
+        return []
+    items = _deal_gate_receipt_list_raw(gate)
+    items.append(
+        {
+            "type": (entry_type or "text").strip().lower(),
+            "text": (text or "")[:2000],
+            "file_id": (file_id or "").strip()[:256],
+            "at": int(time.time()),
+        }
+    )
+    oid = int(offer_id)
+    deal_gate_upsert(
+        offer_id=oid,
+        advert_rowid=int(gate["advert_rowid"]),
+        buyer_telegram_id=int(gate["buyer_telegram_id"]),
+        seller_telegram_id=int(gate["seller_telegram_id"]),
+        buyer_receipt_log=json.dumps(items, ensure_ascii=False),
+    )
+    return items
+
+
+def _deal_gate_seller_receipt_list_raw(gate: dict | None) -> list:
+    import json
+
+    raw = (gate or {}).get("seller_receipt_log") or "[]"
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def deal_gate_seller_receipt_list(offer_id: int) -> list[dict]:
+    gate = deal_gate_get(offer_id)
+    return _deal_gate_seller_receipt_list_raw(gate)
+
+
+def deal_gate_append_seller_receipt(
+    offer_id: int,
+    *,
+    entry_type: str,
+    text: str = "",
+    file_id: str = "",
+) -> list[dict]:
+    """یک فیش واریز یورو فروشنده — برمی‌گرداند لیست کامل."""
+    import json
+
+    gate = deal_gate_get(offer_id)
+    if not gate:
+        return []
+    items = _deal_gate_seller_receipt_list_raw(gate)
+    items.append(
+        {
+            "type": (entry_type or "text").strip().lower(),
+            "text": (text or "")[:2000],
+            "file_id": (file_id or "").strip()[:256],
+            "at": int(time.time()),
+            "buyer_confirmed_at": 0,
+        }
+    )
+    oid = int(offer_id)
+    deal_gate_upsert(
+        offer_id=oid,
+        advert_rowid=int(gate["advert_rowid"]),
+        buyer_telegram_id=int(gate["buyer_telegram_id"]),
+        seller_telegram_id=int(gate["seller_telegram_id"]),
+        seller_receipt_log=json.dumps(items, ensure_ascii=False),
+    )
+    return items
+
+
+def deal_gate_confirm_seller_receipt_buyer(
+    offer_id: int, receipt_index: int
+) -> bool:
+    """خریدار «یورو نشست» را برای یک فیش ثبت می‌کند."""
+    import json
+
+    gate = deal_gate_get(offer_id)
+    if not gate:
+        return False
+    items = _deal_gate_seller_receipt_list_raw(gate)
+    try:
+        idx = int(receipt_index)
+    except (TypeError, ValueError):
+        return False
+    if idx < 0 or idx >= len(items):
+        return False
+    if int(items[idx].get("buyer_confirmed_at") or 0) > 0:
+        return True
+    items[idx]["buyer_confirmed_at"] = int(time.time())
+    oid = int(offer_id)
+    deal_gate_upsert(
+        offer_id=oid,
+        advert_rowid=int(gate["advert_rowid"]),
+        buyer_telegram_id=int(gate["buyer_telegram_id"]),
+        seller_telegram_id=int(gate["seller_telegram_id"]),
+        seller_receipt_log=json.dumps(items, ensure_ascii=False),
+    )
+    return True
 
 
 def deal_gate_delete(offer_id: int) -> None:
