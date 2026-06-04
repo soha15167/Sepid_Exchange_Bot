@@ -2286,8 +2286,9 @@ def _post_acceptance_admin_party_section_html(
 
 
 # =============================================================================
-# Deal admin compact message — خطوط فیش/نشستن زیر بخش خریدار در caption ادمین
-# ساخته‌شده در _post_acceptance_admin_message_html (حداکثر ~۱۰۲۴ کاراکتر)
+# Deal admin compact message | پیام فشرده ادمین
+# EN: Receipt/settlement lines under buyer block in _post_acceptance_admin_message_html (~1024 chars).
+# FA: خطوط فیش و «نشست» زیر بخش خریدار در caption پیام ادمین.
 # =============================================================================
 
 

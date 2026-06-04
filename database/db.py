@@ -306,8 +306,9 @@ def ensure_schema() -> None:
             "CREATE INDEX IF NOT EXISTS idx_bot_outbound_offer ON offer_bot_outbound_log(offer_id)"
         )
 
-        # --- offer_deal_gates: دروازه معامله پس از پذیرش پیشنهاد ---
-        # docs/DEAL_GATE.md — gate_status, receipts (JSON), admin_notify_mids
+        # --- offer_deal_gates | Deal gate after offer acceptance ---
+        # EN: gate_status, receipt JSON columns, admin_notify_mids — see docs/DEAL_GATE.md
+        # FA: وضعیت gate، لاگ فیش‌ها، شناسه پیام ادمین — ر.ک. docs/DEAL_GATE.md
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS offer_deal_gates (
@@ -2497,9 +2498,10 @@ def update_euro_advert_status(advert_rowid: int, status: str) -> bool:
 
 
 # =============================================================================
-# Deal Gate CRUD — offer_deal_gates (یک ردیف per offer_id)
-# EN: get/upsert/delete; receipt logs as JSON strings
-# FA: وضعیت gate، فیش تومان/یورو، تأیید نشستن — docs/DEAL_GATE.md
+# Deal Gate CRUD | offer_deal_gates (one row per offer_id)
+# EN: get/upsert/delete; receipt logs as JSON strings.
+# FA: خواندن/نوشتن gate؛ فیش تومان و یورو و تأیید نشستن به‌صورت JSON.
+# See: docs/DEAL_GATE.md
 # =============================================================================
 
 

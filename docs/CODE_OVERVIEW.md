@@ -1,7 +1,10 @@
 # Code overview / راهنمای کد
 
-Bilingual guide to the **Sepid Exchange Bot** codebase.  
-راهنمای دو‌زبانه برای درک ساختار پروژهٔ ربات کانال Sepid.
+Bilingual guide to the **Sepid Exchange Bot** codebase (English + Persian in every section).  
+راهنمای دو‌زبانه برای درک ساختار پروژه — هر بخش **EN + FA**.
+
+**Convention / قرارداد:** README, `docs/*.md`, and `# Section N | بخش N` banners in Python files.  
+**Commit messages / کامیت:** English subject + Persian explanation in body when documenting.
 
 ---
 

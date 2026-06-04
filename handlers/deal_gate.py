@@ -13,18 +13,18 @@ FA:
 
 راهنمای کامل: docs/DEAL_GATE.md
 
-فهرست بخش‌های فایل (جستجو: «# === بخش»):
-  1  admin_notify JSON helpers
-  2  sync / edit پیام اصلی ادمین
-  3  کیبوردها و منوی اصلی
-  4  فیش — فوروارد و اعلان خریدار
-  5  ادمین — کارت تومان به خریدار
-  6  ادمین — تومان نشست / یورو به فروشنده / یورو نشست / فیش تومان به فروشنده
-  7  بازپخش outbound
-  8  جمع‌آوری حساب طرفین
-  9  شروع gate، یادآوری، تأیید بله/خیر
- 10  فیش طرفین (callback + router گروه ۰)
- 11  تصمیم ادمین و لیست معاملات در پنل
+File sections (search: "Section" or "بخش"):
+  1  EN: admin_notify JSON | FA: شناسه پیام ادمین
+  2  EN: sync admin message | FA: همگام پیام ادمین
+  3  EN: keyboards / main menu | FA: کیبورد و منو
+  4  EN: receipt forward | FA: فوروارد فیش
+  5  EN: toman card to buyer | FA: کارت تومان خریدار
+  6  EN: tomset / eurcfm / stom | FA: نشست و فیش ادمین
+  7  EN: outbound replay | FA: بازپخش outbound
+  8  EN: account collection | FA: جمع حساب
+  9  EN: gate start / reminders | FA: شروع gate
+ 10  EN: party receipts routers | FA: فیش طرفین
+ 11  EN: admin panel deals | FA: پنل معاملات
 """
 
 from __future__ import annotations
@@ -78,8 +78,9 @@ _REMINDER2_SEC = 7200
 _HOURLY_SEC = 3600
 
 # =============================================================================
-# بخش ۱ — شناسهٔ پیام ادمین (admin_notify_mids / admin_notify_photo_mids)
-# EN: Map admin chat_id → message_id for edit-in-place and reply threading
+# Section 1 | بخش ۱ — Admin message IDs (admin_notify_mids)
+# EN: Map admin chat_id → message_id for edit-in-place and reply threading.
+# FA: نگاشت chat ادمین به message_id برای ویرایش همان پیام و reply فیش‌ها.
 # =============================================================================
 
 
@@ -336,9 +337,9 @@ async def _edit_or_send_admin_notification(
 
 
 # =============================================================================
-# بخش ۲ — sync_deal_admin_notification
-# EN: Build HTML via offers._post_acceptance_admin_message_html; edit or send;
-#     attach stage-aware keyboard (deal_admin_payment_actions_keyboard).
+# Section 2 | بخش ۲ — sync_deal_admin_notification
+# EN: Build HTML via offers; edit or send admin message; stage-aware keyboard.
+# FA: ساخت/ویرایش پیام اصلی ادمین و دکمه‌های مرحله‌ای (کارت، نشست، فیش).
 # =============================================================================
 
 
@@ -447,7 +448,9 @@ async def sync_deal_admin_notification(
 
 
 # =============================================================================
-# بخش ۳ — کیبوردهای اینلاین و _show_user_main_menu (ادمین → admin_home)
+# Section 3 | بخش ۳ — Inline keyboards and main menu
+# EN: Party/admin keyboards; _show_user_main_menu uses admin_home for admins.
+# FA: دکمه‌های طرفین و ادمین؛ منوی اصلی (پنل ادمین برای ADMIN_IDS).
 # =============================================================================
 
 
@@ -694,7 +697,9 @@ async def _purge_buyer_pay_on_cancel(
 
 
 # =============================================================================
-# بخش ۴ — فیش: فوروارد به ادمین، کپی مخفی به خریدار (بدون outbound log)
+# Section 4 | بخش ۴ — Receipt forward and buyer notify
+# EN: Forward receipts to admins; discreet euro copy to buyer (no outbound log).
+# FA: ارسال فیش به ادمین؛ کپی یورو برای خریدار بدون لاگ outbound.
 # =============================================================================
 
 
@@ -915,7 +920,9 @@ def _deal_gate_allows_admin_payment(gate: dict | None) -> bool:
 
 
 # =============================================================================
-# بخش ۵ — ادمین: کارت واریز تومان به خریدار (adm|pay|)
+# Section 5 | بخش ۵ — Admin: Toman deposit card to buyer (adm|pay|)
+# EN: Pick bank card from BANK_CARDS; send with receipt upload buttons.
+# FA: انتخاب کارت از تنظیمات؛ ارسال به خریدار با دکمه ارسال فیش.
 # =============================================================================
 
 
@@ -1166,7 +1173,9 @@ def _seller_buyer_euro_account_message_html(
 
 
 # =============================================================================
-# بخش ۶ — ادمین: tomset → یورو به فروشنده | eurcfm → یورو نشست | stom → فیش تومان به فروشنده
+# Section 6 | بخش ۶ — Admin: tomset, eurcfm, stom
+# EN: Toman settled → EUR account to seller; admin euro confirm; toman receipt to seller.
+# FA: تومان نشست → حساب یورو به فروشنده؛ یورو نشست ادمین؛ فیش تومان به فروشنده.
 # Callbacks: adm|tomset|, adm|eurcfm|, adm|stom|, adm|buyeur| (legacy)
 # =============================================================================
 
@@ -1731,7 +1740,9 @@ async def _deal_admin_stom_try_photo(
 
 
 # =============================================================================
-# بخش ۷ — بازپخش لاگ پیام‌های ربات (adm|outlog|) از offer_bot_outbound_log
+# Section 7 | بخش ۷ — Outbound log replay (adm|outlog|)
+# EN: Replay deal_bot_send_* messages logged in offer_bot_outbound_log.
+# FA: بازپخش پیام‌های ذخیره‌شدهٔ ربات به خریدار/فروشنده برای ادمین.
 # =============================================================================
 
 
@@ -1790,7 +1801,9 @@ async def deal_admin_view_outbound_logs_callback(
 
 
 # =============================================================================
-# بخش ۸ — جمع حساب یورو (متن/عکس)، پاک‌سازی پیام‌های موقت، اعلان به طرفین
+# Section 8 | بخش ۸ — Account collection
+# EN: Collect buyer/seller EUR account text or photo; purge temp messages.
+# FA: دریافت حساب یورو طرفین؛ پاک‌سازی پیام‌های موقت و اعلان انتظار.
 # =============================================================================
 
 
@@ -2324,7 +2337,9 @@ async def _admin_edit_or_send(
 
 
 # =============================================================================
-# بخش ۱۱ — پنل ادمین: لیست/جزئیات معامله، ویرایش حساب، adm|dg| تصمیم
+# Section 11 | بخش ۱۱ — Admin panel deal list and decisions
+# EN: List/search gates; edit accounts; adm|dg| admin decisions on disputes.
+# FA: لیست معاملات در پنل؛ ویرایش حساب؛ تصمیم ادمین روی اختلاف.
 # =============================================================================
 
 
@@ -2559,7 +2574,9 @@ def _schedule_gate_jobs(context: ContextTypes.DEFAULT_TYPE, offer_id: int) -> No
 
 
 # =============================================================================
-# بخش ۹ — شروع gate، JobQueue یادآوری، پاسخ بله/خیر، اسکیلیشن ادمین
+# Section 9 | بخش ۹ — Gate start, reminders, yes/no
+# EN: start_deal_final_gate; JobQueue reminders; escalate to admin after 2h.
+# FA: شروع دروازه؛ یادآوری؛ تأیید/رد نهایی؛ ارجاع به ادمین پس از ۲ ساعت.
 # =============================================================================
 
 
@@ -2760,7 +2777,9 @@ async def _notify_admin_escalation(
 
 
 # =============================================================================
-# بخش ۱۰ — فیش طرفین: deal|rcpt| / deal|srcpt| / deal|eurset| + router گروه ۰
+# Section 10 | بخش ۱۰ — Party receipts and group-0 routers
+# EN: deal|rcpt| buyer toman; deal|srcpt| seller euro; deal|eurset| confirm; stom pending.
+# FA: فیش تومان خریدار؛ فیش یورو فروشنده؛ تأیید یورو نشست؛ router گروه ۰.
 # Pending keys: _DEAL_RCPT_KEY, _DEAL_ADMIN_STOM_KEY
 # =============================================================================
 

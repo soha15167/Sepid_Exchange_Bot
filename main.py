@@ -1,14 +1,16 @@
 """
-main.py — Application entry / نقطهٔ ورود برنامه
+main.py — Application entry | نقطهٔ ورود برنامه
 
 EN:
-  Builds the python-telegram-bot Application, runs DB migrations, registers all
-  handlers (commands, callbacks, text routers). Group -1 runs access gates;
-  group 0 routes euro/offer flows by UserState.
+  Builds the python-telegram-bot Application, runs ensure_schema(), registers handlers.
+  Group -1: access/registration gates. Group 0: deal_gate (receipts/accounts, priority).
+  Groups 1+: euro/offer wizards, admin. Deal admin callbacks: adm|pay|, tomset, eurcfm, stom.
 
 FA:
-  ساخت Application، اجرای ensure_schema، ثبت هندلرها. گروه −۱ محدودیت و
-  ثبت‌نام؛ روتر متن بر اساس state کاربر (آگهی، پیشنهاد، ادمین).
+  ساخت Application، migration، ثبت هندلرها. گروه −۱: ثبت‌نام و محدودیت.
+  گروه ۰: deal_gate (فیش و حساب معامله). callbackهای ادمین معامله: pay, tomset, eurcfm, stom.
+
+Docs: README.md, docs/DEAL_GATE.md, docs/CODE_OVERVIEW.md (EN + FA).
 """
 
 from telegram.ext import (
@@ -674,7 +676,8 @@ def main():
         & (filters.PHOTO | filters.Document.IMAGE)
         & ~filters.COMMAND
     )
-    # --- Deal Gate (گروه ۰/۴): فیش و حساب معامله قبل از wizard — docs/DEAL_GATE.md ---
+    # --- Deal Gate | دروازه معامله (groups 0/4) — receipts & accounts before wizard ---
+    # EN: See docs/DEAL_GATE.md. FA: ر.ک. docs/DEAL_GATE.md
     # PTB: فقط یک handler در هر group اجرا می‌شود — deal_gate و wizard باید group جدا باشند.
     application.add_handler(MessageHandler(_private_text, deal_gate_group0_text_router), group=0)
     application.add_handler(MessageHandler(_private_text, wizard_text_router), group=1)
@@ -714,7 +717,7 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_confirm_exchange, pattern="^confirm_exchange$"))
     application.add_handler(CallbackQueryHandler(handle_service_operation_callback, pattern="^service_op_"))
     application.add_handler(CallbackQueryHandler(handle_inline_cancel_callback, pattern="^inline_cancel$"))
-    # Deal Gate admin callbacks: pay, tomset, eurcfm, stom, buyeur (legacy), outlog
+    # Deal Gate admin callbacks | callbackهای ادمین معامله: pay, tomset, eurcfm, stom, outlog
     application.add_handler(CallbackQueryHandler(deal_admin_payment_callback, pattern=r"^adm\|pay\|"))
     application.add_handler(
         CallbackQueryHandler(
