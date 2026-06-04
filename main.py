@@ -674,6 +674,7 @@ def main():
         & (filters.PHOTO | filters.Document.IMAGE)
         & ~filters.COMMAND
     )
+    # --- Deal Gate (گروه ۰/۴): فیش و حساب معامله قبل از wizard — docs/DEAL_GATE.md ---
     # PTB: فقط یک handler در هر group اجرا می‌شود — deal_gate و wizard باید group جدا باشند.
     application.add_handler(MessageHandler(_private_text, deal_gate_group0_text_router), group=0)
     application.add_handler(MessageHandler(_private_text, wizard_text_router), group=1)
@@ -713,6 +714,7 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_confirm_exchange, pattern="^confirm_exchange$"))
     application.add_handler(CallbackQueryHandler(handle_service_operation_callback, pattern="^service_op_"))
     application.add_handler(CallbackQueryHandler(handle_inline_cancel_callback, pattern="^inline_cancel$"))
+    # Deal Gate admin callbacks: pay, tomset, eurcfm, stom, buyeur (legacy), outlog
     application.add_handler(CallbackQueryHandler(deal_admin_payment_callback, pattern=r"^adm\|pay\|"))
     application.add_handler(
         CallbackQueryHandler(

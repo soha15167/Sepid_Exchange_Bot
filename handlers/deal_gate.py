@@ -1,8 +1,30 @@
 """
-handlers/deal_gate.py — تأیید نهایی دوطرفه پس از پذیرش پیشنهاد
+handlers/deal_gate.py — Deal Gate / دروازه معامله
 
-EN: Final yes/no gate, reminders, admin actions, account collection, transcript logging.
-FA: دروازه تأیید، یادآوری، اقدام ادمین، جمع حساب، آرشیو در DB.
+پس از پذیرش پیشنهاد: تأیید نهایی دوطرفه → جمع حساب یورو → هماهنگی واریز تومان/یورو با ادمین.
+
+EN:
+  Final yes/no gate, account collection, staged admin payments (toman card, toman settled,
+  euro account to seller, euro receipts, buyer/admin euro confirm, admin toman receipt to seller).
+
+FA:
+  تأیید نهایی، ثبت حساب، کارت/فیش تومان خریدار، تومان نشست، حساب یورو به فروشنده،
+  فیش یورو، تأیید نشستن (خریدار یا ادمین), فیش تومان ادمین به فروشنده.
+
+راهنمای کامل: docs/DEAL_GATE.md
+
+فهرست بخش‌های فایل (جستجو: «# === بخش»):
+  1  admin_notify JSON helpers
+  2  sync / edit پیام اصلی ادمین
+  3  کیبوردها و منوی اصلی
+  4  فیش — فوروارد و اعلان خریدار
+  5  ادمین — کارت تومان به خریدار
+  6  ادمین — تومان نشست / یورو به فروشنده / یورو نشست / فیش تومان به فروشنده
+  7  بازپخش outbound
+  8  جمع‌آوری حساب طرفین
+  9  شروع gate، یادآوری، تأیید بله/خیر
+ 10  فیش طرفین (callback + router گروه ۰)
+ 11  تصمیم ادمین و لیست معاملات در پنل
 """
 
 from __future__ import annotations
@@ -54,6 +76,11 @@ _ACCOUNT_PHOTO_MARKER = "📷 عکس حساب"
 _REMINDER1_SEC = 3600
 _REMINDER2_SEC = 7200
 _HOURLY_SEC = 3600
+
+# =============================================================================
+# بخش ۱ — شناسهٔ پیام ادمین (admin_notify_mids / admin_notify_photo_mids)
+# EN: Map admin chat_id → message_id for edit-in-place and reply threading
+# =============================================================================
 
 
 def _parse_admin_notify_mids(gate: dict) -> dict[int, int]:
@@ -308,6 +335,13 @@ async def _edit_or_send_admin_notification(
         return old_mid
 
 
+# =============================================================================
+# بخش ۲ — sync_deal_admin_notification
+# EN: Build HTML via offers._post_acceptance_admin_message_html; edit or send;
+#     attach stage-aware keyboard (deal_admin_payment_actions_keyboard).
+# =============================================================================
+
+
 async def sync_deal_admin_notification(
     bot,
     offer_id: int,
@@ -316,7 +350,7 @@ async def sync_deal_admin_notification(
 ) -> None:
     """
     ارسال یا ویرایش پیام ادمین برای معامله.
-    پس از تأیید دوطرفه پیام اول ساخته می‌شود؛ با هر حساب جدید همان پیام edit می‌شود.
+    پس از تأیید دوطرفه پیام اول ساخته می‌شود؛ با هر حساب/فیش جدید همان پیام edit می‌شود.
     """
     from handlers.offers import (
         _deal_admin_recipient_ids,
@@ -410,6 +444,11 @@ async def sync_deal_admin_notification(
             seller_telegram_id=seller_id,
             **upsert_fields,
         )
+
+
+# =============================================================================
+# بخش ۳ — کیبوردهای اینلاین و _show_user_main_menu (ادمین → admin_home)
+# =============================================================================
 
 
 def _first_unconfirmed_seller_euro_index(offer_id: int) -> int | None:
@@ -654,6 +693,11 @@ async def _purge_buyer_pay_on_cancel(
     await _purge_user_deal_chat(bot, store, uid, oid, gate)
 
 
+# =============================================================================
+# بخش ۴ — فیش: فوروارد به ادمین، کپی مخفی به خریدار (بدون outbound log)
+# =============================================================================
+
+
 async def _notify_admins_deal_line(
     bot, *, offer_id: int, gate: dict, line_html: str
 ) -> None:
@@ -868,6 +912,11 @@ def _deal_payment_cards_keyboard(offer_id: int, cards) -> InlineKeyboardMarkup:
 def _deal_gate_allows_admin_payment(gate: dict | None) -> bool:
     st = ((gate or {}).get("gate_status") or "").strip().lower()
     return st in ("accounts", "completed")
+
+
+# =============================================================================
+# بخش ۵ — ادمین: کارت واریز تومان به خریدار (adm|pay|)
+# =============================================================================
 
 
 async def deal_admin_payment_callback(
@@ -1114,6 +1163,12 @@ def _seller_buyer_euro_account_message_html(
         f"{_RTL}پس از انتقال، دکمهٔ <b>ارسال فیش واریزی یورو</b> را بزنید.\n"
         f"{_RTL}تا تأیید ادمین، مبلغ دیگری ارسال نکنید."
     )
+
+
+# =============================================================================
+# بخش ۶ — ادمین: tomset → یورو به فروشنده | eurcfm → یورو نشست | stom → فیش تومان به فروشنده
+# Callbacks: adm|tomset|, adm|eurcfm|, adm|stom|, adm|buyeur| (legacy)
+# =============================================================================
 
 
 async def _send_buyer_eur_account_to_seller(
@@ -1675,6 +1730,11 @@ async def _deal_admin_stom_try_photo(
     return True
 
 
+# =============================================================================
+# بخش ۷ — بازپخش لاگ پیام‌های ربات (adm|outlog|) از offer_bot_outbound_log
+# =============================================================================
+
+
 async def deal_admin_view_outbound_logs_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -1727,6 +1787,11 @@ async def deal_admin_view_outbound_logs_callback(
             )
         except Exception:
             pass
+
+
+# =============================================================================
+# بخش ۸ — جمع حساب یورو (متن/عکس)، پاک‌سازی پیام‌های موقت، اعلان به طرفین
+# =============================================================================
 
 
 def _log(offer_id: int, text: str, *, from_role: str = "system") -> None:
@@ -2258,6 +2323,11 @@ async def _admin_edit_or_send(
         logger.exception("deal_gate admin panel send failed")
 
 
+# =============================================================================
+# بخش ۱۱ — پنل ادمین: لیست/جزئیات معامله، ویرایش حساب، adm|dg| تصمیم
+# =============================================================================
+
+
 async def admin_show_deal_gate_list(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -2488,6 +2558,11 @@ def _schedule_gate_jobs(context: ContextTypes.DEFAULT_TYPE, offer_id: int) -> No
     # یادآوری ساعتی به کاربر حذف شد — ادمین از پنل «وضعیت معاملات» می‌بیند.
 
 
+# =============================================================================
+# بخش ۹ — شروع gate، JobQueue یادآوری، پاسخ بله/خیر، اسکیلیشن ادمین
+# =============================================================================
+
+
 async def start_deal_final_gate(
     context: ContextTypes.DEFAULT_TYPE,
     *,
@@ -2682,6 +2757,12 @@ async def _notify_admin_escalation(
         log_tag=f"deal_gate_escalate|{oid}",
         reply_markup=_admin_gate_keyboard(oid),
     )
+
+
+# =============================================================================
+# بخش ۱۰ — فیش طرفین: deal|rcpt| / deal|srcpt| / deal|eurset| + router گروه ۰
+# Pending keys: _DEAL_RCPT_KEY, _DEAL_ADMIN_STOM_KEY
+# =============================================================================
 
 
 async def _finish_buyer_receipt_flow(

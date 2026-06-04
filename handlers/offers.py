@@ -2285,6 +2285,12 @@ def _post_acceptance_admin_party_section_html(
     )
 
 
+# =============================================================================
+# Deal admin compact message — خطوط فیش/نشستن زیر بخش خریدار در caption ادمین
+# ساخته‌شده در _post_acceptance_admin_message_html (حداکثر ~۱۰۲۴ کاراکتر)
+# =============================================================================
+
+
 def _buyer_toman_receipt_admin_line_html(gate: dict | None) -> str:
     """وضعیت فیش واریز تومان خریدار — زیر بخش خریدار در پیام ادمین."""
     from database.db import deal_gate_buyer_receipt_list

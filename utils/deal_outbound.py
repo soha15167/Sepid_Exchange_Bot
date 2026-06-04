@@ -1,4 +1,15 @@
-"""لاگ و بازپخش پیام‌های ارسالی ربات به طرفین معامله (برای ادمین)."""
+"""
+utils/deal_outbound.py — لاگ پیام‌های ربات به طرفین معامله
+
+EN:
+  deal_bot_send_message / deal_bot_send_photo log to offer_bot_outbound_log.
+  deal_admin_replay_outbound replays for admin (adm|outlog|).
+  Buyer euro receipt copy is sent WITHOUT this log (discreet).
+
+FA:
+  هر پیام رسمی ربات به خریدار/فروشنده ذخیره می‌شود؛ ادمین می‌تواند بازپخش کند.
+  کپی فیش یورو برای تأیید «نشستن» عمداً لاگ نمی‌شود.
+"""
 
 from __future__ import annotations
 

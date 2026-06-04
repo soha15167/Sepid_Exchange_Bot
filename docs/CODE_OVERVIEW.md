@@ -69,7 +69,9 @@ Key tables / جداول اصلی:
 | `callbacks.py` | Payment method multi-select (IBAN, PayPal, …) | انتخاب روش پرداخت |
 | `euro_flow.py` | Buy/sell with Toman rate → post to channel | خرید/فروش یورو |
 | `exchange_flow.py` | Euro-to-Euro exchange ads | معاوضه Euro به Euro |
-| `offers.py` | Offer gate, rate, country, preview, owner actions | پیشنهاد به آگهی |
+| `offers.py` | Offer gate, rate, country, preview, owner actions; admin deal HTML | پیشنهاد + اعلان ادمین |
+| `deal_gate.py` | Final gate, accounts, toman/euro receipts, admin payment buttons | **دروازه معامله** — [DEAL_GATE.md](DEAL_GATE.md) |
+| `deal_outbound.py` | Log/replay bot messages to deal parties | لاگ پیام‌های معامله |
 | `channel_info.py` | Channel rules & fee schedule text | قوانین و کارمزد |
 | `user_adverts.py` | User's own ads list / edit entry | آگهی‌های من |
 | `admin.py` | Admin panel: users, ads, offers, restrictions | پنل ادمین |
@@ -105,6 +107,10 @@ Key tables / جداول اصلی:
 1. Deep link or button → `deliver_offer_proposal_gate`  
 2. Agree or custom amount/rate  
 3. `insert_advert_offer` → notify owner & admins  
+
+### Deal Gate / معامله پس از پذیرش
+See **[DEAL_GATE.md](DEAL_GATE.md)** for full flowcharts.  
+Short path: `start_deal_final_gate` → accounts → admin card → buyer toman receipt → **تومان نشست** → seller euro → buyer **یورو نشست** → admin toman receipt to seller.
 
 ---
 
