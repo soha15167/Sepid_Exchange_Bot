@@ -288,6 +288,26 @@ def ensure_schema() -> None:
 
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS offer_bot_outbound_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                offer_id INTEGER NOT NULL,
+                recipient_telegram_id INTEGER NOT NULL,
+                party TEXT NOT NULL,
+                tag TEXT NOT NULL,
+                msg_type TEXT NOT NULL DEFAULT 'text',
+                body_html TEXT,
+                caption_html TEXT,
+                photo_file_id TEXT,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bot_outbound_offer ON offer_bot_outbound_log(offer_id)"
+        )
+
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS offer_deal_gates (
                 offer_id INTEGER PRIMARY KEY,
                 advert_rowid INTEGER NOT NULL,
@@ -320,6 +340,17 @@ def ensure_schema() -> None:
             )
         except Exception:
             pass
+        for col in (
+            "buyer_accounts_photo_file_id",
+            "seller_accounts_photo_file_id",
+            "admin_notify_photo_mids",
+        ):
+            try:
+                cur.execute(
+                    f"ALTER TABLE offer_deal_gates ADD COLUMN {col} TEXT"
+                )
+            except Exception:
+                pass
 
         conn.commit()
 
@@ -449,6 +480,73 @@ def negotiation_transcript_append_line(
                 )
         conn.commit()
     return negotiation_transcript_list(oid)
+
+
+def bot_outbound_log_insert(
+    offer_id: int,
+    recipient_telegram_id: int,
+    party: str,
+    tag: str,
+    *,
+    msg_type: str = "text",
+    body_html: str = "",
+    caption_html: str = "",
+    photo_file_id: str = "",
+) -> None:
+    """ذخیرهٔ کپی پیام ارسالی ربات به کاربر (برای نمایش ادمین)."""
+    try:
+        oid = int(offer_id)
+        rid = int(recipient_telegram_id)
+    except (TypeError, ValueError):
+        return
+    pr = (party or "").strip().lower()
+    if pr not in ("buyer", "seller", "user"):
+        pr = "user"
+    mt = (msg_type or "text").strip().lower()
+    if mt not in ("text", "photo"):
+        mt = "text"
+    tg = (tag or "پیام").strip()[:120]
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO offer_bot_outbound_log (
+                offer_id, recipient_telegram_id, party, tag, msg_type,
+                body_html, caption_html, photo_file_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                oid,
+                rid,
+                pr,
+                tg,
+                mt,
+                (body_html or "")[:12000],
+                (caption_html or "")[:4000],
+                (photo_file_id or "").strip()[:256],
+                int(time.time()),
+            ),
+        )
+        conn.commit()
+
+
+def bot_outbound_log_list(offer_id: int) -> list[dict]:
+    try:
+        oid = int(offer_id)
+    except (TypeError, ValueError):
+        return []
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, recipient_telegram_id, party, tag, msg_type,
+                   body_html, caption_html, photo_file_id, created_at
+            FROM offer_bot_outbound_log
+            WHERE offer_id = ?
+            ORDER BY id ASC
+            """,
+            (oid,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def display_name_exists(display_name: str) -> bool:
@@ -2465,8 +2563,11 @@ def deal_gate_upsert(
             "seller_gate_mid",
             "buyer_accounts_text",
             "seller_accounts_text",
+            "buyer_accounts_photo_file_id",
+            "seller_accounts_photo_file_id",
             "completed_at",
             "admin_notify_mids",
+            "admin_notify_photo_mids",
         }
         for key, val in fields.items():
             if key not in allowed:

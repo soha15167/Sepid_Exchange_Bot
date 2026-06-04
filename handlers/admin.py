@@ -2813,8 +2813,8 @@ async def admin_dashboard_callback(update: Update, context: ContextTypes.DEFAULT
                 context,
                 context.bot,
                 f"{_RTL}✏️ <b>ثبت حساب {party_fa}</b> — offer <code>{oid}</code>\n\n"
-                f"{_RTL}متن کامل حساب را در یک پیام بفرستید "
-                f"(IBAN، شبا، PayPal…):",
+                f"{_RTL}متن کامل حساب را بفرستید (IBAN، شبا، PayPal…) "
+                f"یا <b>عکس کارت</b> — عکس بدون تبدیل به متن برای ادمین ارسال می‌شود:",
                 reply_markup=InlineKeyboardMarkup(
                     [
                         [

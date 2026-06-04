@@ -139,7 +139,10 @@ from handlers.channel_info import (
     handle_main_rules_reply_message,
 )
 from handlers.deal_gate import (
+    admin_deal_gate_account_photo_router,
     deal_admin_payment_callback,
+    deal_admin_send_buyer_eur_account_callback,
+    deal_admin_view_outbound_logs_callback,
     deal_gate_accounts_photo_router,
     deal_gate_accounts_router,
     deal_gate_callback,
@@ -245,7 +248,7 @@ async def _dispatch_user_flow_text(
 
 async def wizard_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    ثبت آگهی / پیشنهاد / معاوضه — قبل از deal_gate تا state پاک نشود.
+    ثبت آگهی / پیشنهاد / معاوضه — group 1؛ deal_gate در group 0 جدا اجرا می‌شود.
     """
     if not update.effective_chat or update.effective_chat.type != ChatType.PRIVATE:
         return
@@ -254,20 +257,7 @@ async def wizard_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if await ensure_registered_or_redirect(update, context):
         raise ApplicationHandlerStop
 
-    from database.db import deal_gate_active_for_user
-    from utils.flow_guards import (
-        user_advert_offer_wizard_active,
-        user_offer_wizard_text_step,
-    )
-
-    uid = update.effective_user.id if update.effective_user else None
-    if uid and deal_gate_active_for_user(uid) and not user_offer_wizard_text_step(context):
-        logger.info(
-            "wizard_text: defer uid=%s state=%r — deal_gate account collection",
-            uid,
-            context.user_data.get("state"),
-        )
-        return
+    from utils.flow_guards import user_advert_offer_wizard_active
 
     flow_active = user_advert_offer_wizard_active(context)
     if not flow_active:
@@ -674,32 +664,33 @@ def main():
     _private_text = filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND
     _iran_fill_text = filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND
     _iran_txn = filters.ChatType.PRIVATE & ~filters.COMMAND
-    # wizard قبل از deal_gate — ثبت آگهی/پیشنهاد؛ deal_gate فقط وقتی wizard فعال نیست
-    application.add_handler(MessageHandler(_private_text, wizard_text_router), group=0)
-    application.add_handler(MessageHandler(_private_text, deal_gate_accounts_router), group=0)
-    application.add_handler(MessageHandler(_iran_fill_text, iran_panel_fill_router), group=0)
     _iran_receipt_media = (
         filters.ChatType.PRIVATE
         & (filters.PHOTO | filters.Document.IMAGE)
         & ~filters.COMMAND
     )
+    # PTB: فقط یک handler در هر group اجرا می‌شود — deal_gate و wizard باید group جدا باشند.
+    application.add_handler(MessageHandler(_private_text, deal_gate_accounts_router), group=0)
+    application.add_handler(MessageHandler(_private_text, wizard_text_router), group=1)
+    application.add_handler(MessageHandler(_iran_fill_text, iran_panel_fill_router), group=2)
     application.add_handler(
-        MessageHandler(
-            _iran_receipt_media,
-            deal_gate_accounts_photo_router,
-        ),
-        group=0,
+        MessageHandler(_iran_receipt_media, admin_deal_gate_account_photo_router),
+        group=3,
+    )
+    application.add_handler(
+        MessageHandler(_iran_receipt_media, deal_gate_accounts_photo_router),
+        group=4,
     )
     application.add_handler(
         MessageHandler(_iran_receipt_media, iran_panel_sync_router),
-        group=0,
+        group=5,
     )
-    application.add_handler(MessageHandler(_private_text, euro_flow_router), group=0)
-    application.add_handler(MessageHandler(_iran_txn, iran_panel_sync_router), group=0)
+    application.add_handler(MessageHandler(_private_text, euro_flow_router), group=6)
+    application.add_handler(MessageHandler(_iran_txn, iran_panel_sync_router), group=7)
     # Admin panel: run in later group to avoid hijacking normal flows
     application.add_handler(CallbackQueryHandler(iran_panel_tx_callback, pattern=r"^tx\|"))
     application.add_handler(CallbackQueryHandler(deal_gate_callback, pattern=r"^(deal\||adm\|dg\|)"))
-    application.add_handler(MessageHandler(_private_text, admin_router), group=1)
+    application.add_handler(MessageHandler(_private_text, admin_router), group=8)
 
     # تایید نهایی آگهی
     application.add_handler(CallbackQueryHandler(confirm_and_post_advert, pattern="^confirm_advert$"))
@@ -718,6 +709,18 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_service_operation_callback, pattern="^service_op_"))
     application.add_handler(CallbackQueryHandler(handle_inline_cancel_callback, pattern="^inline_cancel$"))
     application.add_handler(CallbackQueryHandler(deal_admin_payment_callback, pattern=r"^adm\|pay\|"))
+    application.add_handler(
+        CallbackQueryHandler(
+            deal_admin_send_buyer_eur_account_callback,
+            pattern=r"^adm\|buyeur\|",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            deal_admin_view_outbound_logs_callback,
+            pattern=r"^adm\|outlog\|",
+        )
+    )
     application.add_handler(CallbackQueryHandler(admin_dashboard_callback, pattern=r"^adm\|"))
     application.add_handler(CallbackQueryHandler(bank_cards_callback, pattern=r"^cards\|"))
     application.add_handler(
@@ -769,7 +772,7 @@ def main():
     # بعد از شروع
     async def post_init(app):
         logger.info(
-            "flow_routing: wizard_first_v6 (deal_gate beats euro advert wizard)"
+            "flow_routing: deal_gate_g0 wizard_g1 (PTB one handler per group)"
         )
         await auto_start_notify(app)
         _setup_bonbast_daily_job(app)

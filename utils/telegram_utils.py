@@ -423,6 +423,9 @@ def reset_flow_user_bucket(store: dict, user_id: int) -> None:
     anchor = None
     if prev:
         anchor = prev.get(MAIN_MENU_ANCHOR_KEY)
+        for k, v in prev.items():
+            if k.startswith("ot_") or k.startswith("negp_"):
+                bucket[k] = v
     if not anchor:
         db = fetch_main_menu_anchor(user_id)
         if db:
@@ -506,6 +509,7 @@ async def send_or_replace_main_menu(
     text: str = "🏠 منوی اصلی:",
     reply_markup=None,
     parse_mode: str | None = None,
+    disable_web_page_preview: bool = False,
 ) -> int:
     """حذف پیام منوی قبلی (در صورت وجود) و ارسال منوی جدید؛ message_id جدید را برمی‌گرداند."""
     from config.settings import ADMIN_IDS
@@ -519,7 +523,12 @@ async def send_or_replace_main_menu(
         reply_markup = main_menu_inline_keyboard
     await _delete_main_menu_anchor_message(bot, user_id=user_id, store=store)
     await strip_reply_keyboard(bot, chat_id=chat_id)
-    kwargs = {"chat_id": chat_id, "text": text, "reply_markup": reply_markup}
+    kwargs = {
+        "chat_id": chat_id,
+        "text": text,
+        "reply_markup": reply_markup,
+        "disable_web_page_preview": disable_web_page_preview,
+    }
     if parse_mode is not None:
         kwargs["parse_mode"] = parse_mode
     sent = await bot.send_message(**kwargs)

@@ -2066,6 +2066,39 @@ def _financial_party_summary_html(
     )
 
 
+def _financial_party_summary_compact_html(
+    advert: dict, rate: int, eur_amt: int, *, party: str
+) -> str:
+    """خلاصهٔ مالی فشرده برای caption ادمین (بدون تکرار نرخ/یورو)."""
+    _ = rate
+    op = (advert.get("operation") or "").strip()
+    if party == "buyer":
+        owner_view = op == "خرید"
+    elif party == "seller":
+        owner_view = op == "فروش"
+    else:
+        owner_view = True
+    party_fa = "فروشنده" if party == "seller" else "خریدار"
+    if op not in ("خرید", "فروش") or eur_amt <= 0:
+        return _financial_party_summary_html(advert, rate, eur_amt, party=party)
+    base = int(eur_amt) * int(rate)
+    ov = advert_fee_override_eur(advert)
+    fee_eur = fee_total_eur(eur_amt, ov)
+    fee_toman = int(round(fee_eur * float(rate)))
+    fee_eur_s = _fmt_fee_eur_display(fee_eur)
+    if op == "فروش":
+        final_amt = base - fee_toman if owner_view else base + fee_toman
+    else:
+        final_amt = base + fee_toman if owner_view else base - fee_toman
+    fee_part = ""
+    if fee_eur > 0 or (ov is not None and fee_eur == 0):
+        fee_part = f"کارمزد <b>{fee_eur_s}</b> یورو · "
+    return (
+        f"{_RTL}🧮 <b>{party_fa}</b> · {fee_part}"
+        f"نهایی: {_copyable_toman_html(final_amt)}\n"
+    )
+
+
 def buyer_deposit_toman_amount(advert: dict, row: dict) -> int:
     """مبلغ تومانی که خریدار یورو باید به حساب ادمین واریز کند."""
     rate = int(row["rate_toman"])
@@ -2083,6 +2116,36 @@ def buyer_deposit_toman_amount(advert: dict, row: dict) -> int:
     if op == "خرید":
         return base + fee_toman if owner_view else base - fee_toman
     return base
+
+
+def _format_deal_party_identity_compact_html(
+    telegram_id: int, *, title: str
+) -> str:
+    """نام + یوزرنیم + شناسه (بدون ایمیل/تلفن) برای اعلان فشردهٔ ادمین."""
+    from utils.channel_format import _telegram_at_link_html
+
+    if not telegram_id:
+        return f"{_RTL}<b>{html_module.escape(title)}:</b> —\n"
+    urow = get_user(int(telegram_id))
+    display = ""
+    if urow:
+        display = (urow.get("display_name") or urow.get("full_name") or "").strip()
+    if not display:
+        display = str(telegram_id)
+    uname = ""
+    if urow and urow.get("username"):
+        uname = str(urow.get("username") or "").strip().lstrip("@")
+    line = (
+        f"{_RTL}🛒 <b>{html_module.escape(title)}:</b> "
+        f"{html_module.escape(display)}"
+    )
+    if uname:
+        line += f" · {_telegram_at_link_html(uname)}"
+    line += (
+        f' · <code>{int(telegram_id)}</code> · '
+        f'<a href="tg://user?id={int(telegram_id)}">تماس</a>\n'
+    )
+    return line
 
 
 def _format_deal_party_identity_html(telegram_id: int, *, title: str) -> str:
@@ -2134,6 +2197,8 @@ def _post_acceptance_admin_party_section_html(
     fin_html: str,
     accounts_text: str | None = None,
     accounts_status_mode: bool = False,
+    account_embedded_photo: bool = False,
+    compact: bool = False,
 ) -> str:
     """بلوک یک طرف (خریدار/فروشنده) در پیام ادمین."""
     buyer_id, seller_id = _offer_buyer_seller_telegram_ids(advert, row)
@@ -2167,12 +2232,46 @@ def _post_acceptance_admin_party_section_html(
     acct_blk = ""
     acct_raw = (accounts_text or "").strip()
     if acct_raw:
-        acct_blk = (
-            f"\n{_RTL}📝 <b>اطلاعات حساب (لمس = کپی یکجا)</b>\n"
-            f"<pre>{html_module.escape(acct_raw)}</pre>\n"
-        )
+        acct_lbl = "📝 حساب:" if compact else "📝 <b>اطلاعات حساب:</b>"
+        if acct_raw.startswith("📷"):
+            if account_embedded_photo or compact:
+                acct_blk = ""
+            else:
+                acct_blk = (
+                    f"\n{_RTL}📝 <b>اطلاعات حساب:</b> 📷 عکس ارسال شد "
+                    f"(پیام جداگانه — از روی عکس کپی کنید)\n"
+                )
+        else:
+            if compact:
+                acct_blk = (
+                    f"\n{_RTL}{acct_lbl}\n"
+                    f"<pre>{html_module.escape(acct_raw)}</pre>\n"
+                )
+            else:
+                acct_blk = (
+                    f"\n{_RTL}📝 <b>اطلاعات حساب (لمس = کپی یکجا)</b>\n"
+                    f"<pre>{html_module.escape(acct_raw)}</pre>\n"
+                )
     elif accounts_status_mode:
-        acct_blk = f"\n{_RTL}📝 <b>اطلاعات حساب:</b> ⏳ در انتظار ارسال کاربر\n"
+        acct_blk = (
+            f"\n{_RTL}📝 حساب: ⏳\n"
+            if compact
+            else f"\n{_RTL}📝 <b>اطلاعات حساب:</b> ⏳ در انتظار ارسال کاربر\n"
+        )
+    if compact:
+        identity = _format_deal_party_identity_compact_html(tid, title=title)
+        if op == "فروش":
+            methods_lbl = "پرداخت" if party == "buyer" else "دریافت"
+        elif op == "خرید":
+            methods_lbl = "پرداخت" if party == "buyer" else "دریافت"
+        else:
+            methods_lbl = "روش"
+        return (
+            f"\n{identity}"
+            f"{_RTL}• {methods_lbl}: <code>{html_module.escape(methods_raw)}</code>\n"
+            f"{fin_html}"
+            f"{acct_blk}"
+        )
     return (
         f"{_RTL}━━━━━━━━━━━━━━━━\n"
         f"{_RTL}🛒 <b>{title}</b>\n\n"
@@ -2197,8 +2296,10 @@ def _post_acceptance_admin_message_html(
     seller_accounts_text: str | None = None,
     accounts_status_mode: bool = False,
     deal_complete: bool = False,
+    embed_account_photos: bool = False,
+    compact: bool = True,
 ) -> str:
-    """اعلان کامل معامله برای ادمین — ابتدا فروشنده، سپس خریدار."""
+    """اعلان معامله برای ادمین — فشرده برای caption عکس (حداکثر ۱۰۲۴ کاراکتر)."""
     rate = int(row["rate_toman"])
     try:
         pe_raw = int(row.get("proposed_euro_amount") or 0)
@@ -2206,10 +2307,72 @@ def _post_acceptance_admin_message_html(
         pe_raw = 0
     pe_kw = pe_raw if pe_raw > 0 else None
     eur_amt = _offer_effective_euro_amount(advert, pe_kw)
-    ad_link = advert_public_link_html(advert, aid)
-    amt_line = _offer_amount_line_html(advert, pe_kw)
     prop_ct = row.get("proposer_account_country")
     buyer_ct, seller_ct = _offer_euro_buyer_seller_country_texts(advert, prop_ct)
+
+    if compact:
+        if deal_complete:
+            status = "تکمیل شد"
+        elif accounts_status_mode:
+            status = "ثبت حساب"
+        else:
+            status = "پذیرش"
+        ad_link = advert_public_link_html(advert, aid)
+        hdr = (
+            f"{_RTL}📩 <b>{status}</b> · پیشنهاد <b>{seq}</b> · {ad_link}\n"
+            f"{_RTL}💶 <b>{eur_amt:,}</b> یورو · نرخ <b>{rate:,}</b>\n"
+        )
+        if accounts_status_mode:
+            ba = bool((buyer_accounts_text or "").strip())
+            sa = bool((seller_accounts_text or "").strip())
+            hdr += (
+                f"{_RTL}حساب: خریدار {'✅' if ba else '⏳'} · "
+                f"فروشنده {'✅' if sa else '⏳'}\n"
+            )
+        hdr += "\n"
+        buyer_fin = _financial_party_summary_compact_html(
+            advert, rate, eur_amt, party="buyer"
+        )
+        seller_fin = _financial_party_summary_compact_html(
+            advert, rate, eur_amt, party="seller"
+        )
+        buyer_is_photo = embed_account_photos and _account_text_is_photo_marker(
+            buyer_accounts_text
+        )
+        seller_is_photo = embed_account_photos and _account_text_is_photo_marker(
+            seller_accounts_text
+        )
+        seller_sec = _post_acceptance_admin_party_section_html(
+            advert,
+            row,
+            party="seller",
+            buyer_country=buyer_ct,
+            seller_country=seller_ct,
+            fin_html=seller_fin,
+            accounts_text=seller_accounts_text,
+            accounts_status_mode=accounts_status_mode,
+            account_embedded_photo=seller_is_photo,
+            compact=True,
+        )
+        buyer_sec = _post_acceptance_admin_party_section_html(
+            advert,
+            row,
+            party="buyer",
+            buyer_country=buyer_ct,
+            seller_country=seller_ct,
+            fin_html=buyer_fin,
+            accounts_text=buyer_accounts_text,
+            accounts_status_mode=accounts_status_mode,
+            account_embedded_photo=buyer_is_photo,
+            compact=True,
+        )
+        foot = ""
+        if deal_complete:
+            foot = f"\n{_RTL}✅ آماده هماهنگی ادمین"
+        return hdr + buyer_sec + seller_sec + foot
+
+    ad_link = advert_public_link_html(advert, aid)
+    amt_line = _offer_amount_line_html(advert, pe_kw)
     buyer_fin = _financial_party_summary_html(advert, rate, eur_amt, party="buyer")
     seller_fin = _financial_party_summary_html(advert, rate, eur_amt, party="seller")
 
@@ -2234,6 +2397,12 @@ def _post_acceptance_admin_message_html(
             f"خریدار {'✅' if ba else '⏳'} · "
             f"فروشنده {'✅' if sa else '⏳'}\n\n"
         )
+    buyer_is_photo = embed_account_photos and _account_text_is_photo_marker(
+        buyer_accounts_text
+    )
+    seller_is_photo = embed_account_photos and _account_text_is_photo_marker(
+        seller_accounts_text
+    )
     buyer_sec = _post_acceptance_admin_party_section_html(
         advert,
         row,
@@ -2243,6 +2412,7 @@ def _post_acceptance_admin_message_html(
         fin_html=buyer_fin,
         accounts_text=buyer_accounts_text,
         accounts_status_mode=accounts_status_mode,
+        account_embedded_photo=buyer_is_photo,
     )
     seller_sec = _post_acceptance_admin_party_section_html(
         advert,
@@ -2253,6 +2423,7 @@ def _post_acceptance_admin_message_html(
         fin_html=seller_fin,
         accounts_text=seller_accounts_text,
         accounts_status_mode=accounts_status_mode,
+        account_embedded_photo=seller_is_photo,
     )
     desc = (row.get("description") or "").strip()
     desc_blk = ""
@@ -2277,7 +2448,11 @@ def _post_acceptance_admin_message_html(
         foot += (
             f"\n{_RTL}✅ <b>هر دو طرف حساب را ارسال کردند — آماده هماهنگی.</b>"
         )
-    return hdr + seller_sec + buyer_sec + desc_blk + foot
+    return hdr + buyer_sec + seller_sec + desc_blk + foot
+
+
+def _account_text_is_photo_marker(text: str | None) -> bool:
+    return bool(text and str(text).strip().startswith("📷"))
 
 
 def _deal_admin_username() -> str:
@@ -2539,6 +2714,55 @@ def _post_acceptance_message_html(
     return hdr + fin + acct + foot
 
 
+def _deal_complete_party_message_html(
+    advert: dict,
+    row: dict,
+    viewer_telegram_id: int,
+) -> str:
+    """خلاصهٔ آگهی + مالی برای خریدار/فروشنده پس از ثبت هر دو حساب."""
+    aid = int(row["advert_rowid"])
+    seq = int(row.get("seq_in_advert") or row["id"])
+    rate = int(row["rate_toman"])
+    try:
+        pe_raw = int(row.get("proposed_euro_amount") or 0)
+    except (TypeError, ValueError):
+        pe_raw = 0
+    pe_kw = pe_raw if pe_raw > 0 else None
+    eur_amt = _offer_effective_euro_amount(advert, pe_kw)
+    owner_id = int(row["owner_id"])
+    is_owner_view = int(viewer_telegram_id) == owner_id
+    fin = _financial_accept_summary_html(
+        advert, rate, eur_amt, owner_view=is_owner_view
+    )
+    ad_link = advert_public_link_html(advert, aid)
+    amt_line = _offer_amount_line_html(advert, pe_kw)
+    hdr = (
+        f"{_RTL}✅ <b>اطلاعات معامله برای ادمین ارسال شد</b>\n\n"
+        f"{_RTL}لطفاً صبور باشید؛ مراحل بعدی را ادمین هماهنگ می‌کند.\n\n"
+        f"{_RTL}⚠️ <b>بدون هماهنگی ادمین واریز نکنید.</b>\n\n"
+        f"{_RTL}📋 <b>خلاصه آگهی {aid}</b>\n\n"
+        f"{_RTL}✅ پیشنهاد <b>{seq}</b> برای {ad_link}\n\n"
+        f"{amt_line}"
+    )
+    acct = _post_acceptance_account_context_html(
+        advert, row, viewer_telegram_id, for_admin=False
+    )
+    foot = _deal_admin_contact_footer_html(viewer_telegram_id)
+    return hdr + fin + acct + foot
+
+
+def _deal_complete_reply_markup(advert: dict | None) -> InlineKeyboardMarkup:
+    """دکمه‌های معامله + منوی اصلی در یک پیام."""
+    from keyboards.menus import main_menu_inline_keyboard
+
+    rows: list[list[InlineKeyboardButton]] = []
+    extra = _post_acceptance_reply_markup(advert)
+    if extra:
+        rows.extend(list(extra.inline_keyboard))
+    rows.extend(list(main_menu_inline_keyboard.inline_keyboard))
+    return InlineKeyboardMarkup(rows)
+
+
 def _post_acceptance_reply_markup(advert: dict | None) -> InlineKeyboardMarkup | None:
     """دکمه‌های اینلاین بعد از تأیید: لینک ادمین و کانال."""
     rows: list[list[InlineKeyboardButton]] = []
@@ -2782,31 +3006,7 @@ def append_offer_lists_to_channel_html(base_html: str, advert_rowid: int) -> str
     accepted = list_accepted_offers_for_advert(advert_rowid)
     agreement_html = ""
     if accepted:
-        ac = accepted[0]
-        try:
-            rt = int(ac["rate_toman"])
-        except (TypeError, ValueError, KeyError):
-            rt = 0
-        try:
-            pe = int(ac.get("proposed_euro_amount") or 0)
-        except (TypeError, ValueError):
-            pe = 0
-        adv_e = _advert_euro_amount_int(advert_for_list)
-        if rt > 0:
-            if pe > 0 and adv_e > 0 and pe != adv_e:
-                agreement_html = (
-                    f"{_RTL}✅ این آگهی با نرخ {_ltr_rate_toman_html(rt)} و "
-                    f"مقدار <b>{pe:,}</b> یورو به توافق رسیده است.\n\n"
-                )
-            else:
-                agreement_html = (
-                    f"{_RTL}✅ این آگهی با نرخ پیشنهادی {_ltr_rate_toman_html(rt)} به توافق رسیده است.\n\n"
-                )
-        elif hybrid_list and rt == 0:
-            agreement_html = (
-                f"{_RTL}✅ این آگهی با توافق «معاوضهٔ یورو به یورو» (بدون نرخ تومان ثابت در پیشنهاد) "
-                f"به نتیجه رسیده است.\n\n"
-            )
+        agreement_html = f"{_RTL}✅ این آگهی تکمیل شده است.\n\n"
     merged: list[tuple[str, dict]] = (
         [("pending", r) for r in pending]
         + [("rejected", r) for r in rejected]
@@ -3232,9 +3432,9 @@ def _channel_offer_line_inner_html(
         euro_seg = f" — <b>{eff_e:,}</b> یورو"
     st = (offer_status or "pending").strip().lower()
     if st == "rejected":
-        status_prefix = "❌ <b>رد شده</b> — "
+        status_prefix = "❌ "
     elif st == "accepted":
-        status_prefix = "✅ <b>پذیرفته</b> — "
+        status_prefix = "✅ "
     return f"{status_prefix}<b>{seq}</b> — {rate_seg}{euro_seg} — {label}"
 
 

@@ -10,6 +10,7 @@ Workflow:
 from __future__ import annotations
 
 import asyncio
+import html as html_module
 import logging
 import re
 from datetime import datetime
@@ -156,7 +157,22 @@ def _is_admin(uid: int) -> bool:
     return uid in set(ADMIN_IDS or [])
 
 
+def _banking_gemini_available() -> bool:
+    try:
+        from banking_recognition.config import BANKING_RECOGNITION_ENABLED, GEMINI_ENABLED
+
+        return bool(BANKING_RECOGNITION_ENABLED and GEMINI_ENABLED)
+    except Exception:
+        return False
+
+
+def _receipt_ai_available() -> bool:
+    return _banking_gemini_available() or receipt_vision_available()
+
+
 def _receipt_read_mode_hint() -> str:
+    if _banking_gemini_available():
+        return "\n<i>خواندن فیش: Gemini + OCR</i>\n"
     if receipt_vision_should_run():
         return "\n<i>خواندن فیش: AI + OCR</i>\n"
     if receipt_vision_available() and receipt_vision_uses_ollama():
@@ -164,6 +180,34 @@ def _receipt_read_mode_hint() -> str:
     if receipt_vision_available():
         return "\n<i>خواندن فیش: AI + OCR</i>\n"
     return "\n<i>خواندن فیش: OCR</i>\n"
+
+
+def _receipt_read_fail_hint_html() -> str:
+    if _banking_gemini_available():
+        try:
+            from banking_recognition.vision.gemini_fallback import (
+                get_last_gemini_user_hint_fa,
+            )
+
+            extra = get_last_gemini_user_hint_fa()
+        except Exception:
+            extra = ""
+        if extra:
+            return f"ℹ️ فیش خوانده نشد.\n{extra}"
+        return (
+            "ℹ️ فیش خوانده نشد.\n"
+            "متن بفرستید یا کلید <code>GEMINI_API_KEY</code> (فرمت <code>AIzaSy...</code>) "
+            "را در .env بررسی کنید."
+        )
+    if receipt_vision_available():
+        return (
+            "ℹ️ فیش خوانده نشد.\n"
+            "متن بفرستید یا کلید <code>OPENAI_API_KEY</code> را در .env بررسی کنید."
+        )
+    return (
+        "ℹ️ فیش خوانده نشد.\n"
+        "متن بفرستید یا <code>tesseract-ocr-fas</code> را روی سرور نصب کنید."
+    )
 
 
 # جداکنندهٔ هزارگان (ویرگول فارسی «،» با ویرگول لاتین فرق دارد)
@@ -1144,6 +1188,81 @@ def _payload_from_vision(vision: dict, mode: str) -> dict:
     return payload
 
 
+def _vision_dict_from_banking(data: dict) -> dict:
+    """نگاشت خروجی banking_recognition به فرمت vision پنل."""
+    amt = data.get("amount")
+    try:
+        iran_amount = int(amt) if amt is not None else None
+    except (TypeError, ValueError):
+        iran_amount = None
+    receiver = (data.get("receiver_name") or "").strip()
+    sender = (data.get("sender_name") or "").strip()
+    owner = (data.get("owner_name") or "").strip()
+    return {
+        "iran_amount": iran_amount,
+        "jdate": (data.get("date") or "").strip(),
+        "bank_name": (data.get("bank_name") or "").strip(),
+        "dest_bank": "",
+        "recipient_name": receiver,
+        "sender_name": sender,
+        "depositor_name": owner or sender or receiver,
+        "transfer_type": "کارت به کارت"
+        if "کارت" in (data.get("raw_text") or "")
+        else "",
+        "description": (data.get("tracking_number") or "").strip(),
+    }
+
+
+async def _read_receipt_with_banking_gemini(
+    path: str, mode: str
+) -> tuple[dict | None, str, str]:
+    """Gemini 2.5 Flash + OCR داخلی banking_recognition (بدون OpenAI)."""
+    if not _banking_gemini_available():
+        return None, "", ""
+    try:
+        from banking_recognition import process_image_for_receipt
+    except ImportError as e:
+        logger.warning("iran_panel: banking_recognition not installed: %s", e)
+        return None, "", ""
+
+    try:
+        data = await asyncio.wait_for(process_image_for_receipt(path), timeout=90.0)
+    except asyncio.TimeoutError:
+        logger.warning("iran_panel: banking_recognition (gemini-first) timeout")
+        return None, "", ""
+    except Exception:
+        logger.exception("iran_panel: banking_recognition (gemini) failed")
+        return None, "", ""
+
+    raw = (data.get("raw_text") or "").strip()
+    conf = float(data.get("confidence") or 0)
+    try:
+        amt = int(data.get("amount") or 0)
+    except (TypeError, ValueError):
+        amt = 0
+
+    if amt < _MIN_RECEIPT_RIAL and conf < 70:
+        logger.info(
+            "iran_panel: gemini low confidence=%.1f amount=%s",
+            conf,
+            amt,
+        )
+        return None, raw, ""
+
+    payload = _payload_from_vision(_vision_dict_from_banking(data), mode)
+    if raw:
+        payload = _enrich_payload_from_ocr_text(payload, raw, mode)
+    payload = _salvage_amount_on_payload(payload, path)
+    if int(payload.get("iran_amount") or 0) >= _MIN_RECEIPT_RIAL:
+        logger.info(
+            "iran_panel: read source=gemini conf=%.1f amount=%s",
+            conf,
+            payload.get("iran_amount"),
+        )
+        return payload, raw, "gemini"
+    return None, raw, ""
+
+
 def _enrich_payload_from_ocr_text(payload: dict, raw: str, mode: str) -> dict:
     """مبلغ/تاریخ/نام/بانک از OCR — وقتی layout فیش فرق می‌کند یا vision ناقص است."""
     out = dict(payload)
@@ -1206,9 +1325,18 @@ def _vision_amount_ok(vision: dict | None) -> bool:
 
 async def _read_receipt_image(path: str, mode: str) -> tuple[dict | None, str, str]:
     """
-    خواندن رسید: OpenAI بینایی اول (سریع)، Ollama موازی با OCR، بدون API فقط OCR.
-    برمی‌گرداند: (payload مستقیم یا None, متن خام OCR, منبع: vision|ocr|"" )
+    خواندن رسید: Gemini (banking_recognition) → OpenAI vision → OCR.
+    برمی‌گرداند: (payload مستقیم یا None, متن خام OCR, منبع: gemini|vision|ocr|"" )
     """
+    try:
+        gemini_payload, gemini_raw, gemini_src = await _read_receipt_with_banking_gemini(
+            path, mode
+        )
+        if gemini_payload and gemini_src == "gemini":
+            return gemini_payload, gemini_raw, "gemini"
+    except Exception:
+        logger.exception("iran_panel: banking_recognition gemini path failed — OCR fallback")
+
     from config.settings import RECEIPT_VISION_TIMEOUT_SEC
     from utils.receipt_vision import (
         extract_receipt_with_vision,
@@ -1807,6 +1935,10 @@ async def iran_panel_sync_router(update: Update, context: ContextTypes.DEFAULT_T
     uid = update.effective_user.id
     if not _is_admin(uid):
         return
+    from models.enums import UserState
+
+    if (context.user_data.get("state") or "").strip() == UserState.ADMIN_DEAL_GATE_ACCOUNT.name:
+        return
     from utils.flow_guards import user_flow_text_active
 
     if user_flow_text_active(context):
@@ -1870,7 +2002,12 @@ async def iran_panel_sync_router(update: Update, context: ContextTypes.DEFAULT_T
         path = None
         source = ""
         try:
-            use_ai = receipt_vision_available()
+            use_ai = _receipt_ai_available()
+            ai_label = ""
+            if _banking_gemini_available():
+                ai_label = " با Gemini"
+            elif use_ai:
+                ai_label = " با AI"
             if receipt_vision_uses_ollama():
                 from config.settings import RECEIPT_VISION_TIMEOUT_SEC
 
@@ -1881,8 +2018,7 @@ async def iran_panel_sync_router(update: Update, context: ContextTypes.DEFAULT_T
             else:
                 slow_hint = ""
             status_msg = await m.reply_text(
-                f"{_RTL}⏳ در حال خواندن فیش"
-                f"{' با AI' if use_ai else ''}{slow_hint}…",
+                f"{_RTL}⏳ در حال خواندن فیش{ai_label}{slow_hint}…",
                 parse_mode=ParseMode.HTML,
             )
             path = await _download_receipt_to_temp(context.bot, m)
@@ -1892,10 +2028,11 @@ async def iran_panel_sync_router(update: Update, context: ContextTypes.DEFAULT_T
                 )
                 return
             logger.info(
-                "iran_panel: read start path=%s size=%s ai=%s",
+                "iran_panel: read start path=%s size=%s gemini=%s openai=%s",
                 path,
                 os.path.getsize(path),
-                use_ai,
+                _banking_gemini_available(),
+                receipt_vision_available(),
             )
             vision_payload, raw, source = await _read_receipt_image(path, mode)
             logger.info(
@@ -1930,14 +2067,21 @@ async def iran_panel_sync_router(update: Update, context: ContextTypes.DEFAULT_T
                 return
             if vision_payload is None and not raw:
                 await m.reply_text(
-                    "ℹ️ فیش خوانده نشد.\n"
-                    "متن بفرستید یا کلید <code>OPENAI_API_KEY</code> را در .env بررسی کنید.",
+                    _receipt_read_fail_hint_html(),
                     parse_mode=ParseMode.HTML,
                 )
                 return
-        except Exception:
+        except Exception as e:
             logger.exception("iran_panel receipt read failed")
-            await m.reply_text("❌ خطا در خواندن فیش. دوباره امتحان کنید یا مبلغ را متنی بفرستید.")
+            err_short = type(e).__name__
+            await m.reply_text(
+                f"{_RTL}❌ خطا در خواندن فیش ({html_module.escape(err_short)}).\n"
+                f"{_RTL}دوباره بفرستید یا متن:\n"
+                f"<code>مبلغ: 24875000\nتاریخ: 1405/02/13\n"
+                f"نام: حسن نصیری\nبانک: ملت</code>\n\n"
+                f"{_RTL}لاگ: <code>journalctl -u telegram-bot -n 40</code>",
+                parse_mode=ParseMode.HTML,
+            )
             return
         finally:
             if path:
@@ -1980,8 +2124,10 @@ async def iran_panel_sync_router(update: Update, context: ContextTypes.DEFAULT_T
         if payload.get("jdate"):
             lines.append(f"تاریخ: {payload['jdate']}")
         hint_ai = ""
-        if not receipt_vision_available():
-            hint_ai = "برای خواندن بهتر فیش، <code>OPENAI_API_KEY</code> در .env بگذارید.\n"
+        if not _receipt_ai_available():
+            hint_ai = (
+                "برای خواندن بهتر فیش، <code>GEMINI_API_KEY</code> (یا OpenAI) در .env بگذارید.\n"
+            )
         elif int(payload.get("iran_amount") or 0) < _MIN_RECEIPT_RIAL:
             hint_ai = (
                 "مبلغ/تاریخ خوانده نشد — متن بفرستید: "
@@ -2116,6 +2262,10 @@ async def iran_panel_fill_router(update: Update, context: ContextTypes.DEFAULT_T
     After clicking "fill", we ask admin to type missing fields.
     """
     if not update.effective_user or not update.message:
+        return
+    from database.db import deal_gate_active_for_user
+
+    if deal_gate_active_for_user(update.effective_user.id):
         return
     field = (context.user_data.get(_AWAIT_FIELD_KEY) or "").strip()
     if not field:

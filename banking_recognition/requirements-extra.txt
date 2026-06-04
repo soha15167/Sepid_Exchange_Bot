@@ -1,0 +1,12 @@
+# نصب اختیاری برای banking_recognition (روی سرور جدا یا همان VPS)
+pydantic>=2.0
+fastapi>=0.110
+uvicorn[standard]>=0.27
+httpx>=0.25
+opencv-python-headless>=4.8
+numpy>=1.24
+# OCR (سنگین — یکی یا هر دو)
+paddlepaddle>=2.6
+paddleocr>=2.7
+easyocr>=1.7
+# قبلاً در requirements.txt: Pillow, pytesseract
