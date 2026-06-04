@@ -51,19 +51,19 @@
 
 ```mermaid
 flowchart LR
-    subgraph users [کاربران]
-        U1[خریدار/فروشنده]
-        U2[ادمین]
+    subgraph users ["کاربران"]
+        U1["خریدار / فروشنده"]
+        U2["ادمین"]
     end
-    subgraph bot [ربات Python]
-        M[main.py]
-        H[handlers/*]
-        D[(database/db.py)]
-        S[state.py]
+    subgraph bot ["ربات Python"]
+        M["main.py"]
+        H["handlers"]
+        D[("database/db.py")]
+        S["state.py"]
     end
-    subgraph external [خارجی]
-        CH[@Sepid_Exchange]
-        TW[Twilio SMS]
+    subgraph external ["خارجی"]
+        CH["کانال Sepid_Exchange"]
+        TW["Twilio SMS"]
     end
     U1 --> M
     U2 --> M
