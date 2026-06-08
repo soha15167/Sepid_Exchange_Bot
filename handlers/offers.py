@@ -2287,19 +2287,53 @@ def _post_acceptance_admin_party_section_html(
 
 # =============================================================================
 # Deal admin compact message | پیام فشرده ادمین
-# EN: Receipt/settlement lines under buyer block in _post_acceptance_admin_message_html (~1024 chars).
-# FA: خطوط فیش و «نشست» زیر بخش خریدار در caption پیام ادمین.
+# EN: Buyer block (info + toman receipt) then seller block (info + euro/toman receipts).
+# FA: ۱. خریدار + فیش تومان — ۲. فروشنده + فیش‌های بعدی؛ همه در یک caption/پیام.
 # =============================================================================
 
+_ADMIN_SECTION_BUYER = f"{_RTL}━━━━ <b>۱. خریدار یورو</b> ━━━━\n"
+_ADMIN_SECTION_SELLER = f"\n{_RTL}━━━━ <b>۲. فروشنده یورو</b> ━━━━\n"
 
-def _buyer_toman_receipt_admin_line_html(gate: dict | None) -> str:
-    """وضعیت فیش واریز تومان خریدار — زیر بخش خریدار در پیام ادمین."""
+
+def _admin_photo_order_foot_html(labels: list[str] | None) -> str:
+    """راهنمای ترتیب عکس‌های آلبوم (عکس ۱ caption دارد)."""
+    if not labels or len(labels) <= 1:
+        return ""
+    lines = [f"{_RTL}📷 <b>ترتیب عکس‌ها:</b>"]
+    for i, lbl in enumerate(labels, start=1):
+        lines.append(f"{_RTL}  <b>{i}.</b> {html_module.escape(lbl)}")
+    return "\n".join(lines) + "\n"
+
+
+def _buyer_toman_receipt_admin_line_html(
+    gate: dict | None, *, embed_photos: bool = False, slides_mode: bool = False
+) -> str:
+    """وضعیت فیش واریز تومان خریدار — در متن اصلی (بدون عکس اگر slides_mode)."""
     from database.db import deal_gate_buyer_receipt_list
 
-    if not gate or not gate.get("buyer_toman_card_sent_at"):
+    if not gate:
         return ""
     oid = int(gate.get("offer_id") or 0)
     items = deal_gate_buyer_receipt_list(oid) if oid else []
+    card_sent = int(gate.get("buyer_toman_card_sent_at") or 0) > 0
+    if not card_sent and not items:
+        return ""
+    photo_items = [r for r in items if (r.get("type") or "") == "photo"]
+    text_items = [
+        r
+        for r in items
+        if (r.get("type") or "") == "text" and (r.get("text") or "").strip()
+    ]
+    if slides_mode and photo_items and text_items:
+        lines = [f"{_RTL}📎 <b>فیش واریز تومان (متن):</b>"]
+        for r in text_items[-2:]:
+            t = (r.get("text") or "").strip()[:120]
+            lines.append(f"{_RTL}  · <code>{html_module.escape(t)}</code>")
+        if int(gate.get("buyer_toman_settled_at") or 0) > 0:
+            lines.append(f"{_RTL}💵 <b>تومان نشست:</b> ✅ تأیید ادمین")
+        elif items:
+            lines.append(f"{_RTL}💵 <b>تومان نشست:</b> ⏳")
+        return "\n".join(lines) + "\n"
     if not items:
         blk = f"{_RTL}📎 <b>فیش واریز تومان:</b> ⏳ در انتظار\n"
     else:
@@ -2311,23 +2345,59 @@ def _buyer_toman_receipt_admin_line_html(gate: dict | None) -> str:
     if not items:
         return blk
     lines = [blk.rstrip("\n")]
+    photo_lbl = (
+        f"{_RTL}  · 📷 عکس فیش"
+        if not embed_photos
+        else f"{_RTL}  · 📷 عکس فیش (بخش ۱ — بالا)"
+    )
     for r in items[-2:]:
         if (r.get("type") or "") == "text" and (r.get("text") or "").strip():
             t = (r.get("text") or "").strip()[:120]
             lines.append(f"{_RTL}  · <code>{html_module.escape(t)}</code>")
-        elif (r.get("type") or "") == "photo":
-            lines.append(f"{_RTL}  · 📷 عکس فیش")
+        elif (r.get("type") or "") == "photo" and not slides_mode:
+            lines.append(photo_lbl)
     return "\n".join(lines) + "\n"
 
 
-def _seller_euro_receipt_admin_line_html(gate: dict | None) -> str:
-    """وضعیت فیش واریز یورو فروشنده و تأیید نشستن — زیر بخش خریدار در پیام ادمین."""
+def buyer_toman_receipt_slide_caption_html(gate: dict | None) -> str:
+    """برچسب بالای عکس فیش تومان خریدار."""
+    return f"{_RTL}📎 <b>فیش واریز تومان</b>"
+
+
+def _seller_euro_receipt_admin_line_html(
+    gate: dict | None, *, embed_photos: bool = False, slides_mode: bool = False
+) -> str:
+    """وضعیت فیش واریز یورو فروشنده — زیر بخش فروشنده."""
     from database.db import deal_gate_seller_receipt_list
 
     if not gate or not gate.get("seller_eur_account_sent_at"):
         return ""
     oid = int(gate.get("offer_id") or 0)
     items = deal_gate_seller_receipt_list(oid) if oid else []
+    photo_items = [r for r in items if (r.get("type") or "") == "photo"]
+    text_items = [
+        r
+        for r in items
+        if (r.get("type") or "") == "text" and (r.get("text") or "").strip()
+    ]
+    if slides_mode and photo_items and text_items:
+        tlines = [f"{_RTL}📎 <b>فیش واریز یورو (متن):</b>"]
+        for r in text_items[-2:]:
+            t = (r.get("text") or "").strip()[:120]
+            mark = " ✅" if int(r.get("buyer_confirmed_at") or 0) > 0 else ""
+            tlines.append(
+                f"{_RTL}  · <code>{html_module.escape(t)}</code>{mark}"
+            )
+        confirmed = sum(1 for r in items if int(r.get("buyer_confirmed_at") or 0) > 0)
+        if confirmed >= len(items):
+            tlines.append(f"{_RTL}💶 <b>یورو نشست:</b> ✅ تأیید شده")
+        elif confirmed > 0:
+            tlines.append(
+                f"{_RTL}💶 <b>یورو نشست:</b> {confirmed}/{len(items)} تأیید"
+            )
+        else:
+            tlines.append(f"{_RTL}💶 <b>یورو نشست:</b> ⏳ در انتظار تأیید")
+        return "\n".join(tlines) + "\n"
     if not items:
         return f"{_RTL}📎 <b>فیش واریز یورو:</b> ⏳ در انتظار\n"
     confirmed = sum(1 for r in items if int(r.get("buyer_confirmed_at") or 0) > 0)
@@ -2342,6 +2412,11 @@ def _seller_euro_receipt_admin_line_html(gate: dict | None) -> str:
         )
     else:
         lines.append(f"{_RTL}💶 <b>یورو نشست:</b> ⏳ در انتظار تأیید")
+    photo_lbl = (
+        f"{_RTL}  · 📷 عکس فیش (بخش ۲ — بالا)"
+        if embed_photos
+        else f"{_RTL}  · 📷 عکس فیش"
+    )
     for r in items[-2:]:
         if (r.get("type") or "") == "text" and (r.get("text") or "").strip():
             t = (r.get("text") or "").strip()[:120]
@@ -2349,20 +2424,41 @@ def _seller_euro_receipt_admin_line_html(gate: dict | None) -> str:
             lines.append(
                 f"{_RTL}  · <code>{html_module.escape(t)}</code>{mark}"
             )
-        elif (r.get("type") or "") == "photo":
+        elif (r.get("type") or "") == "photo" and not slides_mode:
             mark = " ✅ نشست" if int(r.get("buyer_confirmed_at") or 0) > 0 else ""
-            lines.append(f"{_RTL}  · 📷 عکس فیش{mark}")
+            lines.append(f"{photo_lbl}{mark}")
     return "\n".join(lines) + "\n"
 
 
-def _seller_toman_admin_receipt_line_html(gate: dict | None) -> str:
-    """فیش تومان ادمین به فروشنده — زیر بخش خریدار در پیام ادمین."""
+def seller_euro_receipt_slide_caption_html(
+    gate: dict | None, receipt: dict | None = None
+) -> str:
+    """برچسب بالای عکس فیش یورو فروشنده."""
+    return f"{_RTL}📎 <b>فیش واریز یورو (فروشنده)</b>"
+
+
+def _seller_toman_admin_receipt_line_html(
+    gate: dict | None, *, embed_photos: bool = False, slides_mode: bool = False
+) -> str:
+    """فیش تومان ادمین به فروشنده — زیر بخش فروشنده."""
     from database.db import deal_gate_seller_toman_admin_list
 
     if not gate:
         return ""
     oid = int(gate.get("offer_id") or 0)
     items = deal_gate_seller_toman_admin_list(oid) if oid else []
+    photo_items = [r for r in items if (r.get("type") or "") == "photo"]
+    text_items = [
+        r
+        for r in items
+        if (r.get("type") or "") == "text" and (r.get("text") or "").strip()
+    ]
+    if slides_mode and photo_items and text_items:
+        tlines = [f"{_RTL}📎 <b>فیش تومان به فروشنده (متن):</b>"]
+        for r in text_items[-2:]:
+            t = (r.get("text") or "").strip()[:120]
+            tlines.append(f"{_RTL}  · <code>{html_module.escape(t)}</code>")
+        return "\n".join(tlines) + "\n"
     if not items:
         if not _seller_euro_fully_confirmed_gate(gate):
             return ""
@@ -2370,13 +2466,22 @@ def _seller_toman_admin_receipt_line_html(gate: dict | None) -> str:
     lines = [
         f"{_RTL}📎 <b>فیش تومان به فروشنده:</b> <b>{len(items)}</b> مورد ✅"
     ]
+    photo_lbl = (
+        f"{_RTL}  · 📷 عکس فیش (بخش ۲ — پایین)"
+        if embed_photos
+        else f"{_RTL}  · 📷 عکس فیش"
+    )
     for r in items[-2:]:
         if (r.get("type") or "") == "text" and (r.get("text") or "").strip():
             t = (r.get("text") or "").strip()[:120]
             lines.append(f"{_RTL}  · <code>{html_module.escape(t)}</code>")
-        elif (r.get("type") or "") == "photo":
-            lines.append(f"{_RTL}  · 📷 عکس فیش")
+        elif (r.get("type") or "") == "photo" and not slides_mode:
+            lines.append(photo_lbl)
     return "\n".join(lines) + "\n"
+
+
+def seller_toman_receipt_slide_caption_html(gate: dict | None) -> str:
+    return f"{_RTL}📎 <b>فیش تومان به فروشنده</b>"
 
 
 def _seller_euro_fully_confirmed_gate(gate: dict | None) -> bool:
@@ -2403,6 +2508,9 @@ def _post_acceptance_admin_message_html(
     accounts_status_mode: bool = False,
     deal_complete: bool = False,
     embed_account_photos: bool = False,
+    embed_receipt_photos: bool = False,
+    receipt_slides_mode: bool = False,
+    embed_photo_labels: list[str] | None = None,
     compact: bool = True,
     gate: dict | None = None,
 ) -> str:
@@ -2473,17 +2581,39 @@ def _post_acceptance_admin_message_html(
             account_embedded_photo=buyer_is_photo,
             compact=True,
         )
-        receipt_blk = _buyer_toman_receipt_admin_line_html(gate) if deal_complete else ""
+        receipt_blk = (
+            _buyer_toman_receipt_admin_line_html(
+                gate,
+                embed_photos=embed_receipt_photos,
+                slides_mode=receipt_slides_mode,
+            )
+            if deal_complete
+            else ""
+        )
         euro_rcpt_blk = (
-            _seller_euro_receipt_admin_line_html(gate) if deal_complete else ""
+            _seller_euro_receipt_admin_line_html(
+                gate,
+                embed_photos=embed_receipt_photos,
+                slides_mode=receipt_slides_mode,
+            )
+            if deal_complete
+            else ""
         )
         stom_blk = (
-            _seller_toman_admin_receipt_line_html(gate) if deal_complete else ""
+            _seller_toman_admin_receipt_line_html(
+                gate,
+                embed_photos=embed_receipt_photos,
+                slides_mode=receipt_slides_mode,
+            )
+            if deal_complete
+            else ""
         )
         foot = ""
         if deal_complete:
             foot = f"\n{_RTL}✅ آماده هماهنگی ادمین"
-        return hdr + buyer_sec + receipt_blk + euro_rcpt_blk + stom_blk + seller_sec + foot
+        buyer_block = _ADMIN_SECTION_BUYER + buyer_sec + receipt_blk
+        seller_block = _ADMIN_SECTION_SELLER + seller_sec + euro_rcpt_blk + stom_blk
+        return hdr + buyer_block + seller_block + foot
 
     ad_link = advert_public_link_html(advert, aid)
     amt_line = _offer_amount_line_html(advert, pe_kw)
