@@ -2234,8 +2234,10 @@ def _post_acceptance_admin_party_section_html(
     if acct_raw:
         acct_lbl = "📝 حساب:" if compact else "📝 <b>اطلاعات حساب:</b>"
         if acct_raw.startswith("📷"):
-            if account_embedded_photo or compact:
+            if account_embedded_photo:
                 acct_blk = ""
+            elif compact:
+                acct_blk = f"\n{_RTL}📝 حساب: 📷 عکس (پیام جدا)\n"
             else:
                 acct_blk = (
                     f"\n{_RTL}📝 <b>اطلاعات حساب:</b> 📷 عکس ارسال شد "
@@ -2496,6 +2498,88 @@ def _seller_euro_fully_confirmed_gate(gate: dict | None) -> bool:
     return all(int(r.get("buyer_confirmed_at") or 0) > 0 for r in items)
 
 
+def _outbound_delivered_to_user(offer_id: int, user_id: int, tag: str) -> bool:
+    from database.db import bot_outbound_log_list
+
+    uid = int(user_id)
+    if uid <= 0:
+        return False
+    needle = (tag or "").strip()
+    for row in bot_outbound_log_list(int(offer_id)):
+        if int(row.get("recipient_telegram_id") or 0) != uid:
+            continue
+        if (row.get("tag") or "").strip() == needle:
+            return True
+    return False
+
+
+def _deal_admin_steps_checklist_html(gate: dict | None) -> str:
+    """چک‌لیست مراحل معامله برای پیام اصلی ادمین."""
+    if not gate:
+        return ""
+    from database.db import (
+        deal_gate_buyer_receipt_list,
+        deal_gate_seller_receipt_list,
+        deal_gate_seller_toman_admin_list,
+    )
+
+    oid = int(gate.get("offer_id") or 0)
+    buyer_id = int(gate.get("buyer_telegram_id") or 0)
+    seller_id = int(gate.get("seller_telegram_id") or 0)
+
+    both_yes = (
+        (gate.get("buyer_response") or "").strip().lower() == "yes"
+        and (gate.get("seller_response") or "").strip().lower() == "yes"
+    )
+    accounts_ok = bool((gate.get("buyer_accounts_text") or "").strip()) and bool(
+        (gate.get("seller_accounts_text") or "").strip()
+    )
+    card_sent = int(gate.get("buyer_toman_card_sent_at") or 0) > 0 or (
+        _outbound_delivered_to_user(oid, buyer_id, "کارت واریز تومان به خریدار")
+        if buyer_id
+        else False
+    )
+    buyer_rcpts = deal_gate_buyer_receipt_list(oid) if oid else []
+    buyer_rcpt_ok = bool(buyer_rcpts)
+    toman_settled = int(gate.get("buyer_toman_settled_at") or 0) > 0
+    eur_account_sent = int(gate.get("seller_eur_account_sent_at") or 0) > 0 or (
+        _outbound_delivered_to_user(oid, seller_id, "حساب یوروی خریدار به فروشنده")
+        if seller_id
+        else False
+    )
+    seller_rcpts = deal_gate_seller_receipt_list(oid) if oid else []
+    seller_rcpt_ok = bool(seller_rcpts)
+    euro_confirmed = _seller_euro_fully_confirmed_gate(gate)
+    stom_items = deal_gate_seller_toman_admin_list(oid) if oid else []
+    stom_ok = bool(stom_items)
+    deal_closed = (gate.get("gate_status") or "").strip().lower() == "closed"
+
+    steps: list[tuple[str, bool]] = [
+        ("تأیید نهایی خریدار و فروشنده", both_yes),
+        ("ارسال اطلاعات حساب توسط طرفین", accounts_ok),
+        ("ارسال کارت واریز تومان به خریدار", card_sent),
+        ("واریز تومان و ارسال فیش توسط خریدار", buyer_rcpt_ok),
+        ("تأیید نشست تومان (ادمین)", toman_settled),
+        ("ارسال حساب یورو خریدار به فروشنده", eur_account_sent),
+        ("ارسال فیش یورو توسط فروشنده", seller_rcpt_ok),
+        ("تأیید نشست یورو (خریدار/ادمین)", euro_confirmed),
+        ("ارسال فیش تومان به فروشنده (ادمین)", stom_ok),
+        ("پایان معامله", deal_closed),
+    ]
+
+    current_idx = next((i for i, (_, done) in enumerate(steps) if not done), None)
+    lines = [f"{_RTL}📋 <b>مراحل معامله</b>"]
+    for i, (label, done) in enumerate(steps, start=1):
+        if done:
+            mark = "✅"
+        elif current_idx is not None and i - 1 == current_idx:
+            mark = "⏳"
+        else:
+            mark = "▫️"
+        lines.append(f"{_RTL}{mark} <b>{i}.</b> {html_module.escape(label)}")
+    return "\n".join(lines) + "\n\n"
+
+
 def _post_acceptance_admin_message_html(
     advert: dict,
     row: dict,
@@ -2535,16 +2619,10 @@ def _post_acceptance_admin_message_html(
         ad_link = advert_public_link_html(advert, aid)
         hdr = (
             f"{_RTL}📩 <b>{status}</b> · پیشنهاد <b>{seq}</b> · {ad_link}\n"
-            f"{_RTL}💶 <b>{eur_amt:,}</b> یورو · نرخ <b>{rate:,}</b>\n"
+            f"{_RTL}💶 <b>{eur_amt:,}</b> یورو · نرخ <b>{rate:,}</b>\n\n"
         )
-        if accounts_status_mode:
-            ba = bool((buyer_accounts_text or "").strip())
-            sa = bool((seller_accounts_text or "").strip())
-            hdr += (
-                f"{_RTL}حساب: خریدار {'✅' if ba else '⏳'} · "
-                f"فروشنده {'✅' if sa else '⏳'}\n"
-            )
-        hdr += "\n"
+        if gate:
+            hdr += _deal_admin_steps_checklist_html(gate)
         buyer_fin = _financial_party_summary_compact_html(
             advert, rate, eur_amt, party="buyer"
         )
@@ -2608,12 +2686,9 @@ def _post_acceptance_admin_message_html(
             if deal_complete
             else ""
         )
-        foot = ""
-        if deal_complete:
-            foot = f"\n{_RTL}✅ آماده هماهنگی ادمین"
         buyer_block = _ADMIN_SECTION_BUYER + buyer_sec + receipt_blk
         seller_block = _ADMIN_SECTION_SELLER + seller_sec + euro_rcpt_blk + stom_blk
-        return hdr + buyer_block + seller_block + foot
+        return hdr + buyer_block + seller_block
 
     ad_link = advert_public_link_html(advert, aid)
     amt_line = _offer_amount_line_html(advert, pe_kw)
@@ -2633,14 +2708,8 @@ def _post_acceptance_admin_message_html(
         f"{_RTL}✅ پیشنهاد <b>{seq}</b> برای {ad_link}\n\n"
         f"{amt_line}"
     )
-    if accounts_status_mode:
-        ba = bool((buyer_accounts_text or "").strip())
-        sa = bool((seller_accounts_text or "").strip())
-        hdr += (
-            f"{_RTL}📊 <b>وضعیت حساب:</b> "
-            f"خریدار {'✅' if ba else '⏳'} · "
-            f"فروشنده {'✅' if sa else '⏳'}\n\n"
-        )
+    if gate:
+        hdr += _deal_admin_steps_checklist_html(gate)
     buyer_is_photo = embed_account_photos and _account_text_is_photo_marker(
         buyer_accounts_text
     )
@@ -2688,10 +2757,6 @@ def _post_acceptance_admin_message_html(
         )
     elif owner_id:
         foot += _format_deal_party_identity_html(owner_id, title="پذیرنده (صاحب آگهی)")
-    if deal_complete:
-        foot += (
-            f"\n{_RTL}✅ <b>هر دو طرف حساب را ارسال کردند — آماده هماهنگی.</b>"
-        )
     return hdr + buyer_sec + seller_sec + desc_blk + foot
 
 

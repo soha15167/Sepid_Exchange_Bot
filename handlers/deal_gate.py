@@ -157,11 +157,21 @@ def _parse_admin_notify_photo_mids(
 
 
 def _serialize_admin_notify_photo_mids(
-    mids: dict[int, dict[str, int | list[int]]],
+    mids: dict[int, dict[str, int | list[int] | list[str] | dict[str, int]]],
 ) -> str:
-    def _encode_val(v: int | list[int]) -> int | list[int]:
+    def _encode_val(
+        v: int | str | list[int] | list[str] | dict[str, int],
+    ) -> int | str | list[int] | list[str] | dict[str, int]:
+        if isinstance(v, dict):
+            return {str(fk): int(fm) for fk, fm in v.items() if str(fk).strip() and int(fm) > 0}
         if isinstance(v, list):
+            if not v:
+                return []
+            if isinstance(v[0], str):
+                return [str(x) for x in v if str(x).strip()]
             return [int(x) for x in v]
+        if isinstance(v, str):
+            return v
         return int(v)
 
     return json.dumps(
@@ -173,14 +183,56 @@ def _serialize_admin_notify_photo_mids(
 
 
 def _parse_admin_album_mids(gate: dict) -> dict[int, list[int]]:
+    """لیست message_id عکس‌های reply (سازگاری با قالب قدیمی album)."""
     raw = _parse_admin_notify_photo_mids(gate)
     out: dict[int, list[int]] = {}
     for chat_id, v in raw.items():
+        by_fid = v.get("by_fid")
+        if isinstance(by_fid, dict):
+            mids = [int(x) for x in by_fid.values() if int(x) > 0]
+            if mids:
+                out[int(chat_id)] = mids
+            continue
         album = v.get("album")
         if isinstance(album, list):
             mids = [int(x) for x in album if int(x) > 0]
             if mids:
                 out[int(chat_id)] = mids
+    return out
+
+
+def _parse_admin_photo_reply_by_fid(gate: dict) -> dict[int, dict[str, int]]:
+    """chat_id -> {telegram_file_id: message_id} (قالب قدیمی reply تکی)."""
+    raw = _parse_admin_notify_photo_mids(gate)
+    out: dict[int, dict[str, int]] = {}
+    for chat_id, v in raw.items():
+        by_fid = v.get("by_fid")
+        if not isinstance(by_fid, dict):
+            continue
+        m: dict[str, int] = {}
+        for fid, mid in by_fid.items():
+            f = str(fid or "").strip()
+            try:
+                m_id = int(mid)
+            except (TypeError, ValueError):
+                continue
+            if f and m_id > 0:
+                m[f] = m_id
+        if m:
+            out[int(chat_id)] = m
+    return out
+
+
+def _parse_admin_album_fids(gate: dict) -> dict[int, list[str]]:
+    """chat_id -> ترتیب file_idهای آلبوم reply."""
+    raw = _parse_admin_notify_photo_mids(gate)
+    out: dict[int, list[str]] = {}
+    for chat_id, v in raw.items():
+        fids = v.get("fids")
+        if isinstance(fids, list):
+            lst = [str(f).strip() for f in fids if str(f).strip()]
+            if lst:
+                out[int(chat_id)] = lst
     return out
 
 
@@ -317,6 +369,48 @@ def _admin_receipt_slides_plan(
     return slides[:_TELEGRAM_ALBUM_MAX]
 
 
+def _admin_account_slides_plan(
+    gate: dict,
+    offer_id: int,
+    *,
+    seq: int,
+    aid: int,
+) -> list[tuple[str, str]]:
+    """عکس‌های حساب — آلبوم reply جدا تا caption ۱۰۲۴ بخش فروشنده را نبرد."""
+    tag = _deal_admin_album_tag_html(seq, aid, offer_id)
+    slides: list[tuple[str, str]] = []
+    for party, label in (("buyer", "حساب خریدار"), ("seller", "حساب فروشنده")):
+        fid = _admin_party_account_photo(gate, party)
+        if fid:
+            slides.append((fid, f"{tag}\n{_RTL}📷 <b>{label}</b>"))
+    return slides[:_TELEGRAM_ALBUM_MAX]
+
+
+def _admin_deal_slides_plan(
+    gate: dict,
+    offer_id: int,
+    *,
+    seq: int,
+    aid: int,
+    include_receipts: bool = True,
+) -> list[tuple[str, str]]:
+    """حساب‌ها + فیش‌ها — یک آلبوم reply زیر پیام متنی (برچسب آگهی روی هر عکس)."""
+    merged: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for fid, cap in _admin_account_slides_plan(gate, offer_id, seq=seq, aid=aid):
+        f = (fid or "").strip()
+        if f and f not in seen:
+            seen.add(f)
+            merged.append((f, cap))
+    if include_receipts:
+        for fid, cap in _admin_receipt_slides_plan(gate, offer_id, seq=seq, aid=aid):
+            f = (fid or "").strip()
+            if f and f not in seen:
+                seen.add(f)
+                merged.append((f, cap))
+    return merged[:_TELEGRAM_ALBUM_MAX]
+
+
 def _deal_admin_album_tag_html(seq: int, aid: int, offer_id: int) -> str:
     """برچسب کوتاه روی هر عکس — تشخیص آگهی وقتی چند معامله باز است."""
     return (
@@ -328,7 +422,7 @@ def _deal_admin_album_tag_html(seq: int, aid: int, offer_id: int) -> str:
 def _build_receipt_only_album_media(
     slides: list[tuple[str, str]],
 ) -> list[InputMediaPhoto]:
-    """آلبوم فقط فیش‌ها — متن اصلی جدا می‌ماند."""
+    """آلبوم با caption جدا روی هر عکس (legacy)."""
     media: list[InputMediaPhoto] = []
     for fid, slide_cap in slides:
         cap = _photo_caption_html(slide_cap)
@@ -352,64 +446,117 @@ def _build_receipt_only_album_media(
     return media
 
 
-async def _sync_admin_text_and_receipt_album(
+async def _sync_admin_album_captions(
+    bot,
+    *,
+    chat_id: int,
+    album_mids: list[int],
+    slides: list[tuple[str, str]],
+) -> bool:
+    """به‌روز caption هر عکس آلبوم وقتی file_idها عوض نشده."""
+    if len(album_mids) != len(slides):
+        return False
+    ok = True
+    for mid, (_, slide_cap) in zip(album_mids, slides):
+        cap = _photo_caption_html(slide_cap)
+        try:
+            await bot.edit_message_caption(
+                chat_id=int(chat_id),
+                message_id=int(mid),
+                caption=cap,
+                parse_mode=ParseMode.HTML,
+            )
+        except BadRequest as e:
+            if "message is not modified" not in str(e).lower():
+                ok = False
+        except TelegramError:
+            ok = False
+    return ok
+
+
+async def _sync_admin_text_and_album_reply(
     bot,
     *,
     chat_id: int,
     old_mid: int | None,
     old_album_mids: list[int],
+    stored_fids: list[str],
     admin_html: str,
     slides: list[tuple[str, str]],
     reply_markup,
     plain: str,
     log_offer_id: int,
-) -> tuple[int | None, list[int]]:
+) -> tuple[int | None, list[int], list[str]]:
     """
-    پیام اصلی = متن (edit-in-place) + آلبوم reply فقط برای فیش‌ها.
-    پیام متنی هرگز با آلبوم ادغام نمی‌شود تا خلاصهٔ معامله پاک نشود.
-    """
-    album_ids = {int(x) for x in old_album_mids if int(x) > 0}
-    main_mid = int(old_mid) if old_mid else None
+    پیام متنی اصلی (خلاصه + دکمه) همیشه حفظ می‌شود؛ آلبوم عکس‌ها reply به همان پیام.
+  """
+    desired_fids = [(fid or "").strip() for fid, _ in slides if (fid or "").strip()]
+    was_glued = bool(
+        old_album_mids
+        and old_mid
+        and int(old_mid) == int(old_album_mids[0])
+    )
+    text_old_mid = None if was_glued else old_mid
 
-    # قالب قدیمی: admin_notify_mids = اولین عکس آلبوم
-    if main_mid and main_mid in album_ids:
-        for mid in album_ids:
-            await _delete_message_safe(bot, chat_id, mid)
-        main_mid = None
-    elif album_ids:
-        for mid in album_ids:
-            await _delete_message_safe(bot, chat_id, mid)
-
-    new_main_mid = await _edit_or_send_admin_notification(
+    text_mid = await _edit_or_send_admin_notification(
         bot,
         chat_id=chat_id,
-        old_mid=main_mid,
+        old_mid=text_old_mid,
         admin_html=admin_html,
         photo_fids=[],
         reply_markup=reply_markup,
         plain=plain,
         log_offer_id=log_offer_id,
     )
+    if not text_mid:
+        return None, [], []
 
-    new_album: list[int] = []
-    if new_main_mid and slides:
-        media = _build_receipt_only_album_media(slides)
-        try:
-            msgs = await bot.send_media_group(
-                chat_id=chat_id,
-                media=media,
-                reply_to_message_id=int(new_main_mid),
-            )
-            new_album = [int(m.message_id) for m in msgs]
-        except TelegramError as e:
-            logger.warning(
-                "deal_admin_sync: receipt album offer=%s chat=%s: %s",
-                log_offer_id,
-                chat_id,
-                e,
-            )
+    if not slides:
+        for mid in old_album_mids:
+            if int(mid) != int(text_mid):
+                await _delete_message_safe(bot, chat_id, int(mid))
+        return int(text_mid), [], []
 
-    return new_main_mid, new_album
+    if was_glued:
+        for mid in old_album_mids:
+            await _delete_message_safe(bot, chat_id, int(mid))
+
+    album_ok = (
+        not was_glued
+        and old_album_mids
+        and desired_fids == stored_fids
+        and len(old_album_mids) == len(slides)
+    )
+    if album_ok:
+        await _sync_admin_album_captions(
+            bot,
+            chat_id=chat_id,
+            album_mids=old_album_mids,
+            slides=slides,
+        )
+        return int(text_mid), list(old_album_mids), list(desired_fids)
+
+    for mid in old_album_mids:
+        if int(mid) != int(text_mid):
+            await _delete_message_safe(bot, chat_id, int(mid))
+
+    media = _build_receipt_only_album_media(slides)
+    try:
+        msgs = await bot.send_media_group(
+            chat_id=int(chat_id),
+            media=media,
+            reply_to_message_id=int(text_mid),
+        )
+        album = [int(m.message_id) for m in msgs]
+        return int(text_mid), album, desired_fids
+    except TelegramError as e:
+        logger.warning(
+            "deal_admin_sync: album reply offer=%s chat=%s: %s",
+            log_offer_id,
+            chat_id,
+            e,
+        )
+        return int(text_mid), [], []
 
 
 async def _delete_admin_album_messages(
@@ -686,23 +833,21 @@ async def sync_deal_admin_notification(
     seller_id = int(gate["seller_telegram_id"])
     buyer_acct = (gate.get("buyer_accounts_text") or "").strip()
     seller_acct = (gate.get("seller_accounts_text") or "").strip()
-    if deal_complete:
-        receipt_slides = _admin_receipt_slides_plan(
-            gate, oid, seq=seq, aid=aid
-        )
-        photo_fids: list[str] = []
-        receipt_slides_mode = True
-    else:
-        receipt_slides = []
-        receipt_slides_mode = False
-        all_photo_fids = _admin_account_photo_file_ids(gate)
-        if len(all_photo_fids) >= 2:
-            photo_fids = all_photo_fids
-        else:
-            primary = _primary_admin_photo_file_id(gate)
-            photo_fids = [primary] if primary else []
     accounts_mode = not deal_complete
-    embed_photos = bool(photo_fids)
+    if deal_complete:
+        album_slides = _admin_deal_slides_plan(
+            gate, oid, seq=seq, aid=aid, include_receipts=True
+        )
+        receipt_slides_mode = True
+    elif accounts_mode:
+        album_slides = _admin_account_slides_plan(gate, oid, seq=seq, aid=aid)
+        receipt_slides_mode = False
+    else:
+        album_slides = []
+        receipt_slides_mode = False
+    photo_fids: list[str] = []
+    # عکس حساب در آلبوم reply — نه داخل caption (حد ۱۰۲۴ کاراکتر بخش فروشنده را حذف می‌کرد)
+    embed_photos = False
 
     admin_html = _post_acceptance_admin_message_html(
         advert,
@@ -736,29 +881,39 @@ async def sync_deal_admin_notification(
         reply_markup = None
 
     album_stored = _parse_admin_album_mids(gate)
-    album_updated: dict[int, list[int]] = {}
+    album_fids_stored = _parse_admin_album_fids(gate)
+    by_fid_stored = _parse_admin_photo_reply_by_fid(gate)
+    album_payload_updated: dict[int, dict[str, list]] = {}
 
     for chat_id in recipients:
+        cid = int(chat_id)
         old_mid = stored.get(chat_id)
-        old_album = album_stored.get(int(chat_id)) or []
-        if deal_complete and receipt_slides:
-            new_mid, new_album = await _sync_admin_text_and_receipt_album(
+        old_album = list(album_stored.get(cid) or [])
+        stored_fids = list(album_fids_stored.get(cid) or [])
+        if by_fid_stored.get(cid) and not stored_fids:
+            old_album = list(by_fid_stored[cid].values()) + old_album
+            stored_fids = []
+        if album_slides:
+            new_mid, new_album, new_fids = await _sync_admin_text_and_album_reply(
                 bot,
-                chat_id=chat_id,
+                chat_id=cid,
                 old_mid=old_mid,
                 old_album_mids=old_album,
+                stored_fids=stored_fids,
                 admin_html=admin_html,
-                slides=receipt_slides,
+                slides=album_slides,
                 reply_markup=reply_markup,
                 plain=plain,
                 log_offer_id=oid,
             )
         else:
-            if old_album and deal_complete:
-                await _delete_admin_album_messages(bot, int(chat_id), old_album)
+            if old_album:
+                await _delete_admin_album_messages(bot, cid, old_album)
+            for mid in (by_fid_stored.get(cid) or {}).values():
+                await _delete_message_safe(bot, cid, int(mid))
             new_mid = await _edit_or_send_admin_notification(
                 bot,
-                chat_id=chat_id,
+                chat_id=cid,
                 old_mid=old_mid,
                 admin_html=admin_html,
                 photo_fids=photo_fids,
@@ -767,29 +922,38 @@ async def sync_deal_admin_notification(
                 log_offer_id=oid,
             )
             new_album = []
+            new_fids = []
         if new_mid:
             updated[chat_id] = int(new_mid)
             if new_album:
-                album_updated[int(chat_id)] = new_album
+                album_payload_updated[cid] = {
+                    "album": new_album,
+                    "fids": new_fids,
+                    "mode": "reply",
+                }
             logger.info(
-                "deal_admin_sync: synced offer=%s chat_id=%s mid=%s photos=%s slides=%s",
+                "deal_admin_sync: synced offer=%s chat_id=%s mid=%s album=%s slides=%s",
                 oid,
                 chat_id,
                 new_mid,
-                len(photo_fids),
                 len(new_album),
+                len(album_slides),
             )
 
     upsert_fields: dict = {}
     if updated != stored:
         upsert_fields["admin_notify_mids"] = _serialize_admin_notify_mids(updated)
     stored_photos = _parse_admin_notify_photo_mids(gate)
-    photo_payload: dict[int, dict[str, int | list[int]]] = dict(stored_photos)
-    for cid, mids in album_updated.items():
-        photo_payload[cid] = {"album": mids}
+    photo_payload: dict[int, dict[str, int | list[int] | dict[str, int]]] = dict(
+        stored_photos
+    )
+    for cid, payload in album_payload_updated.items():
+        photo_payload[cid] = payload
     for chat_id in recipients:
         cid = int(chat_id)
-        if deal_complete and cid not in album_updated and album_stored.get(cid):
+        if cid not in album_payload_updated and (
+            album_stored.get(cid) or by_fid_stored.get(cid)
+        ):
             photo_payload.pop(cid, None)
     if photo_payload != stored_photos:
         upsert_fields["admin_notify_photo_mids"] = (
@@ -809,8 +973,8 @@ async def sync_deal_admin_notification(
 
 # =============================================================================
 # Section 3 | بخش ۳ — Inline keyboards and main menu
-# EN: Party/admin keyboards; _show_user_main_menu uses admin_home for admins.
-# FA: دکمه‌های طرفین و ادمین؛ منوی اصلی (پنل ادمین برای ADMIN_IDS).
+# EN: Party keyboards; admins stay on deal message (no admin_home after deal buttons).
+# FA: دکمه‌های طرفین؛ ادمین پس از دکمه‌های معامله منوی پنل نمی‌گیرد.
 # =============================================================================
 
 
@@ -1398,12 +1562,6 @@ async def _admin_send_toman_deposit_card(
         )
     except Exception:
         pass
-    await _show_user_main_menu(
-        context,
-        q.from_user.id,
-        text=f"{_RTL}✅ کارت برای خریدار ارسال شد.",
-        parse_mode=ParseMode.HTML,
-    )
 
 
 def _seller_euro_transfer_rules_html() -> str:
@@ -1634,12 +1792,6 @@ async def deal_admin_toman_settled_callback(
         )
     except Exception:
         pass
-    await _show_user_main_menu(
-        context,
-        q.from_user.id,
-        text=f"{_RTL}✅ <b>تومان نشست</b> ثبت شد.",
-        parse_mode=ParseMode.HTML,
-    )
 
 
 async def deal_admin_send_buyer_eur_account_callback(
@@ -1774,12 +1926,13 @@ async def _apply_euro_settled(
                     )
         except Exception:
             pass
-        await _show_user_main_menu(
-            context,
-            answer_query.from_user.id,
-            text=f"{_RTL}✅ تأیید یورو ثبت شد.",
-            parse_mode=ParseMode.HTML,
-        )
+        if answer_query.from_user.id not in set(ADMIN_IDS or []):
+            await _show_user_main_menu(
+                context,
+                answer_query.from_user.id,
+                text=f"{_RTL}✅ تأیید یورو ثبت شد.",
+                parse_mode=ParseMode.HTML,
+            )
 
 
 async def deal_admin_euro_settled_callback(
@@ -2594,13 +2747,28 @@ def build_admin_deal_detail_html(
         body += _format_deal_party_identity_html(seller_id, title="فروشنده یورو")
 
     acct_parts: list[str] = []
-    for label, key in (("خریدار", "buyer_accounts_text"), ("فروشنده", "seller_accounts_text")):
+    for label, key, fid_key in (
+        ("خریدار", "buyer_accounts_text", "buyer_accounts_photo_file_id"),
+        ("فروشنده", "seller_accounts_text", "seller_accounts_photo_file_id"),
+    ):
         raw = (gate.get(key) or "").strip()
         if raw:
-            acct_parts.append(
-                f"\n{_RTL}🏦 <b>حساب {label}</b>\n"
-                f"<pre>{html_module.escape(raw[:2000])}</pre>"
-            )
+            if _account_text_is_photo_marker(raw):
+                has_img = bool((gate.get(fid_key) or "").strip())
+                acct_parts.append(
+                    f"\n{_RTL}🏦 <b>حساب {label}</b>\n"
+                    f"{_RTL}📷 عکس ثبت شده"
+                    + (
+                        " — در آلبوم زیر پیام اصلی معامله"
+                        if has_img
+                        else " (فایل در دیتابیس نیست)"
+                    )
+                )
+            else:
+                acct_parts.append(
+                    f"\n{_RTL}🏦 <b>حساب {label}</b>\n"
+                    f"<pre>{html_module.escape(raw[:2000])}</pre>"
+                )
         elif st == "accounts":
             acct_parts.append(f"\n{_RTL}🏦 <b>حساب {label}:</b> ⏳ هنوز ارسال نشده")
     return hdr + body + "".join(acct_parts)
