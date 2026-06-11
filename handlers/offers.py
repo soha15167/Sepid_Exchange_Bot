@@ -2486,16 +2486,22 @@ def seller_toman_receipt_slide_caption_html(gate: dict | None) -> str:
     return f"{_RTL}📎 <b>فیش تومان به فروشنده</b>"
 
 
-def _seller_euro_fully_confirmed_gate(gate: dict | None) -> bool:
+def _seller_euro_receipts_all_confirmed(gate: dict | None) -> bool:
     from database.db import deal_gate_seller_receipt_list
 
-    if not gate or not gate.get("seller_eur_account_sent_at"):
+    if not gate:
         return False
     oid = int(gate.get("offer_id") or 0)
     items = deal_gate_seller_receipt_list(oid) if oid else []
     if not items:
         return False
     return all(int(r.get("buyer_confirmed_at") or 0) > 0 for r in items)
+
+
+def _seller_euro_fully_confirmed_gate(gate: dict | None) -> bool:
+    if not gate or not gate.get("seller_eur_account_sent_at"):
+        return False
+    return _seller_euro_receipts_all_confirmed(gate)
 
 
 def _outbound_delivered_to_user(offer_id: int, user_id: int, tag: str) -> bool:
@@ -2540,8 +2546,8 @@ def _deal_admin_steps_checklist_html(gate: dict | None) -> str:
         else False
     )
     buyer_rcpts = deal_gate_buyer_receipt_list(oid) if oid else []
-    buyer_rcpt_ok = bool(buyer_rcpts)
     toman_settled = int(gate.get("buyer_toman_settled_at") or 0) > 0
+    buyer_rcpt_ok = bool(buyer_rcpts) or toman_settled
     eur_account_sent = int(gate.get("seller_eur_account_sent_at") or 0) > 0 or (
         _outbound_delivered_to_user(oid, seller_id, "حساب یوروی خریدار به فروشنده")
         if seller_id
@@ -2549,7 +2555,7 @@ def _deal_admin_steps_checklist_html(gate: dict | None) -> str:
     )
     seller_rcpts = deal_gate_seller_receipt_list(oid) if oid else []
     seller_rcpt_ok = bool(seller_rcpts)
-    euro_confirmed = _seller_euro_fully_confirmed_gate(gate)
+    euro_confirmed = _seller_euro_receipts_all_confirmed(gate)
     stom_items = deal_gate_seller_toman_admin_list(oid) if oid else []
     stom_ok = bool(stom_items)
     deal_closed = (gate.get("gate_status") or "").strip().lower() == "closed"

@@ -143,6 +143,7 @@ from handlers.channel_info import (
 from handlers.deal_gate import (
     admin_deal_gate_account_photo_router,
     deal_admin_euro_settled_callback,
+    deal_admin_party_proxy_callback,
     deal_admin_payment_callback,
     deal_admin_seller_toman_receipt_callback,
     deal_admin_send_buyer_eur_account_callback,
@@ -717,7 +718,13 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_confirm_exchange, pattern="^confirm_exchange$"))
     application.add_handler(CallbackQueryHandler(handle_service_operation_callback, pattern="^service_op_"))
     application.add_handler(CallbackQueryHandler(handle_inline_cancel_callback, pattern="^inline_cancel$"))
-    # Deal Gate admin callbacks | callbackهای ادمین معامله: pay, tomset, eurcfm, stom, outlog
+    # Deal Gate admin callbacks | callbackهای ادمین معامله: pxy, pay, tomset, eurcfm, stom, outlog
+    application.add_handler(
+        CallbackQueryHandler(
+            deal_admin_party_proxy_callback,
+            pattern=r"^adm\|pxy\|",
+        )
+    )
     application.add_handler(CallbackQueryHandler(deal_admin_payment_callback, pattern=r"^adm\|pay\|"))
     application.add_handler(
         CallbackQueryHandler(
