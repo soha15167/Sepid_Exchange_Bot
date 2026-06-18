@@ -54,6 +54,23 @@ async def handle_channel_member_ack(update: Update, context: ContextTypes.DEFAUL
 
     await cleanup_ids(context.bot, chat_id=chat_id, ids=extra_mids)
 
+    state = (context.user_data.get("state") or "").strip()
+    if state == UserState.EURO_CONFIRM_ADVERT.name:
+        from handlers.euro_flow import restore_euro_preview_after_channel_join
+
+        restored = await restore_euro_preview_after_channel_join(
+            context.bot, chat_id, uid, context
+        )
+        if restored:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "\u200f✅ عضویت تأیید شد.\n"
+                    "\u200fپیش‌نمایش آگهی دوباره فرستاده شد — «تایید آگهی» را بزنید."
+                ),
+            )
+            return
+
     bucket = user_data_store.get(uid, {})
     bucket.pop("euro_cleanup_message_ids", None)
     bucket.pop("exchange_cleanup_message_ids", None)

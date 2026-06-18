@@ -500,6 +500,13 @@ async def get_display_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update, context, f"{_RTL}❌ لطفاً یک نام معتبر وارد کنید:"
         )
         return REGISTER_DISPLAY_NAME
+    if "<" in display_name or ">" in display_name:
+        await _reply_registration_step(
+            update,
+            context,
+            f"{_RTL}❌ نام نمایشی نباید شامل < یا > باشد (مثلاً به‌جای &lt;n.t&gt; بنویسید: n.t)",
+        )
+        return REGISTER_DISPLAY_NAME
     if display_name_exists(display_name):
         await _reply_registration_step(
             update,

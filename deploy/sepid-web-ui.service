@@ -1,0 +1,19 @@
+[Unit]
+Description=Sepid Exchange Web UI (Next.js)
+After=network.target sepid-web-api.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/web
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=NEXT_PUBLIC_API_URL=http://127.0.0.1:8100
+# مستقیم از node_modules — بدون npx (کمتر خطا می‌دهد)
+ExecStart=/root/web/node_modules/.bin/next start -H 0.0.0.0 -p 3100
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

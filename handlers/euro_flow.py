@@ -5,8 +5,12 @@ EN: Amount, rate, description, country, instant transfer → channel post.
 FA: مقدار، نرخ تومان، توضیحات، کشور، واریز آنی → انتشار در کانال.
 """
 
+import html as html_module
+import logging
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
+from telegram.constants import ParseMode
 from telegram.constants import ParseMode
 
 from models.enums import UserState
@@ -37,6 +41,7 @@ from utils.channel_membership import (
 from utils.channel_ad_publish import try_open_telegram_url
 
 _EURO_CLEANUP_KEY = "euro_cleanup_message_ids"
+logger = logging.getLogger(__name__)
 
 
 def resolve_channel_advert_identity(context: ContextTypes.DEFAULT_TYPE, acting_user_id: int) -> tuple[int, str]:
@@ -95,6 +100,170 @@ def _format_instant_transfer(value: str | None) -> str | None:
         "unknown": "اطلاعی ندارم",
     }
     return mapping.get(value, value)
+
+
+def _euro_bucket(user_id: int) -> dict:
+    return user_data_store.setdefault(int(user_id), {})
+
+
+def _euro_save_field(
+    user_id: int, context: ContextTypes.DEFAULT_TYPE, key: str, value
+) -> None:
+    context.user_data[key] = value
+    _euro_bucket(user_id)[key] = value
+
+
+def _euro_load_draft(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> dict | None:
+    """Draft amount/rate/desc from context + user_data_store (survives partial resets)."""
+    bucket = user_data_store.get(int(user_id)) or {}
+    ud = context.user_data
+
+    def _int_field(field: str) -> int | None:
+        for src in (ud, bucket):
+            raw = src.get(field)
+            if raw is None:
+                continue
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    amount = _int_field("euro_amount")
+    rate = _int_field("euro_rate")
+    desc = (ud.get("euro_description") or bucket.get("euro_description") or "").strip()
+    if amount is None or rate is None or not desc:
+        return None
+    return {"amount": amount, "rate": rate, "desc": desc}
+
+
+def _euro_flow_meta(user_id: int) -> dict:
+    bucket = _euro_bucket(user_id)
+    operation = bucket.get("operation", "نامشخص")
+    methods = bucket.get("methods", [])
+    return {
+        "operation": operation,
+        "methods": methods,
+        "methods_text": _format_methods_rtl(methods),
+        "account_country": bucket.get("account_country"),
+        "instant_transfer": (
+            _format_instant_transfer(bucket.get("instant_transfer"))
+            if operation != "خرید"
+            else None
+        ),
+    }
+
+
+async def _build_euro_preview_html(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    *,
+    bot_username: str | None = None,
+) -> str | None:
+    draft = _euro_load_draft(user_id, context)
+    if not draft:
+        return None
+    _, full_name = resolve_channel_advert_identity(context, user_id)
+    meta = _euro_flow_meta(user_id)
+    operation = meta["operation"]
+    advert_type = "خرید یورو" if operation == "خرید" else "فروش یورو"
+    methods_label = "روش‌های دریافت" if operation == "خرید" else "روش‌های پرداخت"
+    methods_block = f"💳 <b>{methods_label}:</b>\n{meta['methods_text']}\n\n"
+    esc_name = html_module.escape(full_name or "—", quote=False)
+    esc_desc = html_module.escape(draft["desc"] or "—", quote=False)
+    body = (
+        "📣 <b>پیش‌نمایش آگهی</b>\n\n"
+        f"👤 <b>آگهی‌دهنده:</b> {esc_name}\n"
+        f"🏷️ <b>نوع آگهی:</b> {advert_type}\n"
+        f"{methods_block}"
+        f"💶 <b>مقدار:</b> {draft['amount']:,} یورو\n"
+        f"💰 <b>نرخ:</b> {draft['rate']:,} تومان\n"
+        f"🧾 <b>کارمزد معامله:</b> {_format_fee_eur(draft['amount'])}\n\n"
+        f"{_channel_country_html(meta['account_country'], operation=operation)}"
+        f"{_format_optional_line('⚡ <b>امکان واریز آنی:</b>', meta['instant_transfer'])}"
+        f"📄 <b>توضیحات:</b> {esc_desc}"
+    )
+    if bot_username is None:
+        bot_username = (await context.bot.get_me()).username
+    return body + format_channel_ad_footer(bot_username=bot_username)
+
+
+def _euro_preview_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ تایید آگهی", callback_data="confirm_advert")],
+            [InlineKeyboardButton("❌ انصراف", callback_data="inline_cancel")],
+        ]
+    )
+
+
+async def _send_euro_preview_message(
+    bot,
+    *,
+    chat_id: int,
+    user_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+    preview = await _build_euro_preview_html(context, user_id)
+    if not preview:
+        return False
+    sent = await bot.send_message(
+        chat_id=chat_id,
+        text=preview,
+        parse_mode=ParseMode.HTML,
+        reply_markup=_euro_preview_keyboard(),
+    )
+    remember_cleanup_id(user_data_store, user_id, sent.message_id, _EURO_CLEANUP_KEY)
+    context.user_data["state"] = UserState.EURO_CONFIRM_ADVERT.name
+    return True
+
+
+async def restore_euro_preview_after_channel_join(
+    bot, chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    """After channel join during confirm step — resend preview instead of wiping wizard."""
+    draft = _euro_load_draft(user_id, context)
+    if not draft:
+        return False
+    _euro_save_field(user_id, context, "euro_amount", draft["amount"])
+    _euro_save_field(user_id, context, "euro_rate", draft["rate"])
+    _euro_save_field(user_id, context, "euro_description", draft["desc"])
+    return await _send_euro_preview_message(
+        bot, chat_id=chat_id, user_id=user_id, context=context
+    )
+
+
+def _build_euro_channel_ad_html(
+    *,
+    advert_id: int,
+    full_name: str,
+    amount: int,
+    rate: int,
+    desc: str,
+    operation: str,
+    methods_text: str,
+    account_country,
+    instant_transfer: str | None,
+    bot_username: str,
+    placeholder_link: str,
+) -> str:
+    methods_label_ch = "روش‌های دریافت" if operation == "خرید" else "روش‌های پرداخت"
+    methods_block_ch = f"💳 <b>{methods_label_ch}:</b>\n{methods_text}\n\n"
+    esc_name = html_module.escape(full_name or "—", quote=False)
+    esc_desc = html_module.escape(desc or "—", quote=False)
+    return (
+        f"📋 <b><a href=\"{placeholder_link}\">آگهی شماره {advert_id}</a></b>\n\n"
+        f"👤 <b>آگهی‌دهنده:</b> {esc_name}\n"
+        f"🏷️ <b>نوع آگهی:</b> {'خرید یورو' if operation == 'خرید' else 'فروش یورو'}\n"
+        f"{methods_block_ch}"
+        f"💶 <b>مقدار:</b> {amount:,} یورو\n"
+        f"💰 <b>نرخ:</b> {rate:,} تومان\n"
+        f"🧾 <b>کارمزد معامله:</b> {_format_fee_eur(amount)}\n\n"
+        f"{_channel_country_html(account_country, operation=operation)}"
+        f"{_format_optional_line('⚡ <b>امکان واریز آنی:</b>', instant_transfer)}"
+        f"📄 <b>توضیحات:</b> {esc_desc}"
+        f"{format_channel_ad_footer(bot_username=bot_username)}"
+    )
 
 async def ask_euro_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['state'] = UserState.EURO_AMOUNT.name
@@ -255,6 +424,7 @@ async def ask_euro_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raise ValueError
         context.user_data['euro_amount'] = amount
         context.user_data['state'] = UserState.EURO_RATE.name
+        _euro_save_field(user_id, context, "euro_amount", amount)
         remember_cleanup_id(user_data_store, user_id, msg.message_id, _EURO_CLEANUP_KEY)
     except:
         return await msg.reply_text("❌ لطفاً فقط عدد صحیح وارد کنید. مثال: 1200", reply_markup=inline_cancel_keyboard())
@@ -295,6 +465,7 @@ async def ask_euro_description(update: Update, context: ContextTypes.DEFAULT_TYP
             raise ValueError
         context.user_data['euro_rate'] = rate
         context.user_data['state'] = UserState.EURO_DESCRIPTION.name
+        _euro_save_field(user_id, context, "euro_rate", rate)
         remember_cleanup_id(user_data_store, user_id, msg.message_id, _EURO_CLEANUP_KEY)
     except:
         return await msg.reply_text("❌ لطفاً فقط عدد صحیح وارد کنید. مثال: 98000", reply_markup=inline_cancel_keyboard())
@@ -321,10 +492,9 @@ async def preview_advert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msg = update.message
-    desc_value = msg.text.strip()
-    context.user_data['euro_description'] = desc_value
-    context.user_data['state'] = UserState.EURO_CONFIRM_ADVERT.name
     user_id = update.effective_user.id
+    desc_value = msg.text.strip()
+    _euro_save_field(user_id, context, "euro_description", desc_value)
     user_data_store.setdefault(user_id, {})
     remember_cleanup_id(user_data_store, user_id, msg.message_id, _EURO_CLEANUP_KEY)
     await _ack_step(update, context, f"✅ توضیحات: {desc_value}")
@@ -336,42 +506,31 @@ async def preview_advert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     _, full_name = resolve_channel_advert_identity(context, user_id)
-    amount = context.user_data['euro_amount']
-    rate = context.user_data['euro_rate']
-    desc = context.user_data['euro_description']
-    operation = user_data_store.get(user_id, {}).get('operation', 'نامشخص')
-    methods = user_data_store.get(user_id, {}).get('methods', [])
-    methods_text = _format_methods_rtl(methods)
-    account_country = user_data_store.get(user_id, {}).get("account_country")
-    instant_transfer = _format_instant_transfer(user_data_store.get(user_id, {}).get("instant_transfer")) if operation != "خرید" else None
+    draft = _euro_load_draft(user_id, context)
+    if not draft:
+        await msg.reply_text(
+            "\u200f⚠️ اطلاعات آگهی ناقص است — از /menu دوباره «ثبت آگهی» را شروع کنید."
+        )
+        return
 
-    advert_type = "خرید یورو" if operation == "خرید" else "فروش یورو"
-    # Show chosen methods under "نوع آگهی" (buy=receive, sell=pay).
-    methods_label = "روش‌های دریافت" if operation == "خرید" else "روش‌های پرداخت"
-    methods_block = f"💳 <b>{methods_label}:</b>\n{methods_text}\n\n"
+    try:
+        preview = await _build_euro_preview_html(context, user_id)
+        if not preview:
+            raise ValueError("preview empty")
+        sent_preview = await msg.reply_text(
+            preview,
+            parse_mode=ParseMode.HTML,
+            reply_markup=_euro_preview_keyboard(),
+        )
+    except Exception as exc:
+        logger.exception("preview_advert failed uid=%s: %s", user_id, exc)
+        await msg.reply_text(
+            "\u200f⚠️ نمایش پیش‌نمایش ناموفق بود.\n"
+            "\u200fتوضیحات را دوباره بفرستید یا از /menu دوباره شروع کنید."
+        )
+        return
 
-    preview = (
-        "📣 <b>پیش‌نمایش آگهی</b>\n\n"
-        f"👤 <b>آگهی‌دهنده:</b> {full_name}\n"
-        f"🏷️ <b>نوع آگهی:</b> {advert_type}\n"
-        f"{methods_block}"
-        f"💶 <b>مقدار:</b> {amount:,} یورو\n"
-        f"💰 <b>نرخ:</b> {rate:,} تومان\n"
-        f"🧾 <b>کارمزد معامله:</b> {_format_fee_eur(amount)}\n\n"
-        f"{_channel_country_html(account_country, operation=operation)}"
-        f"{_format_optional_line('⚡ <b>امکان واریز آنی:</b>', instant_transfer)}"
-        f"📄 <b>توضیحات:</b> {desc}"
-        f"{format_channel_ad_footer(bot_username=(await context.bot.get_me()).username)}"
-    )
-
-    sent_preview = await msg.reply_text(
-        preview,
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ تایید آگهی", callback_data="confirm_advert")],
-            [InlineKeyboardButton("❌ انصراف", callback_data="inline_cancel")],
-        ])
-    )
+    context.user_data["state"] = UserState.EURO_CONFIRM_ADVERT.name
     remember_cleanup_id(user_data_store, user_id, sent_preview.message_id, _EURO_CLEANUP_KEY)
 
 
@@ -384,6 +543,8 @@ async def confirm_and_post_advert(update: Update, context: ContextTypes.DEFAULT_
     if await ensure_registered_or_redirect(update, context):
         return
     query = update.callback_query
+    if not query or not query.from_user:
+        return
     user_id = query.from_user.id
     admin_posting = bool(context.user_data.get("admin_post_advert_for"))
     if (
@@ -396,8 +557,8 @@ async def confirm_and_post_advert(update: Update, context: ContextTypes.DEFAULT_
         except Exception:
             pass
         return
-    await query.answer()
-    chat_id = query.message.chat_id
+
+    chat_id = query.message.chat_id if query.message else update.effective_chat.id
     user_data_store.setdefault(user_id, {})
     owner_id, full_name = resolve_channel_advert_identity(context, user_id)
     try:
@@ -407,6 +568,13 @@ async def confirm_and_post_advert(update: Update, context: ContextTypes.DEFAULT_
 
     member_ok, _ = await ensure_advert_channel_member(context.bot, owner_id)
     if not member_ok:
+        try:
+            await query.answer(
+                "ابتدا عضو کانال شوید، سپس دوباره «تایید آگهی» را بزنید.",
+                show_alert=True,
+            )
+        except Exception:
+            pass
         kb = channel_membership_keyboard()
         member_err = channel_membership_required_html(at_confirm_step=True)
         try:
@@ -428,14 +596,31 @@ async def confirm_and_post_advert(update: Update, context: ContextTypes.DEFAULT_
             context.user_data["channel_member_block_mid"] = sent.message_id
         return
 
-    amount = context.user_data.get('euro_amount')
-    rate = context.user_data.get('euro_rate')
-    desc = context.user_data.get('euro_description')
-    methods = user_data_store.get(user_id, {}).get('methods', [])
-    operation = user_data_store.get(user_id, {}).get('operation', '---')
-    methods_text = _format_methods_rtl(methods)
-    account_country = user_data_store.get(user_id, {}).get("account_country")
-    instant_transfer = _format_instant_transfer(user_data_store.get(user_id, {}).get("instant_transfer")) if operation != "خرید" else None
+    draft = _euro_load_draft(user_id, context)
+    if not draft:
+        try:
+            await query.answer(
+                "اطلاعات آگهی منقضی شده — از /menu دوباره «ثبت آگهی» را شروع کنید.",
+                show_alert=True,
+            )
+        except Exception:
+            pass
+        return
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    amount = draft["amount"]
+    rate = draft["rate"]
+    desc = draft["desc"]
+    meta = _euro_flow_meta(user_id)
+    methods = meta["methods"]
+    operation = meta["operation"]
+    methods_text = meta["methods_text"]
+    account_country = meta["account_country"]
+    instant_transfer = meta["instant_transfer"]
 
     with get_db() as conn:
         conn.execute(
@@ -446,30 +631,34 @@ async def confirm_and_post_advert(update: Update, context: ContextTypes.DEFAULT_
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (owner_id, full_name, amount, rate, desc, ", ".join(methods), operation, account_country, instant_transfer),
+            (
+                owner_id,
+                full_name,
+                amount,
+                rate,
+                desc,
+                ", ".join(methods),
+                operation,
+                account_country,
+                instant_transfer,
+            ),
         )
         advert_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
     bot_uname = (await context.bot.get_me()).username or ""
-
-    # لینک موقت جایگزین‌شدنی
     placeholder_link = f"https://t.me/{CHANNEL_USERNAME}/..."
-
-    methods_label_ch = "روش‌های دریافت" if operation == "خرید" else "روش‌های پرداخت"
-    methods_block_ch = f"💳 <b>{methods_label_ch}:</b>\n{methods_text}\n\n"
-
-    ad_text = (
-        f"📋 <b><a href=\"{placeholder_link}\">آگهی شماره {advert_id}</a></b>\n\n"
-        f"👤 <b>آگهی‌دهنده:</b> {full_name}\n"
-        f"🏷️ <b>نوع آگهی:</b> {'خرید یورو' if operation == 'خرید' else 'فروش یورو'}\n"
-        f"{methods_block_ch}"
-        f"💶 <b>مقدار:</b> {amount:,} یورو\n"
-        f"💰 <b>نرخ:</b> {rate:,} تومان\n"
-        f"🧾 <b>کارمزد معامله:</b> {_format_fee_eur(amount)}\n\n"
-        f"{_channel_country_html(account_country, operation=operation)}"
-        f"{_format_optional_line('⚡ <b>امکان واریز آنی:</b>', instant_transfer)}"
-        f"📄 <b>توضیحات:</b> {desc}"
-        f"{format_channel_ad_footer(bot_username=bot_uname)}"
+    ad_text = _build_euro_channel_ad_html(
+        advert_id=int(advert_id),
+        full_name=full_name,
+        amount=amount,
+        rate=rate,
+        desc=desc,
+        operation=operation,
+        methods_text=methods_text,
+        account_country=account_country,
+        instant_transfer=instant_transfer,
+        bot_username=bot_uname,
+        placeholder_link=placeholder_link,
     )
 
     real_link = ""
@@ -503,7 +692,14 @@ async def confirm_and_post_advert(update: Update, context: ContextTypes.DEFAULT_
                 """,
                 (str(ADVERT_CHANNEL_ID), int(sent_msg.message_id), int(advert_id)),
             )
-    except Exception:
+    except Exception as exc:
+        logger.exception(
+            "confirm_and_post_advert channel publish failed uid=%s owner=%s advert_id=%s: %s",
+            user_id,
+            owner_id,
+            advert_id,
+            exc,
+        )
         try:
             with get_db() as conn:
                 conn.execute(
@@ -515,14 +711,15 @@ async def confirm_and_post_advert(update: Update, context: ContextTypes.DEFAULT_
         ids = user_data_store.get(user_id, {}).pop(_EURO_CLEANUP_KEY, [])
         await cleanup_ids(context.bot, chat_id=chat_id, ids=ids)
         try:
-            await query.message.delete()
+            if query.message:
+                await query.message.delete()
         except Exception:
             pass
         rm = admin_home_inline_keyboard() if admin_posting else main_menu_inline_keyboard
         fail_msg = (
             "❌ انتشار در کانال انجام نشد.\n"
-            "ربات را در کانال <b>ادمین</b> کنید و مطمئن شوید <code>ADVERT_CHANNEL_ID</code> "
-            "در تنظیمات درست است."
+            "اگر عضو کانال هستید، دوباره از /menu ثبت آگهی را امتحان کنید.\n"
+            "در غیر این صورت ربات را در کانال <b>ادمین</b> کنید."
         )
         await send_or_replace_main_menu(
             context.bot,

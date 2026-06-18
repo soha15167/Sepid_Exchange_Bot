@@ -132,22 +132,35 @@ def _serialize_admin_notify_mids(mids: dict[int, int]) -> str:
 
 def _parse_admin_notify_photo_mids(
     gate: dict,
-) -> dict[int, dict[str, int | list[int]]]:
+) -> dict[int, dict[str, int | list[int] | list[str] | dict[str, int]]]:
     raw = (gate.get("admin_notify_photo_mids") or "").strip()
     if not raw:
         return {}
     try:
         data = json.loads(raw)
-        out: dict[int, dict[str, int | list[int]]] = {}
+        out: dict[int, dict[str, int | list[int] | list[str] | dict[str, int]]] = {}
         for k, v in data.items():
             if not isinstance(v, dict):
                 continue
-            entry: dict[str, int | list[int]] = {}
+            entry: dict[str, int | list[int] | list[str] | dict[str, int]] = {}
             for pk, pv in v.items():
-                if isinstance(pv, list):
-                    mids = [int(x) for x in pv if int(x) > 0]
-                    if mids:
-                        entry[str(pk)] = mids
+                if isinstance(pv, dict):
+                    by_fid = {
+                        str(fk): int(fm)
+                        for fk, fm in pv.items()
+                        if str(fk).strip() and int(fm) > 0
+                    }
+                    if by_fid:
+                        entry[str(pk)] = by_fid
+                elif isinstance(pv, list):
+                    if pv and isinstance(pv[0], str):
+                        fids = [str(x) for x in pv if str(x).strip()]
+                        if fids:
+                            entry[str(pk)] = fids
+                    else:
+                        mids = [int(x) for x in pv if int(x) > 0]
+                        if mids:
+                            entry[str(pk)] = mids
                 else:
                     entry[str(pk)] = int(pv)
             if entry:
@@ -480,6 +493,47 @@ async def _sync_admin_album_captions(
     return ok
 
 
+async def _send_slide_photo_reply(
+    bot,
+    *,
+    chat_id: int,
+    text_mid: int,
+    fid: str,
+    caption: str,
+) -> int | None:
+    """یک عکس فیش زیر پیام اصلی — بدون بازسازی کل آلبوم."""
+    cap = _photo_caption_html(caption)
+    try:
+        sent = await bot.send_photo(
+            int(chat_id),
+            photo=fid,
+            caption=cap,
+            parse_mode=ParseMode.HTML,
+            reply_to_message_id=int(text_mid),
+        )
+        return int(sent.message_id)
+    except TelegramError as e:
+        logger.warning("deal_admin_sync: photo reply chat=%s: %s", chat_id, e)
+        return None
+
+
+def _rebuild_by_fid_from_stored(
+    *,
+    stored_fids: list[str],
+    old_album_mids: list[int],
+    text_mid: int,
+    stored_by_fid: dict[str, int],
+) -> dict[str, int]:
+    if stored_by_fid:
+        return dict(stored_by_fid)
+    by_fid: dict[str, int] = {}
+    if stored_fids and old_album_mids and len(stored_fids) == len(old_album_mids):
+        for fid, mid in zip(stored_fids, old_album_mids):
+            if int(mid) != int(text_mid):
+                by_fid[str(fid)] = int(mid)
+    return by_fid
+
+
 async def _sync_admin_text_and_album_reply(
     bot,
     *,
@@ -487,16 +541,21 @@ async def _sync_admin_text_and_album_reply(
     old_mid: int | None,
     old_album_mids: list[int],
     stored_fids: list[str],
+    stored_by_fid: dict[str, int],
     admin_html: str,
     slides: list[tuple[str, str]],
     reply_markup,
     plain: str,
     log_offer_id: int,
-) -> tuple[int | None, list[int], list[str]]:
+) -> tuple[int | None, list[int], list[str], dict[str, int]]:
     """
-    پیام متنی اصلی (خلاصه + دکمه) همیشه حفظ می‌شود؛ آلبوم عکس‌ها reply به همان پیام.
-  """
+    پیام متنی اصلی (خلاصه + دکمه) همیشه حفظ می‌شود؛ عکس‌ها reply زیر همان پیام.
+    فقط عکس‌های جدید ارسال می‌شوند — آلبوم کامل دوباره ساخته نمی‌شود.
+    """
     desired_fids = [(fid or "").strip() for fid, _ in slides if (fid or "").strip()]
+    cap_by_fid = {
+        (fid or "").strip(): cap for fid, cap in slides if (fid or "").strip()
+    }
     was_glued = bool(
         old_album_mids
         and old_mid
@@ -515,55 +574,87 @@ async def _sync_admin_text_and_album_reply(
         log_offer_id=log_offer_id,
     )
     if not text_mid:
-        return None, [], []
+        return None, [], [], {}
+
+    all_old_mids = set(int(x) for x in old_album_mids if int(x) > 0)
 
     if not slides:
-        for mid in old_album_mids:
+        for mid in all_old_mids | set(stored_by_fid.values()):
             if int(mid) != int(text_mid):
                 await _delete_message_safe(bot, chat_id, int(mid))
-        return int(text_mid), [], []
+        return int(text_mid), [], [], {}
 
     if was_glued:
         for mid in old_album_mids:
             await _delete_message_safe(bot, chat_id, int(mid))
+        stored_by_fid = {}
+        all_old_mids = set()
 
-    fids_match = bool(desired_fids) and (
-        desired_fids == stored_fids
-        or (
-            not stored_fids
-            and len(old_album_mids) == len(slides)
+    by_fid = _rebuild_by_fid_from_stored(
+        stored_fids=stored_fids,
+        old_album_mids=old_album_mids,
+        text_mid=int(text_mid),
+        stored_by_fid=stored_by_fid,
+    )
+
+    desired_set = set(desired_fids)
+    for fid in list(by_fid.keys()):
+        if fid not in desired_set:
+            await _delete_message_safe(bot, chat_id, int(by_fid[fid]))
+            del by_fid[fid]
+
+    if (
+        desired_fids
+        and desired_fids == stored_fids
+        and by_fid
+        and all(fid in by_fid for fid in desired_fids)
+    ):
+        album_mids = [by_fid[fid] for fid in desired_fids]
+        await _sync_admin_album_captions(
+            bot,
+            chat_id=int(chat_id),
+            album_mids=album_mids,
+            slides=slides,
         )
-    )
-    album_ok = (
-        not was_glued
-        and old_album_mids
-        and fids_match
-        and len(old_album_mids) == len(slides)
-    )
-    if album_ok:
-        return int(text_mid), list(old_album_mids), list(desired_fids)
+        return int(text_mid), album_mids, desired_fids, by_fid
 
-    for mid in old_album_mids:
+    if (
+        stored_fids
+        and len(desired_fids) > len(stored_fids)
+        and desired_fids[: len(stored_fids)] == stored_fids
+        and all(fid in by_fid for fid in stored_fids)
+    ):
+        for fid in desired_fids[len(stored_fids) :]:
+            mid = await _send_slide_photo_reply(
+                bot,
+                chat_id=int(chat_id),
+                text_mid=int(text_mid),
+                fid=fid,
+                caption=cap_by_fid.get(fid, ""),
+            )
+            if mid:
+                by_fid[fid] = mid
+        album_mids = [by_fid[fid] for fid in desired_fids if fid in by_fid]
+        return int(text_mid), album_mids, desired_fids, by_fid
+
+    for mid in all_old_mids | set(by_fid.values()):
         if int(mid) != int(text_mid):
             await _delete_message_safe(bot, chat_id, int(mid))
+    by_fid = {}
 
-    media = _build_receipt_only_album_media(slides)
-    try:
-        msgs = await bot.send_media_group(
+    for fid in desired_fids:
+        mid = await _send_slide_photo_reply(
+            bot,
             chat_id=int(chat_id),
-            media=media,
-            reply_to_message_id=int(text_mid),
+            text_mid=int(text_mid),
+            fid=fid,
+            caption=cap_by_fid.get(fid, ""),
         )
-        album = [int(m.message_id) for m in msgs]
-        return int(text_mid), album, desired_fids
-    except TelegramError as e:
-        logger.warning(
-            "deal_admin_sync: album reply offer=%s chat=%s: %s",
-            log_offer_id,
-            chat_id,
-            e,
-        )
-        return int(text_mid), [], []
+        if mid:
+            by_fid[fid] = mid
+
+    album_mids = [by_fid[fid] for fid in desired_fids if fid in by_fid]
+    return int(text_mid), album_mids, desired_fids, by_fid
 
 
 async def _delete_admin_album_messages(
@@ -964,14 +1055,28 @@ async def sync_deal_admin_notification(
         old_mid = stored.get(chat_id)
         old_album = list(album_stored.get(cid) or [])
         stored_fids = list(album_fids_stored.get(cid) or [])
-        if by_fid_stored.get(cid) and not old_album:
-            old_album = list(by_fid_stored[cid].values())
-            if not stored_fids:
-                stored_fids = [
-                    str(f).strip()
-                    for f in by_fid_stored[cid].keys()
-                    if str(f).strip()
+        stored_by_fid = dict(by_fid_stored.get(cid) or {})
+        if stored_by_fid and not old_album:
+            if stored_fids:
+                old_album = [
+                    int(stored_by_fid[f])
+                    for f in stored_fids
+                    if f in stored_by_fid
                 ]
+            else:
+                old_album = list(stored_by_fid.values())
+        if not stored_fids and stored_by_fid and old_album:
+            inv = {int(v): k for k, v in stored_by_fid.items()}
+            for mid in old_album:
+                fid = inv.get(int(mid))
+                if fid:
+                    stored_fids.append(str(fid))
+        stored_by_fid = _rebuild_by_fid_from_stored(
+            stored_fids=stored_fids,
+            old_album_mids=old_album,
+            text_mid=int(old_mid or 0),
+            stored_by_fid=stored_by_fid,
+        )
         if text_only and old_mid:
             new_mid = await _edit_or_send_admin_notification(
                 bot,
@@ -1017,6 +1122,7 @@ async def sync_deal_admin_notification(
                     album_payload_updated[cid] = {
                         "album": old_album,
                         "fids": desired_fids,
+                        "by_fid": stored_by_fid,
                         "mode": "reply",
                     }
                 logger.info(
@@ -1027,22 +1133,25 @@ async def sync_deal_admin_notification(
                 )
             continue
         if album_slides:
-            new_mid, new_album, new_fids = await _sync_admin_text_and_album_reply(
-                bot,
-                chat_id=cid,
-                old_mid=old_mid,
-                old_album_mids=old_album,
-                stored_fids=stored_fids,
-                admin_html=admin_html,
-                slides=album_slides,
-                reply_markup=reply_markup,
-                plain=plain,
-                log_offer_id=oid,
+            new_mid, new_album, new_fids, new_by_fid = (
+                await _sync_admin_text_and_album_reply(
+                    bot,
+                    chat_id=cid,
+                    old_mid=old_mid,
+                    old_album_mids=old_album,
+                    stored_fids=stored_fids,
+                    stored_by_fid=stored_by_fid,
+                    admin_html=admin_html,
+                    slides=album_slides,
+                    reply_markup=reply_markup,
+                    plain=plain,
+                    log_offer_id=oid,
+                )
             )
         else:
             if old_album:
                 await _delete_admin_album_messages(bot, cid, old_album)
-            for mid in (by_fid_stored.get(cid) or {}).values():
+            for mid in stored_by_fid.values():
                 await _delete_message_safe(bot, cid, int(mid))
             new_mid = await _edit_or_send_admin_notification(
                 bot,
@@ -1056,12 +1165,19 @@ async def sync_deal_admin_notification(
             )
             new_album = []
             new_fids = []
+            new_by_fid = {}
+            album_payload_updated[cid] = {
+                "album": [],
+                "fids": [],
+                "mode": "reply",
+            }
         if new_mid:
             updated[chat_id] = int(new_mid)
-            if new_album:
+            if new_album or new_by_fid:
                 album_payload_updated[cid] = {
                     "album": new_album,
                     "fids": new_fids,
+                    "by_fid": new_by_fid,
                     "mode": "reply",
                 }
             logger.info(
@@ -1082,12 +1198,6 @@ async def sync_deal_admin_notification(
     )
     for cid, payload in album_payload_updated.items():
         photo_payload[cid] = payload
-    for chat_id in recipients:
-        cid = int(chat_id)
-        if cid not in album_payload_updated and (
-            album_stored.get(cid) or by_fid_stored.get(cid)
-        ):
-            photo_payload.pop(cid, None)
     if photo_payload != stored_photos:
         upsert_fields["admin_notify_photo_mids"] = (
             _serialize_admin_notify_photo_mids(photo_payload)
@@ -1441,11 +1551,24 @@ def _clear_deal_receipt_pending(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def _deal_gate_allows_party_receipts(gate: dict | None) -> bool:
-    """تا پایان معامله امکان ارسال فیش (چندتایی) — مگر لغو/بسته شدن."""
+    """فیش واریز فقط در مرحلهٔ پرداخت (gate_status=completed پس از ثبت هر دو حساب)."""
     if not gate:
         return False
     st = (gate.get("gate_status") or "").strip().lower()
-    return st not in ("completed", "closed", "rejected")
+    return st == "completed"
+
+
+async def _admin_receipt_upload_done(
+    bot,
+    update: Update,
+    offer_id: int,
+) -> None:
+    """فیش ادمین: حذف آپلود از چت + به‌روزرسانی همان پیام اصلی معامله."""
+    if update.message:
+        await _delete_message_safe(
+            bot, int(update.message.chat_id), int(update.message.message_id)
+        )
+    await sync_deal_admin_notification(bot, int(offer_id), deal_complete=True)
 
 
 async def _party_receipt_ack(
@@ -1454,8 +1577,10 @@ async def _party_receipt_ack(
     party: str,
     advert_rowid: int,
 ) -> None:
-    """ثبت فیش — pending باز می‌ماند برای فیش بعدی."""
-    if not update.message:
+    """ثبت فیش — برای طرفین عادی؛ ادمین پیام جدا نمی‌گیرد."""
+    if not update.message or not update.effective_user:
+        return
+    if update.effective_user.id in set(ADMIN_IDS or []):
         return
     kind = "تومان" if party == "buyer" else "یورو"
     await update.message.reply_text(
@@ -1678,16 +1803,31 @@ async def _admin_prompt_party_account(
     if st not in ("accounts", "completed"):
         await q.answer("این مرحله دیگر فعال نیست", show_alert=True)
         return
-    party_fa = "خریدار یورو" if party == "buyer" else "فروشنده یورو"
+    row = get_advert_offer_joined(oid)
+    advert = get_euro_advert_by_rowid(int(row["advert_rowid"])) if row else None
+    is_buyer = party == "buyer"
+    party_fa = "خریدار یورو" if is_buyer else "فروشنده یورو"
+    hint = _account_collection_hint(is_buyer=is_buyer, advert=advert)
     context.user_data["state"] = UserState.ADMIN_DEAL_GATE_ACCOUNT.name
     context.user_data["admin_deal_acc_offer_id"] = oid
     context.user_data["admin_deal_acc_party"] = party
     _persist_admin_wizard_state(admin_uid, context)
     await q.answer()
+    if is_buyer:
+        prompt = (
+            f"{_RTL}✏️ <b>ثبت حساب {party_fa}</b> — offer <code>{oid}</code>\n\n"
+            f"{_RTL}متن حساب <b>دریافت یورو</b> (IBAN، PayPal…) یا <b>عکس کارت</b> بفرستید:\n\n"
+            f"<pre>{html_module.escape(hint)}</pre>"
+        )
+    else:
+        prompt = (
+            f"{_RTL}✏️ <b>ثبت حساب {party_fa}</b> — offer <code>{oid}</code>\n\n"
+            f"{_RTL}اطلاعات حساب <b>دریافت تومان</b> (شبا/کارت) یا <b>عکس کارت</b> بفرستید:\n\n"
+            f"<pre>{html_module.escape(hint)}</pre>"
+        )
     await context.bot.send_message(
         int(q.message.chat_id),
-        f"{_RTL}✏️ <b>ثبت حساب {party_fa}</b> — آگهی offer <code>{oid}</code>\n\n"
-        f"{_RTL}متن حساب (IBAN، PayPal…) یا <b>عکس کارت</b> بفرستید:",
+        prompt,
         parse_mode=ParseMode.HTML,
         reply_markup=_admin_proxy_account_prompt_keyboard(oid),
     )
@@ -1808,12 +1948,39 @@ async def deal_admin_party_proxy_callback(
         return
     action = parts[3]
     if action == "acccancel":
+        oid_raw = context.user_data.get("admin_deal_acc_offer_id")
         _clear_admin_account_wizard(context, q.from_user.id)
-        await q.answer("انصراف")
+        _clear_deal_admin_proxy_pending(context)
+        try:
+            await q.answer("انصراف")
+        except Exception:
+            pass
+        try:
+            oid = int(oid_raw) if oid_raw is not None else 0
+        except (TypeError, ValueError):
+            oid = 0
+        if oid > 0:
+            from handlers.deal_gate import admin_show_deal_gate_detail
+
+            await admin_show_deal_gate_detail(update, context, oid)
+        else:
+            try:
+                if q.message:
+                    await q.message.delete()
+            except Exception:
+                pass
         return
     if action == "rcptcancel":
         _clear_deal_admin_proxy_pending(context)
-        await q.answer("انصراف")
+        try:
+            await q.answer("انصراف")
+        except Exception:
+            pass
+        try:
+            if q.message:
+                await q.message.delete()
+        except Exception:
+            pass
         return
     if action == "byes":
         await _admin_proxy_party_final_yes(context, oid, "buyer", q)
@@ -1872,15 +2039,7 @@ async def _deal_admin_proxy_receipt_try_message(
         deal_gate_append_buyer_receipt(oid, entry_type="text", text=text)
         gate = deal_gate_get(oid) or gate
         _log(oid, f"ادمین — فیش تومان متنی خریدار", from_role="admin")
-    await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
-    aid = int(gate.get("advert_rowid") or 0)
-    kind = "تومان" if party == "buyer" else "یورو"
-    await update.message.reply_text(
-        f"{_RTL}✅ فیش {kind} ثبت شد · آگهی <b>{aid}</b>\n"
-        f"{_RTL}فیش بعدی همین‌جا یا «انصراف».",
-        parse_mode=ParseMode.HTML,
-        reply_markup=_admin_proxy_receipt_prompt_keyboard(oid),
-    )
+    await _admin_receipt_upload_done(context.bot, update, oid)
     return True
 
 
@@ -1924,15 +2083,7 @@ async def _deal_admin_proxy_receipt_try_photo(
         deal_gate_append_buyer_receipt(oid, entry_type="photo", text=cap, file_id=fid)
         gate = deal_gate_get(oid) or gate
         _log(oid, "ادمین — فیش تومان عکس خریدار", from_role="admin")
-    await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
-    aid = int(gate.get("advert_rowid") or 0)
-    kind = "تومان" if party == "buyer" else "یورو"
-    await update.message.reply_text(
-        f"{_RTL}✅ فیش {kind} ثبت شد · آگهی <b>{aid}</b>\n"
-        f"{_RTL}فیش بعدی همین‌جا یا «انصراف».",
-        parse_mode=ParseMode.HTML,
-        reply_markup=_admin_proxy_receipt_prompt_keyboard(oid),
-    )
+    await _admin_receipt_upload_done(context.bot, update, oid)
     return True
 
 
@@ -2561,23 +2712,6 @@ def _clear_deal_admin_stom_pending(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop(_DEAL_ADMIN_STOM_KEY, None)
 
 
-async def _admin_stom_receipt_ack(
-    update: Update,
-    *,
-    offer_id: int,
-    advert_rowid: int,
-) -> None:
-    """تأیید کوتاه — بدون باز کردن منوی ادمین."""
-    if not update.message:
-        return
-    await update.message.reply_text(
-        f"{_RTL}✅ فیش ثبت شد · <b>آگهی {int(advert_rowid)}</b>\n"
-        f"{_RTL}فیش بعدی همین‌جا بفرستید یا «انصراف».\n"
-        f"{_RTL}تا پایان معامله می‌توانید چند فیش بفرستید.",
-        parse_mode=ParseMode.HTML,
-    )
-
-
 async def deal_admin_seller_toman_receipt_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -2610,15 +2744,6 @@ async def deal_admin_seller_toman_receipt_callback(
         await q.answer("انصراف")
         _clear_deal_admin_stom_pending(context)
         await _purge_rcpt_prompt_msgs(context.bot, user_data_store, uid, oid)
-        try:
-            await context.bot.send_message(
-                uid,
-                f"{_RTL}✅ ارسال فیش متوقف شد. هر وقت لازم بود دوباره "
-                f"«ارسال فیش واریزی تومان به فروشنده» را بزنید.",
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
         return
     if action != "go":
         await q.answer()
@@ -2698,12 +2823,7 @@ async def _deal_admin_stom_try_message(
     except Exception as e:
         logger.warning("deal_stom: send seller=%s: %s", seller_id, e)
     _log(oid, "ادمین فیش تومان برای فروشنده فرستاد (متن)", from_role="admin")
-    await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
-    await _admin_stom_receipt_ack(
-        update,
-        offer_id=oid,
-        advert_rowid=int(gate.get("advert_rowid") or 0),
-    )
+    await _admin_receipt_upload_done(context.bot, update, oid)
     return True
 
 
@@ -2764,12 +2884,7 @@ async def _deal_admin_stom_try_photo(
     except Exception as e:
         logger.warning("deal_stom: photo to seller=%s: %s", seller_id, e)
     _log(oid, "ادمین فیش تومان برای فروشنده فرستاد (عکس)", from_role="admin")
-    await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
-    await _admin_stom_receipt_ack(
-        update,
-        offer_id=oid,
-        advert_rowid=int(gate.get("advert_rowid") or 0),
-    )
+    await _admin_receipt_upload_done(context.bot, update, oid)
     return True
 
 
@@ -3922,11 +4037,12 @@ async def _handle_deal_seller_receipt_callback(
     if not gate or int(gate.get("seller_telegram_id") or 0) != uid:
         await q.answer("فقط فروشنده این معامله", show_alert=True)
         return
-    if not gate.get("seller_eur_account_sent_at"):
-        await q.answer(
-            "ادمین هنوز «تومان نشست» را تأیید نکرده.",
-            show_alert=True,
-        )
+    seller_id = int(gate.get("seller_telegram_id") or 0)
+    eur_ok = int(gate.get("seller_eur_account_sent_at") or 0) > 0 or (
+        _seller_buyer_eur_account_delivered(offer_id, seller_id) if seller_id else False
+    )
+    if not eur_ok:
+        await q.answer("ابتدا حساب یورو به فروشنده ارسال شود.", show_alert=True)
         return
     if not _deal_gate_allows_party_receipts(gate):
         await q.answer("این معامله بسته شده است.", show_alert=True)

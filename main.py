@@ -327,8 +327,8 @@ async def euro_flow_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if u and deal_gate_active_for_user(u.id) and not user_flow_text_active(context):
         return
 
-    if await _dispatch_user_flow_text(update, context):
-        return
+    # ثبت آگهی/پیشنهاد/معاوضه در group=1 (wizard_text_router) هندل می‌شود؛
+    # تکرار _dispatch_user_flow_text اینجا باعث پیام اشتباه «تایید آگهی» بعد از پیش‌نمایش می‌شد.
 
     if state == UserState.NEGOTIATION.name:
         return await handle_negotiation_message(update, context)

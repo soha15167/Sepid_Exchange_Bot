@@ -1,0 +1,18 @@
+[Unit]
+Description=Sepid Exchange Web API (FastAPI)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/telegram_bot_project2
+Environment=PATH=/root/telegram_bot_project2/venv/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-/root/telegram_bot_project2/.env
+ExecStart=/root/telegram_bot_project2/venv/bin/python3 /root/telegram_bot_project2/scripts/run_web_api.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

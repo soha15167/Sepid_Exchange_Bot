@@ -2805,18 +2805,42 @@ async def admin_dashboard_callback(update: Update, context: ContextTypes.DEFAULT
                 return
             party = "buyer" if parts[2] == "bacc" else "seller"
             party_fa = "خریدار یورو" if party == "buyer" else "فروشنده یورو"
+            from database.db import get_advert_offer_joined, get_euro_advert_by_rowid
+            from handlers.deal_gate import _account_collection_hint
+
+            row = get_advert_offer_joined(oid)
+            advert = get_euro_advert_by_rowid(int(row["advert_rowid"])) if row else None
+            hint = _account_collection_hint(is_buyer=(party == "buyer"), advert=advert)
             context.user_data["state"] = UserState.ADMIN_DEAL_GATE_ACCOUNT.name
             context.user_data["admin_deal_acc_offer_id"] = oid
             context.user_data["admin_deal_acc_party"] = party
             _persist_admin_wizard_state(admin_uid, context)
+            if party == "buyer":
+                dash_prompt = (
+                    f"{_RTL}✏️ <b>ثبت حساب {party_fa}</b> — offer <code>{oid}</code>\n\n"
+                    f"{_RTL}متن حساب <b>دریافت یورو</b> (IBAN، PayPal…) "
+                    f"یا <b>عکس کارت</b> بفرستید:\n\n"
+                    f"<pre>{html_module.escape(hint)}</pre>"
+                )
+            else:
+                dash_prompt = (
+                    f"{_RTL}✏️ <b>ثبت حساب {party_fa}</b> — offer <code>{oid}</code>\n\n"
+                    f"{_RTL}اطلاعات حساب <b>دریافت تومان</b> (شبا/کارت) "
+                    f"یا <b>عکس کارت</b> بفرستید:\n\n"
+                    f"<pre>{html_module.escape(hint)}</pre>"
+                )
             await _admin_edit_dashboard(
                 context,
                 context.bot,
-                f"{_RTL}✏️ <b>ثبت حساب {party_fa}</b> — offer <code>{oid}</code>\n\n"
-                f"{_RTL}متن کامل حساب را بفرستید (IBAN، شبا، PayPal…) "
-                f"یا <b>عکس کارت</b> — عکس بدون تبدیل به متن برای ادمین ارسال می‌شود:",
+                dash_prompt,
                 reply_markup=InlineKeyboardMarkup(
                     [
+                        [
+                            InlineKeyboardButton(
+                                "❌ انصراف",
+                                callback_data=f"adm|pxy|{oid}|acccancel",
+                            )
+                        ],
                         [
                             InlineKeyboardButton(
                                 "🔙 جزئیات معامله",
