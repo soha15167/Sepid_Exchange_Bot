@@ -8,6 +8,7 @@
 *.db-journal
 *.sqlite
 *.sqlite3
+/backups/
 
 # Python
 __pycache__/

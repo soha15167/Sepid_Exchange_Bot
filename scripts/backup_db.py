@@ -1,44 +1,97 @@
 #!/usr/bin/env python3
-"""Backup SQLite DB — run via cron on server."""
+"""Create a verified online SQLite backup — safe while the bot is running."""
 
 from __future__ import annotations
 
 import os
-import shutil
+import sqlite3
 import sys
+from contextlib import closing
 from datetime import datetime
+from pathlib import Path
+from tempfile import mkstemp
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
-from config.settings import DB_PATH  # noqa: E402
+
+def resolve_database_path(configured_path: str | os.PathLike[str]) -> Path:
+    path = Path(configured_path).expanduser()
+    if not path.is_absolute():
+        path = ROOT / path
+    return path.resolve()
+
+
+def create_verified_backup(
+    source_path: str | os.PathLike[str],
+    backup_dir: str | os.PathLike[str],
+    *,
+    keep: int = 14,
+    now: datetime | None = None,
+) -> Path:
+    """Back up a live SQLite database, verify it, then publish it atomically."""
+    if keep < 1:
+        raise ValueError("keep must be at least 1")
+
+    source = Path(source_path).expanduser().resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"DB not found: {source}")
+
+    destination_dir = Path(backup_dir).expanduser().resolve()
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(destination_dir, 0o700)
+
+    stamp = (now or datetime.now()).strftime("%Y%m%d_%H%M%S_%f")
+    destination = destination_dir / f"{source.name}.{stamp}.bak"
+    fd, temporary_name = mkstemp(
+        prefix=f".{source.name}.", suffix=".tmp", dir=destination_dir
+    )
+    os.close(fd)
+    temporary = Path(temporary_name)
+
+    try:
+        source_uri = f"{source.as_uri()}?mode=ro"
+        with closing(
+            sqlite3.connect(source_uri, uri=True, timeout=30.0)
+        ) as source_db:
+            with closing(sqlite3.connect(temporary, timeout=30.0)) as backup_db:
+                source_db.backup(backup_db)
+                backup_db.commit()
+                result = backup_db.execute("PRAGMA integrity_check").fetchone()[0]
+                if result != "ok":
+                    raise RuntimeError(f"backup integrity check failed: {result}")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, destination)
+        os.chmod(destination, 0o600)
+    except Exception:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+    backups = sorted(
+        destination_dir.glob(f"{source.name}.*.bak"),
+        key=lambda path: path.stat().st_mtime,
+    )
+    for old_backup in backups[:-keep]:
+        old_backup.unlink()
+
+    return destination
 
 
 def main() -> int:
-    src = DB_PATH
-    if not os.path.isfile(src):
-        print(f"DB not found: {src}")
+    source = resolve_database_path(os.getenv("DATABASE_NAME", "eurobot.db"))
+    try:
+        destination = create_verified_backup(
+            source,
+            ROOT / "backups",
+            keep=14,
+        )
+    except Exception as exc:
+        print(f"ERROR {exc}", file=sys.stderr)
         return 1
-    backup_dir = os.path.join(ROOT, "backups")
-    os.makedirs(backup_dir, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dest = os.path.join(backup_dir, f"{os.path.basename(src)}.{stamp}.bak")
-    shutil.copy2(src, dest)
-    print(f"OK {dest}")
-    # prune old backups (keep 14)
-    files = sorted(
-        [
-            os.path.join(backup_dir, f)
-            for f in os.listdir(backup_dir)
-            if f.endswith(".bak")
-        ],
-        key=os.path.getmtime,
-    )
-    for old in files[:-14]:
-        try:
-            os.remove(old)
-        except OSError:
-            pass
+    print(f"OK {destination}")
     return 0
 
 
