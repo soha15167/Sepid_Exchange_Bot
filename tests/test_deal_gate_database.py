@@ -99,6 +99,39 @@ class DealGateDatabaseTests(unittest.TestCase):
         awaiting = db.deal_gate_list_awaiting_seller_toman_confirm()
         self.assertEqual([item["offer_id"] for item in awaiting], [101])
 
+    def test_selected_offer_remains_linked_to_gate_until_reactivation(self):
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                """
+                INSERT INTO advert_offers (
+                    id, advert_rowid, proposer_telegram_id, rate_toman,
+                    created_at, status, seq_in_advert
+                ) VALUES (101, 3196, 20, 205000, '2026-07-18', 'accepted', 1)
+                """
+            )
+            conn.commit()
+        self._create_gate()
+
+        selected = db.list_accepted_offers_for_advert(3196)
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["gate_status"], "pending")
+
+        db.update_advert_offer_status(101, "gate_rejected")
+        db.deal_gate_upsert(
+            offer_id=101,
+            advert_rowid=3196,
+            buyer_telegram_id=10,
+            seller_telegram_id=20,
+            gate_status="rejected",
+        )
+        selected = db.list_accepted_offers_for_advert(3196)
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["gate_status"], "rejected")
+
+        db.update_advert_offer_status(101, "gate_aborted")
+        db.deal_gate_delete(101)
+        self.assertEqual(db.list_accepted_offers_for_advert(3196), [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -96,6 +96,11 @@ class TestDealAdminImmediateControls(unittest.IsolatedAsyncioTestCase):
                 "sync_deal_admin_notification",
                 new=AsyncMock(),
             ) as sync_admin,
+            patch.object(
+                deal_gate,
+                "_refresh_deal_channel_status",
+                new=AsyncMock(),
+            ) as refresh_channel,
             patch.object(deal_gate, "_log"),
         ):
             await deal_gate.start_deal_final_gate(
@@ -115,6 +120,12 @@ class TestDealAdminImmediateControls(unittest.IsolatedAsyncioTestCase):
         send_gate.assert_awaited_once()
         schedule.assert_called_once_with(context, 41)
         sync_admin.assert_awaited_once_with(bot, 41)
+        refresh_channel.assert_awaited_once_with(
+            context,
+            77,
+            offer_id=41,
+            gate_status="pending",
+        )
 
     async def test_pending_sync_uses_acceptance_text_and_proxy_keyboard(self):
         from handlers import deal_gate

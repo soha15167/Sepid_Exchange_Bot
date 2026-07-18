@@ -1997,6 +1997,13 @@ def list_pending_offers_for_advert(advert_rowid: int) -> list[dict]:
 
 
 def list_accepted_offers_for_advert(advert_rowid: int) -> list[dict]:
+    """Return the selected deal offer, including its live gate stage.
+
+    The historical name is kept for compatibility. A selected offer remains
+    locked while its deal gate is pending, collecting accounts, paying,
+    rejected-awaiting-admin, or closed. Reactivation deletes the gate and
+    changes the offer to ``gate_aborted``, so it naturally leaves this list.
+    """
     try:
         aid = int(advert_rowid)
     except (TypeError, ValueError):
@@ -2006,20 +2013,38 @@ def list_accepted_offers_for_advert(advert_rowid: int) -> list[dict]:
         acols = _table_columns(conn, "advert_offers")
         if "status" not in acols:
             return []
-        seq_expr = "COALESCE(seq_in_advert, id)" if "seq_in_advert" in acols else "id"
-        alias_sel = "COALESCE(offer_alias_name, '')" if "offer_alias_name" in acols else "''"
+        seq_expr = (
+            "COALESCE(o.seq_in_advert, o.id)"
+            if "seq_in_advert" in acols
+            else "o.id"
+        )
+        alias_sel = (
+            "COALESCE(o.offer_alias_name, '')"
+            if "offer_alias_name" in acols
+            else "''"
+        )
         pe_sel = (
-            "COALESCE(proposed_euro_amount, 0)"
+            "COALESCE(o.proposed_euro_amount, 0)"
             if "proposed_euro_amount" in acols
             else "0"
         )
         rows = cur.execute(
             f"""
-            SELECT id, rate_toman, description, proposer_telegram_id, {seq_expr}, {alias_sel},
-                   {pe_sel}
-            FROM advert_offers
-            WHERE advert_rowid = ? AND status = 'accepted'
-            ORDER BY id ASC
+            SELECT o.id, o.rate_toman, o.description, o.proposer_telegram_id,
+                   {seq_expr}, {alias_sel}, {pe_sel},
+                   COALESCE(o.status, ''),
+                   COALESCE(g.gate_status, ''),
+                   COALESCE(g.seller_toman_settled_at, 0)
+            FROM advert_offers o
+            LEFT JOIN offer_deal_gates g ON g.offer_id = o.id
+            WHERE o.advert_rowid = ?
+              AND (
+                    lower(trim(COALESCE(o.status, ''))) = 'accepted'
+                    OR lower(trim(COALESCE(g.gate_status, ''))) IN (
+                        'pending', 'accounts', 'completed', 'rejected', 'closed'
+                    )
+                  )
+            ORDER BY o.id ASC
             """,
             (aid,),
         ).fetchall()
@@ -2032,6 +2057,9 @@ def list_accepted_offers_for_advert(advert_rowid: int) -> list[dict]:
             "seq_in_advert": int(r[4]),
             "offer_alias_name": (r[5] or "").strip() if len(r) > 5 else "",
             "proposed_euro_amount": int(r[6] or 0) if len(r) > 6 else 0,
+            "offer_status": (r[7] or "").strip().lower() if len(r) > 7 else "",
+            "gate_status": (r[8] or "").strip().lower() if len(r) > 8 else "",
+            "seller_toman_settled_at": int(r[9] or 0) if len(r) > 9 else 0,
         }
         for r in rows
     ]

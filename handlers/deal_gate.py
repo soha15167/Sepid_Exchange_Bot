@@ -4441,6 +4441,54 @@ def _schedule_gate_jobs(context: ContextTypes.DEFAULT_TYPE, offer_id: int) -> No
 # =============================================================================
 
 
+async def _refresh_deal_channel_status(
+    context: ContextTypes.DEFAULT_TYPE,
+    advert_rowid: int,
+    *,
+    offer_id: int,
+    gate_status: str,
+) -> None:
+    """Best-effort public channel refresh after a deal-stage transition."""
+    from handlers.offers import refresh_advert_channel_post
+
+    try:
+        await refresh_advert_channel_post(context.bot, int(advert_rowid))
+    except Exception:
+        logger.exception(
+            "deal_gate: channel refresh failed offer=%s advert=%s stage=%s",
+            offer_id,
+            advert_rowid,
+            gate_status,
+        )
+
+
+async def _set_deal_gate_stage(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    offer_id: int,
+    advert_rowid: int,
+    buyer_telegram_id: int,
+    seller_telegram_id: int,
+    gate_status: str,
+    **fields,
+) -> None:
+    """Persist one gate stage and immediately synchronize the public advert."""
+    deal_gate_upsert(
+        offer_id=int(offer_id),
+        advert_rowid=int(advert_rowid),
+        buyer_telegram_id=int(buyer_telegram_id),
+        seller_telegram_id=int(seller_telegram_id),
+        gate_status=gate_status,
+        **fields,
+    )
+    await _refresh_deal_channel_status(
+        context,
+        int(advert_rowid),
+        offer_id=int(offer_id),
+        gate_status=gate_status,
+    )
+
+
 async def start_deal_final_gate(
     context: ContextTypes.DEFAULT_TYPE,
     *,
@@ -4454,7 +4502,8 @@ async def start_deal_final_gate(
     oid = int(offer_id)
     aid = int(row["advert_rowid"])
     seq = int(row.get("seq_in_advert") or oid)
-    deal_gate_upsert(
+    await _set_deal_gate_stage(
+        context,
         offer_id=oid,
         advert_rowid=aid,
         buyer_telegram_id=buyer_id,
@@ -5252,7 +5301,8 @@ async def _on_both_yes(
         return
     buyer_id = int(gate["buyer_telegram_id"])
     seller_id = int(gate["seller_telegram_id"])
-    deal_gate_upsert(
+    await _set_deal_gate_stage(
+        context,
         offer_id=offer_id,
         advert_rowid=int(gate["advert_rowid"]),
         buyer_telegram_id=buyer_id,
@@ -5348,14 +5398,15 @@ async def _on_gate_rejected(
         return
     buyer_id = int(gate["buyer_telegram_id"])
     seller_id = int(gate["seller_telegram_id"])
-    deal_gate_upsert(
+    update_advert_offer_status(offer_id, "gate_rejected")
+    await _set_deal_gate_stage(
+        context,
         offer_id=offer_id,
         advert_rowid=int(gate["advert_rowid"]),
         buyer_telegram_id=buyer_id,
         seller_telegram_id=seller_id,
         gate_status="rejected",
     )
-    update_advert_offer_status(offer_id, "gate_rejected")
     _cancel_gate_jobs(context, offer_id)
     actor_text = f"ادمین از طرف {party}" if acted_by_admin else party
     row = get_advert_offer_joined(offer_id)
@@ -5544,7 +5595,8 @@ async def _finalize_deal_close(
     seller_id = int(gate["seller_telegram_id"])
     update_advert_offer_status(offer_id, "gate_closed")
     update_euro_advert_status(aid, "بسته")
-    deal_gate_upsert(
+    await _set_deal_gate_stage(
+        context,
         offer_id=offer_id,
         advert_rowid=aid,
         buyer_telegram_id=buyer_id,
@@ -6192,7 +6244,8 @@ async def _complete_deal(context: ContextTypes.DEFAULT_TYPE, offer_id: int) -> N
     buyer_id = int(gate["buyer_telegram_id"])
     seller_id = int(gate["seller_telegram_id"])
     aid = int(row["advert_rowid"])
-    deal_gate_upsert(
+    await _set_deal_gate_stage(
+        context,
         offer_id=offer_id,
         advert_rowid=aid,
         buyer_telegram_id=buyer_id,

@@ -3378,6 +3378,58 @@ def _strip_channel_offer_block(html: str) -> str:
     return f"{before}\n{tail}" if before else tail
 
 
+def _channel_selected_offer_successfully_settled(row: dict) -> bool:
+    gate_status = (row.get("gate_status") or "").strip().lower()
+    return gate_status == "closed" and int(
+        row.get("seller_toman_settled_at") or 0
+    ) > 0
+
+
+def _channel_selected_offer_line_status(row: dict) -> str:
+    """Visual state for the selected offer line in the public channel."""
+    gate_status = (row.get("gate_status") or "").strip().lower()
+    offer_status = (row.get("offer_status") or "").strip().lower()
+    if _channel_selected_offer_successfully_settled(row):
+        return "selected_completed"
+    if gate_status == "rejected":
+        return "selected_rejected"
+    if gate_status == "closed" or offer_status == "gate_closed":
+        return "selected_closed"
+    return "selected_active"
+
+
+def _channel_selected_offer_status_html(selected: list[dict]) -> str:
+    """Persian public status based on the real deal gate, not offer acceptance."""
+    if not selected:
+        return ""
+    row = selected[-1]
+    gate_status = (row.get("gate_status") or "").strip().lower()
+    offer_status = (row.get("offer_status") or "").strip().lower()
+    if _channel_selected_offer_successfully_settled(row):
+        return f"{_RTL}✅ این آگهی و معامله تکمیل شده است.\n\n"
+    if gate_status == "rejected":
+        return (
+            f"{_RTL}❌ تأیید نهایی رد شده است؛ معامله متوقف و منتظر تصمیم ادمین است.\n\n"
+        )
+    if gate_status == "closed" or offer_status == "gate_closed":
+        return f"{_RTL}⛔ این آگهی بسته شده است.\n\n"
+    if gate_status == "completed":
+        return (
+            f"{_RTL}⏳ معامله در حال انجام است؛ پرداخت و تسویه هنوز تکمیل نشده است.\n\n"
+        )
+    if gate_status == "accounts":
+        return (
+            f"{_RTL}⏳ معامله در حال انجام است؛ اطلاعات حساب طرفین در حال ثبت است.\n\n"
+        )
+    if gate_status == "pending":
+        return (
+            f"{_RTL}⏳ پیشنهاد پذیرفته شده است؛ در انتظار تأیید نهایی طرفین.\n\n"
+        )
+    return (
+        f"{_RTL}⏳ پیشنهاد پذیرفته شده است؛ معامله هنوز تکمیل نشده است.\n\n"
+    )
+
+
 def append_offer_lists_to_channel_html(base_html: str, advert_rowid: int) -> str:
     base_html = _strip_channel_offer_block(base_html)
     advert_for_list = get_euro_advert_by_rowid(advert_rowid)
@@ -3385,9 +3437,7 @@ def append_offer_lists_to_channel_html(base_html: str, advert_rowid: int) -> str
     pending = list_pending_offers_for_advert(advert_rowid)
     rejected = list_rejected_offers_for_advert(advert_rowid)
     accepted = list_accepted_offers_for_advert(advert_rowid)
-    agreement_html = ""
-    if accepted:
-        agreement_html = f"{_RTL}✅ این آگهی تکمیل شده است.\n\n"
+    deal_status_html = _channel_selected_offer_status_html(accepted)
     merged: list[tuple[str, dict]] = (
         [("pending", r) for r in pending]
         + [("rejected", r) for r in rejected]
@@ -3406,6 +3456,9 @@ def append_offer_lists_to_channel_html(base_html: str, advert_rowid: int) -> str
             label = _esc_html(_display_name_for_channel(u, int(r["proposer_telegram_id"])))
         pe = int(r.get("proposed_euro_amount") or 0)
         prefix = "• "
+        line_status = (
+            _channel_selected_offer_line_status(r) if st == "accepted" else st
+        )
         inner = _channel_offer_line_inner_html(
             seq=seq,
             label=label,
@@ -3414,7 +3467,7 @@ def append_offer_lists_to_channel_html(base_html: str, advert_rowid: int) -> str
             advert=advert_for_list,
             hybrid=hybrid_list,
             status_prefix=prefix,
-            offer_status=st,
+            offer_status=line_status,
         )
         lines.append(_channel_offer_line_rtl(inner))
     offers_body = "\n".join(lines) if lines else ""
@@ -3422,8 +3475,8 @@ def append_offer_lists_to_channel_html(base_html: str, advert_rowid: int) -> str
     parts: list[str] = []
     if offers_body:
         parts.append(f"{header}\n\n{offers_body}")
-    if agreement_html:
-        parts.append(agreement_html.rstrip())
+    if deal_status_html:
+        parts.append(deal_status_html.rstrip())
     block = "\n\n".join(parts) if parts else ""
     if not block:
         return base_html
@@ -3486,21 +3539,31 @@ def channel_ad_reply_markup(
     )
 
 
-async def refresh_advert_channel_post(bot, advert_rowid: int) -> None:
+async def refresh_advert_channel_post(bot, advert_rowid: int) -> bool:
     from handlers import admin
 
     advert = get_euro_advert_by_rowid(advert_rowid)
     if not advert:
-        return
+        logger.warning("channel_refresh: advert not found advert=%s", advert_rowid)
+        return False
     mid = advert.get("channel_message_id")
     cid = advert.get("channel_chat_id") or ADVERT_CHANNEL_ID
     if mid is None or cid is None:
-        return
+        logger.warning(
+            "channel_refresh: channel target missing advert=%s", advert_rowid
+        )
+        return False
     try:
         cid_i = int(cid)
         mid_i = int(mid)
     except (TypeError, ValueError):
-        return
+        logger.warning(
+            "channel_refresh: invalid channel target advert=%s chat=%r mid=%r",
+            advert_rowid,
+            cid,
+            mid,
+        )
+        return False
     try:
         me = await bot.get_me()
         uname = (me.username or "").strip().lstrip("@")
@@ -3518,9 +3581,17 @@ async def refresh_advert_channel_post(bot, advert_rowid: int) -> None:
             reply_markup=rk,
             disable_web_page_preview=True,
         )
+        return True
     except BadRequest as e:
         if "message is not modified" in str(e).lower():
-            return
+            return True
+        logger.warning(
+            "channel_refresh: text edit rejected advert=%s chat=%s mid=%s: %s",
+            advert_rowid,
+            cid_i,
+            mid_i,
+            e,
+        )
         try:
             await bot.edit_message_reply_markup(
                 chat_id=cid_i,
@@ -3528,9 +3599,21 @@ async def refresh_advert_channel_post(bot, advert_rowid: int) -> None:
                 reply_markup=rk,
             )
         except Exception:
-            pass
+            logger.exception(
+                "channel_refresh: markup fallback failed advert=%s chat=%s mid=%s",
+                advert_rowid,
+                cid_i,
+                mid_i,
+            )
+        return False
     except Exception:
-        pass
+        logger.exception(
+            "channel_refresh: unexpected failure advert=%s chat=%s mid=%s",
+            advert_rowid,
+            cid_i,
+            mid_i,
+        )
+        return False
 
 
 def parse_offer_start_payload(args: list[str]) -> int | None:
@@ -3812,10 +3895,14 @@ def _channel_offer_line_inner_html(
     if eff_e > 0 and pe > 0 and pe != adv_e:
         euro_seg = f" — <b>{eff_e:,}</b> یورو"
     st = (offer_status or "pending").strip().lower()
-    if st == "rejected":
+    if st in ("rejected", "selected_rejected"):
         status_prefix = "❌ "
-    elif st == "accepted":
+    elif st in ("accepted", "selected_completed"):
         status_prefix = "✅ "
+    elif st == "selected_closed":
+        status_prefix = "⛔ "
+    elif st == "selected_active":
+        status_prefix = "⏳ "
     return f"{status_prefix}<b>{seq}</b> — {rate_seg}{euro_seg} — {label}"
 
 
