@@ -5,6 +5,8 @@ EN: Delivery method, amount, countries/cities, description → channel (rate 0).
 FA: روش تحویل، مقدار، شهرها، توضیحات → آگهی معاوضه در کانال.
 """
 
+import html as html_module
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
@@ -55,7 +57,7 @@ def _exch_country_line(raw) -> str:
     c = (raw or "").strip()
     if not c or c in ("-", "—", "–"):
         return ""
-    return f"🗺️ <b>کشور (خارج از ایران):</b> {c}\n"
+    return f"🗺️ <b>کشور (خارج از ایران):</b> {html_module.escape(c, quote=False)}\n"
 
 
 def _get_exchange_side(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -366,30 +368,36 @@ async def handle_exchange_description(update: Update, context: ContextTypes.DEFA
     country_int = context.user_data.get("exchange_country_int", "-")
     city_int = context.user_data.get("exchange_city_int", "-")
     desc = context.user_data.get("exchange_description", "-")
+    esc = lambda s: html_module.escape(str(s or "—"), quote=False)
+    amt_disp = f"{amount:,}" if isinstance(amount, int) else esc(amount)
 
     # Force RTL for the whole Iran-city line (better alignment with 🇮🇷).
-    rtl_city_ir_line = f"\u200f🏙️ <b>شهر ایران:</b> {city_ir}"
+    rtl_city_ir_line = f"\u200f🏙️ <b>شهر ایران:</b> {esc(city_ir)}"
     show_instant = side != "خرید" and context.user_data.get("exchange_method") == "امکان واریز به حساب دارم"
     instant_value = instant or "—"
-    instant_line = f"⚡ <b>امکان واریز آنی:</b> {instant_value}\n" if show_instant else ""
+    instant_line = (
+        f"⚡ <b>امکان واریز آنی:</b> {esc(instant_value)}\n" if show_instant else ""
+    )
     in_person_value = "دریافت حضوری" if side == "خرید" else "تحویل حضوری"
     show_foreign_city = context.user_data.get("exchange_method") == in_person_value
-    foreign_city_line = f"🌆 <b>شهر خارج:</b> {city_int}\n" if show_foreign_city else ""
+    foreign_city_line = (
+        f"🌆 <b>شهر خارج:</b> {esc(city_int)}\n" if show_foreign_city else ""
+    )
     foreign_country_line = _exch_country_line(country_int)
     preview = (
         "📣 <b>پیش‌نمایش آگهی معاوضه</b>\n\n"
-        f"👤 <b>آگهی‌دهنده:</b> {full_name}\n"
+        f"👤 <b>آگهی‌دهنده:</b> {esc(full_name)}\n"
         f"🏷️ <b>نوع آگهی:</b> {'خرید یورو' if side == 'خرید' else 'فروش یورو'}\n"
         "🔀 <b>روش معاوضه:</b>\n"
         f"{_RTL}یورو به یورو\n\n"
-        f"💶 <b>مقدار:</b> {amount:,} یورو\n"
+        f"💶 <b>مقدار:</b> {amt_disp} یورو\n"
         f"🧾 <b>کارمزد (هر طرف):</b> {_format_fee_eur(amount if isinstance(amount, int) else None)}\n\n"
         f"{foreign_country_line}"
         f"{foreign_city_line}"
         f"{rtl_city_ir_line}\n\n"
-        f"📦 <b>{'روش دریافت' if side == 'خرید' else 'روش تحویل'}:</b> {method}\n"
+        f"📦 <b>{'روش دریافت' if side == 'خرید' else 'روش تحویل'}:</b> {esc(method)}\n"
         f"{instant_line}\n"
-        f"📄 <b>توضیحات:</b> {desc}"
+        f"📄 <b>توضیحات:</b> {esc(desc)}"
         f"{format_channel_ad_footer(bot_username=(await context.bot.get_me()).username, euro_exchange_no_rate=True)}"
     )
 

@@ -353,6 +353,9 @@ def ensure_schema() -> None:
             "seller_eur_account_sent_at",
             "buyer_toman_settled_at",
             "seller_toman_admin_log",
+            "seller_toman_settled_at",
+            "seller_toman_close_enabled_at",
+            "admin_escalation_mids",
         ):
             try:
                 cur.execute(
@@ -2585,12 +2588,15 @@ def deal_gate_upsert(
             "completed_at",
             "admin_notify_mids",
             "admin_notify_photo_mids",
+            "admin_escalation_mids",
             "buyer_receipt_log",
             "buyer_toman_card_sent_at",
             "seller_receipt_log",
             "seller_eur_account_sent_at",
             "buyer_toman_settled_at",
             "seller_toman_admin_log",
+            "seller_toman_settled_at",
+            "seller_toman_close_enabled_at",
         }
         for key, val in fields.items():
             if key not in allowed:
@@ -2787,6 +2793,23 @@ def deal_gate_append_seller_toman_admin(
     return items
 
 
+def deal_gate_enable_seller_toman_close(offer_id: int) -> int:
+    """فعال‌سازی فلو «تومان نشست — پایان معامله» — فقط پس از ارسال جدید فیش تومان."""
+    gate = deal_gate_get(offer_id)
+    if not gate:
+        return 0
+    now = int(time.time())
+    oid = int(offer_id)
+    deal_gate_upsert(
+        offer_id=oid,
+        advert_rowid=int(gate["advert_rowid"]),
+        buyer_telegram_id=int(gate["buyer_telegram_id"]),
+        seller_telegram_id=int(gate["seller_telegram_id"]),
+        seller_toman_close_enabled_at=now,
+    )
+    return now
+
+
 def deal_gate_delete(offer_id: int) -> None:
     try:
         oid = int(offer_id)
@@ -2843,20 +2866,24 @@ def deal_gate_active_for_user(user_id: int) -> dict | None:
 
 
 def deal_gate_list_for_admin(*, limit: int = 25) -> list[dict]:
-    """معاملات باز و اخیراً تکمیل‌شده برای پنل ادمین."""
+    """معاملات باز، تکمیل‌شده و رد/بستهٔ اخیر برای پنل ادمین."""
     lim = max(1, min(int(limit), 50))
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
             SELECT * FROM offer_deal_gates
-            WHERE gate_status IN ('pending', 'accounts', 'completed')
+            WHERE gate_status IN (
+                'pending', 'accounts', 'completed', 'rejected', 'closed'
+            )
             ORDER BY
                 CASE gate_status
                     WHEN 'pending' THEN 0
                     WHEN 'accounts' THEN 1
                     WHEN 'completed' THEN 2
-                    ELSE 3
+                    WHEN 'rejected' THEN 3
+                    WHEN 'closed' THEN 4
+                    ELSE 5
                 END,
                 COALESCE(completed_at, started_at) DESC
             LIMIT ?
@@ -2864,6 +2891,37 @@ def deal_gate_list_for_admin(*, limit: int = 25) -> list[dict]:
             (lim,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def deal_gate_list_awaiting_seller_toman_confirm() -> list[dict]:
+    """معاملات completed با فیش تومان ادمین و بدون تأیید پایان فروشنده."""
+    import json
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT * FROM offer_deal_gates
+            WHERE gate_status = 'completed'
+            ORDER BY offer_id ASC
+            """
+        ).fetchall()
+    out: list[dict] = []
+    for row in rows:
+        d = dict(row)
+        if int(d.get("seller_toman_settled_at") or 0) > 0:
+            continue
+        if int(d.get("seller_toman_close_enabled_at") or 0) <= 0:
+            continue
+        raw = (d.get("seller_toman_admin_log") or "[]").strip()
+        try:
+            items = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            items = []
+        if isinstance(items, list) and items:
+            d["offer_id"] = int(d["offer_id"])
+            out.append(d)
+    return out
 
 
 def deal_gate_lookup_for_admin(

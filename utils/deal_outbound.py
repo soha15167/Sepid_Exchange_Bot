@@ -130,6 +130,40 @@ async def deal_bot_send_photo(
     return sent
 
 
+async def deal_bot_send_document(
+    bot: Bot,
+    *,
+    offer_id: int,
+    chat_id: int,
+    party: str,
+    tag: str,
+    document_file_id: str,
+    caption: str | None = None,
+    parse_mode: str | None = ParseMode.HTML,
+    reply_markup=None,
+):
+    sent = await bot.send_document(
+        int(chat_id),
+        document_file_id,
+        caption=caption,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+    )
+    try:
+        bot_outbound_log_insert(
+            offer_id,
+            chat_id,
+            party,
+            tag,
+            msg_type="document",
+            caption_html=caption or "",
+            photo_file_id=document_file_id,
+        )
+    except Exception:
+        logger.exception("deal_outbound: log document failed offer=%s", offer_id)
+    return sent
+
+
 async def deal_admin_replay_outbound(
     bot: Bot,
     admin_chat_id: int,

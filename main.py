@@ -143,6 +143,7 @@ from handlers.channel_info import (
 from handlers.deal_gate import (
     admin_deal_gate_account_photo_router,
     deal_admin_euro_settled_callback,
+    deal_admin_party_proxy_callback,
     deal_admin_payment_callback,
     deal_admin_seller_toman_receipt_callback,
     deal_admin_send_buyer_eur_account_callback,
@@ -326,8 +327,8 @@ async def euro_flow_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if u and deal_gate_active_for_user(u.id) and not user_flow_text_active(context):
         return
 
-    if await _dispatch_user_flow_text(update, context):
-        return
+    # ثبت آگهی/پیشنهاد/معاوضه در group=1 (wizard_text_router) هندل می‌شود؛
+    # تکرار _dispatch_user_flow_text اینجا باعث پیام اشتباه «تایید آگهی» بعد از پیش‌نمایش می‌شد.
 
     if state == UserState.NEGOTIATION.name:
         return await handle_negotiation_message(update, context)
@@ -455,6 +456,26 @@ async def auto_start_notify(application: Application):
         print(f"✅ offer rate rejection build: {OFFER_RATE_REJECTION_BUILD}")
     except Exception:
         pass
+
+
+def _setup_seller_stom_reminder_job(application: Application) -> None:
+    from handlers.deal_gate import run_seller_stom_reminder_sweep
+
+    if not application.job_queue:
+        return
+
+    async def _sweep(context):
+        n = await run_seller_stom_reminder_sweep(context.bot)
+        if n:
+            logger.info("seller_stom_reminder_sweep: sent %s", n)
+
+    application.job_queue.run_repeating(
+        _sweep,
+        interval=3600,
+        first=600,
+        name="seller_stom_reminder_sweep",
+    )
+    logger.info("Seller stom close reminder sweep every 1h (8h interval)")
 
 
 def _setup_daily_admin_report_job(application: Application) -> None:
@@ -676,6 +697,11 @@ def main():
         & (filters.PHOTO | filters.Document.IMAGE)
         & ~filters.COMMAND
     )
+    _deal_receipt_media = (
+        filters.ChatType.PRIVATE
+        & (filters.PHOTO | filters.Document.IMAGE | filters.Document.PDF)
+        & ~filters.COMMAND
+    )
     # --- Deal Gate | دروازه معامله (groups 0/4) — receipts & accounts before wizard ---
     # EN: See docs/DEAL_GATE.md. FA: ر.ک. docs/DEAL_GATE.md
     # PTB: فقط یک handler در هر group اجرا می‌شود — deal_gate و wizard باید group جدا باشند.
@@ -687,7 +713,7 @@ def main():
         group=3,
     )
     application.add_handler(
-        MessageHandler(_iran_receipt_media, deal_gate_group0_photo_router),
+        MessageHandler(_deal_receipt_media, deal_gate_group0_photo_router),
         group=4,
     )
     application.add_handler(
@@ -717,7 +743,13 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_confirm_exchange, pattern="^confirm_exchange$"))
     application.add_handler(CallbackQueryHandler(handle_service_operation_callback, pattern="^service_op_"))
     application.add_handler(CallbackQueryHandler(handle_inline_cancel_callback, pattern="^inline_cancel$"))
-    # Deal Gate admin callbacks | callbackهای ادمین معامله: pay, tomset, eurcfm, stom, outlog
+    # Deal Gate admin callbacks | callbackهای ادمین معامله: pxy, pay, tomset, eurcfm, stom, outlog
+    application.add_handler(
+        CallbackQueryHandler(
+            deal_admin_party_proxy_callback,
+            pattern=r"^adm\|pxy\|",
+        )
+    )
     application.add_handler(CallbackQueryHandler(deal_admin_payment_callback, pattern=r"^adm\|pay\|"))
     application.add_handler(
         CallbackQueryHandler(
@@ -805,6 +837,7 @@ def main():
         await auto_start_notify(app)
         _setup_bonbast_daily_job(app)
         _setup_daily_admin_report_job(app)
+        _setup_seller_stom_reminder_job(app)
         try:
             await _set_bot_command_menus(app.bot)
         except Exception:

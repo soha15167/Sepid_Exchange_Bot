@@ -68,6 +68,11 @@ REGISTER_FULLNAME, REGISTER_LASTNAME, REGISTER_DISPLAY_NAME, REGISTER_EMAIL, REG
 
 OTP_TELEGRAM_REVEAL_SECONDS = 60
 
+_DISPLAY_NAME_PROMPT_HTML = (
+    f"{_RTL}🏷️ <b>نام نمایشی در آگهی</b> را وارد کنید.\n"
+    f"{_RTL}<i>همان نامی که دیگران در آگهی می‌بینند؛ باید یکتا باشد.</i>"
+)
+
 
 def _otp_countdown_job_name(user_id: int) -> str:
     return f"reg_otp_countdown_{user_id}"
@@ -484,15 +489,19 @@ async def get_lastname(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply_registration_step(
         update,
         context,
-        f"{_RTL}🏷️ لطفاً <b>نام نمایشی (یا نام مستعار) در آگهی</b> را وارد کنید:\n"
-        f"{_RTL}<i>این نام باید برای هر کاربر منحصربه‌فرد باشد.</i>",
+        _DISPLAY_NAME_PROMPT_HTML,
+        parse_mode="HTML",
     )
     return REGISTER_DISPLAY_NAME
 
 
 async def get_display_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
-        await _reply_registration_step(update, context, f"{_RTL}❌ لطفاً نام نمایشی را به صورت متن ارسال کنید:")
+        await _reply_registration_step(
+            update,
+            context,
+            f"{_RTL}❌ لطفاً نام نمایشی را به صورت متن ارسال کنید:",
+        )
         return REGISTER_DISPLAY_NAME
     display_name = (update.message.text or "").strip()
     if not display_name:
@@ -500,11 +509,20 @@ async def get_display_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update, context, f"{_RTL}❌ لطفاً یک نام معتبر وارد کنید:"
         )
         return REGISTER_DISPLAY_NAME
+    if "<" in display_name or ">" in display_name:
+        await _reply_registration_step(
+            update,
+            context,
+            f"{_RTL}❌ نام نمایشی نباید شامل < یا > باشد.\n"
+            f"{_RTL}مثال درست: <code>n.t</code>",
+            parse_mode="HTML",
+        )
+        return REGISTER_DISPLAY_NAME
     if display_name_exists(display_name):
         await _reply_registration_step(
             update,
             context,
-            f"{_RTL}❌ این نام قبلاً استفاده شده است و باید منحصربه‌فرد باشد.\n"
+            f"{_RTL}❌ این نام قبلاً استفاده شده است.\n"
             f"{_RTL}لطفاً یک نام دیگر وارد کنید:",
         )
         return REGISTER_DISPLAY_NAME
@@ -809,10 +827,9 @@ async def verify_sms(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["state"] = UserState.MAIN_MENU.name
     welcome_txt = (
-        f"{_RTL}✅ ثبت‌نام شما با موفقیت انجام شد.\n\n"
-        f"{_RTL}📜 قبل از «🚀 درخواست خدمات»، یک‌بار از منوی پایین گزینهٔ "
-        "«قوانین و روال کار کانال» را باز کنید و مطالعه کنید؛ بعد از آن "
-        "امکان ثبت درخواست برای شما فعال می‌شود."
+        f"{_RTL}✅ <b>ثبت‌نام شما با موفقیت انجام شد.</b>\n\n"
+        f"{_RTL}قبل از «🚀 درخواست خدمات»، یک‌بار از منوی پایین "
+        f"«قوانین و روال کار کانال» را بخوانید؛ بعد از آن درخواست فعال می‌شود."
     )
     menu_mid = await send_or_replace_main_menu(
         context.bot,
@@ -820,6 +837,7 @@ async def verify_sms(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id=uid,
         store=user_data_store,
         text=welcome_txt,
+        parse_mode="HTML",
     )
     mark_flow_keep_message(user_data_store, uid, context.user_data, menu_mid)
     return ConversationHandler.END
@@ -835,7 +853,6 @@ async def cancel_registration(update: Update, context: ContextTypes.DEFAULT_TYPE
         extra.append(q.message.message_id)
     _clear_otp_flow_extras(context, uid)
     context.user_data.pop("registration_active", None)
-    context.user_data.pop("registration", None)
     context.user_data.pop("registration", None)
     await _reg_cleanup_messages(
         context.bot, chat_id=cid, user_id=uid, context=context, extra_ids=extra

@@ -170,8 +170,6 @@ async def handle_payment_selection_callback(update: Update, context: ContextType
         context.user_data["state"] = UserState.EURO_ACCOUNT_COUNTRY.name
         return await ask_account_country(update, context)
 
-        return await ask_euro_amount(update, context)
-
     # Compatibility: support both old label-based callbacks and new token-based callbacks.
     selected_method = METHOD_BY_CALLBACK.get(choice)
     if selected_method is None and choice in set(PAYMENT_OPTIONS + [EXCHANGE_OPTION]):

@@ -1943,6 +1943,10 @@ async def iran_panel_sync_router(update: Update, context: ContextTypes.DEFAULT_T
 
     if user_flow_text_active(context):
         return
+    from handlers.deal_gate import is_deal_receipt_flow_active
+
+    if is_deal_receipt_flow_active(context):
+        return
     m = update.message
     if not m:
         return
