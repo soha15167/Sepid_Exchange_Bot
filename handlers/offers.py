@@ -57,7 +57,7 @@ from database.db import (
     proposer_offer_rate_exists,
     proposer_offer_rate_exists_other_than,
     proposer_has_pending_offer_on_advert,
-    reject_other_pending_offers_for_advert,
+    accept_advert_offer_atomically,
     update_advert_offer_status,
     update_proposer_pending_offer_rate,
 )
@@ -2646,6 +2646,33 @@ def _deal_admin_status_banner_html(gate: dict | None) -> str:
     return ""
 
 
+def _deal_admin_identity_header_html(
+    gate: dict | None,
+    *,
+    offer_id: int,
+    advert_id: int,
+    offer_sequence: int,
+    advert_link_html: str,
+) -> str:
+    """Prominent Persian identity header for admin messages only."""
+    stage = ((gate or {}).get("gate_status") or "").strip().lower()
+    stage_fa = {
+        "pending": "تأیید نهایی طرفین",
+        "accounts": "دریافت اطلاعات حساب",
+        "completed": "پرداخت و تسویه",
+        "rejected": "متوقف؛ منتظر تصمیم ادمین",
+        "closed": "بسته‌شده",
+    }.get(stage, "پذیرش پیشنهاد")
+    return (
+        f"{_RTL}🧾 <b>مشخصات معامله</b>\n"
+        f"{_RTL}آگهی <b>{int(advert_id)}</b> · پیشنهاد <b>{int(offer_sequence)}</b> · "
+        f"کد معامله <code>{int(offer_id)}</code>\n"
+        f"{_RTL}نقش‌ها: <b>خریدار یورو / فروشنده یورو</b>\n"
+        f"{_RTL}مرحله فعلی: <b>{html_module.escape(stage_fa)}</b>\n"
+        f"{_RTL}لینک آگهی: {advert_link_html}\n\n"
+    )
+
+
 def _post_acceptance_admin_message_html(
     advert: dict,
     row: dict,
@@ -2676,18 +2703,15 @@ def _post_acceptance_admin_message_html(
     buyer_ct, seller_ct = _offer_euro_buyer_seller_country_texts(advert, prop_ct)
 
     if compact:
-        gate_status = ((gate or {}).get("gate_status") or "").strip().lower()
-        if deal_complete:
-            status = "تکمیل شد"
-        elif accounts_status_mode:
-            status = "ثبت حساب"
-        elif gate_status == "pending":
-            status = "تأیید نهایی"
-        else:
-            status = "پذیرش"
         ad_link = advert_public_link_html(advert, aid)
-        hdr = (
-            f"{_RTL}📩 <b>{status}</b> · پیشنهاد <b>{seq}</b> · {ad_link}\n"
+        oid = int((gate or {}).get("offer_id") or row.get("id") or 0)
+        hdr = _deal_admin_identity_header_html(
+            gate,
+            offer_id=oid,
+            advert_id=aid,
+            offer_sequence=seq,
+            advert_link_html=ad_link,
+        ) + (
             f"{_RTL}💶 <b>{eur_amt:,}</b> یورو · نرخ <b>{rate:,}</b>\n\n"
         )
         if gate:
@@ -5153,8 +5177,18 @@ async def handle_advert_owner_offer_action(
         if st == "rejected":
             await query.answer("این پیشنهاد قبلاً رد شده است.", show_alert=True)
             return
-        if not update_advert_offer_status(offer_id, "accepted"):
-            await query.answer("ذخیره نشد.", show_alert=True)
+        acceptance = accept_advert_offer_atomically(offer_id)
+        if not acceptance.get("accepted"):
+            reason = (acceptance.get("reason") or "").strip().lower()
+            if reason == "already_accepted":
+                msg = "این پیشنهاد قبلاً پذیرفته شده است."
+            elif reason in ("rejected", "gate_rejected", "gate_closed", "gate_aborted"):
+                msg = "این پیشنهاد دیگر فعال نیست و قابل پذیرش نیست."
+            elif reason == "winner_exists":
+                msg = "پیشنهاد دیگری برای این آگهی قبلاً پذیرفته شده است."
+            else:
+                msg = "پذیرش پیشنهاد ذخیره نشد؛ لطفاً دوباره وضعیت آگهی را بررسی کنید."
+            await query.answer(msg, show_alert=True)
             return
         await query.answer("پیشنهاد پذیرفته شد.")
         owner_id = int(row["owner_id"])
@@ -5162,7 +5196,7 @@ async def handle_advert_owner_offer_action(
         aid = int(row["advert_rowid"])
         seq = int(row.get("seq_in_advert") or offer_id)
         auto_rejected = 0
-        for other_oid in reject_other_pending_offers_for_advert(aid, offer_id):
+        for other_oid in acceptance.get("rejected_offer_ids") or []:
             ometa = get_advert_offer_joined(other_oid)
             if not ometa:
                 continue

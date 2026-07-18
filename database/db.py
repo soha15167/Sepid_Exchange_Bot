@@ -1891,6 +1891,138 @@ def reject_other_pending_offers_for_advert(
     return ids
 
 
+def accept_advert_offer_atomically(offer_id: int) -> dict:
+    """Select exactly one offer for an advert in one SQLite transaction.
+
+    ``BEGIN IMMEDIATE`` serializes competing Accept callbacks before either
+    callback reads the offer state.  The winner is accepted and every other
+    pending offer is rejected in the same commit.  Existing deal gates keep
+    the advert locked until the explicit admin reactivation flow deletes the
+    gate.
+    """
+    result = {
+        "accepted": False,
+        "reason": "not_found",
+        "advert_rowid": None,
+        "winner_offer_id": None,
+        "rejected_offer_ids": [],
+    }
+    try:
+        oid = int(offer_id)
+    except (TypeError, ValueError):
+        return result
+
+    conn = sqlite3.connect(DB_PATH, timeout=15.0, isolation_level=None)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT id, advert_rowid,
+                   lower(trim(COALESCE(NULLIF(status, ''), 'pending')))
+            FROM advert_offers
+            WHERE id = ?
+            """,
+            (oid,),
+        ).fetchone()
+        if not row:
+            conn.rollback()
+            return result
+
+        aid = int(row[1])
+        current_status = (row[2] or "pending").strip().lower()
+        result["advert_rowid"] = aid
+        if current_status == "accepted":
+            result["reason"] = "already_accepted"
+            result["winner_offer_id"] = oid
+            conn.commit()
+            return result
+        if current_status != "pending":
+            result["reason"] = current_status or "not_pending"
+            conn.commit()
+            return result
+
+        winner = conn.execute(
+            """
+            SELECT o.id
+            FROM advert_offers o
+            LEFT JOIN offer_deal_gates g ON g.offer_id = o.id
+            WHERE o.advert_rowid = ?
+              AND o.id != ?
+              AND (
+                    lower(trim(COALESCE(o.status, ''))) = 'accepted'
+                    OR lower(trim(COALESCE(g.gate_status, ''))) IN (
+                        'pending', 'accounts', 'completed', 'rejected', 'closed'
+                    )
+                  )
+            ORDER BY o.id ASC
+            LIMIT 1
+            """,
+            (aid, oid),
+        ).fetchone()
+        if winner:
+            conn.execute(
+                """
+                UPDATE advert_offers SET status = 'rejected'
+                WHERE id = ?
+                  AND lower(trim(COALESCE(NULLIF(status, ''), 'pending'))) = 'pending'
+                """,
+                (oid,),
+            )
+            result["reason"] = "winner_exists"
+            result["winner_offer_id"] = int(winner[0])
+            conn.commit()
+            return result
+
+        other_rows = conn.execute(
+            """
+            SELECT id FROM advert_offers
+            WHERE advert_rowid = ? AND id != ?
+              AND lower(trim(COALESCE(NULLIF(status, ''), 'pending'))) = 'pending'
+            ORDER BY id ASC
+            """,
+            (aid, oid),
+        ).fetchall()
+        rejected_ids = [int(item[0]) for item in other_rows]
+        updated = conn.execute(
+            """
+            UPDATE advert_offers SET status = 'accepted'
+            WHERE id = ?
+              AND lower(trim(COALESCE(NULLIF(status, ''), 'pending'))) = 'pending'
+            """,
+            (oid,),
+        )
+        if updated.rowcount != 1:
+            conn.rollback()
+            result["reason"] = "changed_during_acceptance"
+            return result
+        conn.execute(
+            """
+            UPDATE advert_offers SET status = 'rejected'
+            WHERE advert_rowid = ? AND id != ?
+              AND lower(trim(COALESCE(NULLIF(status, ''), 'pending'))) = 'pending'
+            """,
+            (aid, oid),
+        )
+        conn.commit()
+        result.update(
+            {
+                "accepted": True,
+                "reason": "accepted",
+                "winner_offer_id": oid,
+                "rejected_offer_ids": rejected_ids,
+            }
+        )
+        return result
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
 def update_advert_offer_status(offer_id: int, status: str) -> bool:
     st = (status or "").strip().lower()
     if st not in (
@@ -2848,12 +2980,13 @@ def deal_gate_delete(offer_id: int) -> None:
         conn.commit()
 
 
-def deal_gate_active_for_user(user_id: int) -> dict | None:
-    """Gate فعال که کاربر باید حساب بفرستد (accounts)."""
+def deal_gate_accounts_for_user(user_id: int) -> list[dict]:
+    """All account-stage deals still awaiting this user's account details."""
     try:
         uid = int(user_id)
     except (TypeError, ValueError):
-        return None
+        return []
+    out: list[dict] = []
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -2889,8 +3022,14 @@ def deal_gate_active_for_user(user_id: int) -> dict | None:
                 continue
             if uid == seller_id and (d.get("seller_accounts_text") or "").strip():
                 continue
-            return d
-    return None
+            out.append(d)
+    return out
+
+
+def deal_gate_active_for_user(user_id: int) -> dict | None:
+    """Most recent account-stage deal awaiting this user's account details."""
+    rows = deal_gate_accounts_for_user(user_id)
+    return rows[0] if rows else None
 
 
 def deal_gate_list_for_admin(*, limit: int = 25) -> list[dict]:

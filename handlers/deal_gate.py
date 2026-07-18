@@ -46,7 +46,7 @@ from telegram.ext import ApplicationHandlerStop, ContextTypes
 from config.settings import ADMIN_IDS, BANK_CARDS
 from database.db import (
     bot_outbound_log_list,
-    deal_gate_active_for_user,
+    deal_gate_accounts_for_user,
     deal_gate_append_buyer_receipt,
     deal_gate_append_seller_receipt,
     deal_gate_append_seller_toman_admin,
@@ -103,6 +103,7 @@ def _seller_buyer_eur_account_delivered(offer_id: int, seller_telegram_id: int) 
 _RTL = "\u200f"
 _ACC_PENDING_KEY = "deal_acc_pending"
 _DEAL_ACC_OFFER_KEY = "deal_gate_accounts_offer_id"
+_DEAL_ACC_REQUIRE_PICK_KEY = "deal_gate_accounts_require_pick"
 _DEAL_RCPT_KEY = "deal_rcpt_pending"
 _DEAL_ADMIN_STOM_KEY = "deal_admin_stom_pending"
 _DEAL_ADMIN_PXY_KEY = "deal_admin_pxy_pending"
@@ -1854,16 +1855,25 @@ def _party_receipt_pending_offer(
     return (oid if oid > 0 else None), party
 
 
-def _party_receipt_pending_switch(
-    context: ContextTypes.DEFAULT_TYPE, offer_id: int, party: str
+async def _party_receipt_prepare_switch(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    offer_id: int,
+    party: str,
 ) -> bool:
-    """True = همان offer/party فعال است."""
+    """Select one receipt flow and remove a different deal's stale prompt."""
     active_oid, active_party = _party_receipt_pending_offer(context)
     if active_oid is None:
         return False
     if int(active_oid) == int(offer_id) and active_party == party:
         return True
     _clear_deal_receipt_pending(context)
+    await _purge_rcpt_prompt_msgs(
+        context.bot,
+        user_data_store,
+        int(user_id),
+        int(active_oid),
+    )
     return False
 
 
@@ -3415,6 +3425,67 @@ async def deal_admin_view_outbound_logs_callback(
 # =============================================================================
 
 
+def _party_role_fa(gate: dict, user_id: int) -> str:
+    uid = int(user_id)
+    if uid == int(gate.get("buyer_telegram_id") or 0):
+        return "خریدار یورو"
+    if uid == int(gate.get("seller_telegram_id") or 0):
+        return "فروشنده یورو"
+    return "کاربر"
+
+
+def _party_deal_identity_html(
+    gate: dict, user_id: int, *, stage_fa: str
+) -> str:
+    """Private/admin-safe deal identity; never added to the public advert."""
+    oid = int(gate.get("offer_id") or 0)
+    aid = int(gate.get("advert_rowid") or 0)
+    row = get_advert_offer_joined(oid) if oid else None
+    seq = int((row or {}).get("seq_in_advert") or oid)
+    role = _party_role_fa(gate, int(user_id))
+    return (
+        f"{_RTL}🧾 <b>مشخصات معامله</b>\n"
+        f"{_RTL}آگهی <b>{aid}</b> · پیشنهاد <b>{seq}</b> · کد معامله <code>{oid}</code>\n"
+        f"{_RTL}نقش شما: <b>{html_module.escape(role)}</b>\n"
+        f"{_RTL}مرحله فعلی: <b>{html_module.escape(stage_fa)}</b>\n\n"
+    )
+
+
+def _account_deal_pick_keyboard(offer_id: int) -> InlineKeyboardMarkup:
+    oid = int(offer_id)
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📝 انتخاب این معامله و ارسال حساب",
+                    callback_data=f"deal|accpick|{oid}",
+                )
+            ]
+        ]
+    )
+
+
+def _account_deal_choices_keyboard(
+    gates: list[dict], user_id: int
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for gate in gates[:20]:
+        oid = int(gate.get("offer_id") or 0)
+        aid = int(gate.get("advert_rowid") or 0)
+        row = get_advert_offer_joined(oid) if oid else None
+        seq = int((row or {}).get("seq_in_advert") or oid)
+        role = _party_role_fa(gate, int(user_id))
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"آگهی {aid} · پیشنهاد {seq} · {role}",
+                    callback_data=f"deal|accpick|{oid}",
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
+
+
 def _log(offer_id: int, text: str, *, from_role: str = "system") -> None:
     negotiation_transcript_append_line(int(offer_id), from_role, text, max_lines=None)
 
@@ -4859,7 +4930,9 @@ async def _handle_deal_receipt_callback(
         await q.answer()
         return
 
-    if _party_receipt_pending_switch(context, int(offer_id), "buyer"):
+    if await _party_receipt_prepare_switch(
+        context, uid, int(offer_id), "buyer"
+    ):
         await q.answer("همین‌جا فیش بعدی را بفرستید یا انصراف.", show_alert=True)
         return
 
@@ -4878,7 +4951,12 @@ async def _handle_deal_receipt_callback(
     try:
         sent = await context.bot.send_message(
             uid,
-            f"{_RTL}📎 <b>ارسال فیش واریزی</b>\n\n"
+            _party_deal_identity_html(
+                gate,
+                uid,
+                stage_fa="ارسال فیش واریزی تومان",
+            )
+            + f"{_RTL}📎 <b>ارسال فیش واریزی</b>\n\n"
             f"{_RTL}آگهی <b>{aid}</b> · offer <code>{offer_id}</code>\n"
             f"{_RTL}عکس یا متن هر فیش را بفرستید.\n"
             f"{_RTL}یک واریز ممکن است چند فیش باشد — "
@@ -4934,7 +5012,9 @@ async def _handle_deal_seller_receipt_callback(
         await q.answer()
         return
 
-    if _party_receipt_pending_switch(context, int(offer_id), "seller"):
+    if await _party_receipt_prepare_switch(
+        context, uid, int(offer_id), "seller"
+    ):
         await q.answer("همین‌جا فیش بعدی را بفرستید یا انصراف.", show_alert=True)
         return
 
@@ -4953,7 +5033,12 @@ async def _handle_deal_seller_receipt_callback(
     try:
         sent = await context.bot.send_message(
             uid,
-            f"{_RTL}📎 <b>ارسال فیش واریزی یورو</b>\n\n"
+            _party_deal_identity_html(
+                gate,
+                uid,
+                stage_fa="ارسال فیش واریزی یورو",
+            )
+            + f"{_RTL}📎 <b>ارسال فیش واریزی یورو</b>\n\n"
             f"{_RTL}آگهی <b>{aid}</b> · offer <code>{offer_id}</code>\n"
             f"{_RTL}عکس یا متن هر فیش را بفرستید.\n"
             f"{_RTL}یک واریز ممکن است چند فیش باشد — "
@@ -5191,6 +5276,10 @@ async def deal_gate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _handle_seller_toman_settled_callback(
             update, context, int(parts[2])
         )
+    elif parts[0] == "deal" and parts[1] == "accpick" and len(parts) >= 3:
+        await _handle_account_deal_pick_callback(
+            update, context, int(parts[2])
+        )
     elif parts[0] == "deal" and parts[1] == "acc" and len(parts) >= 4:
         await _handle_account_confirm_callback(update, context, parts[2], int(parts[3]))
     elif parts[0] == "deal":
@@ -5332,14 +5421,17 @@ async def _on_both_yes(
             if not party_uid:
                 continue
             try:
-                context.application.user_data[party_uid][_DEAL_ACC_OFFER_KEY] = int(
-                    offer_id
-                )
-            except Exception:
-                pass
-            try:
                 ud = context.application.user_data[party_uid]
                 clear_offer_flow_user_data(ud)
+                candidates = deal_gate_accounts_for_user(int(party_uid))
+                if len(candidates) == 1 and not ud.get(
+                    _DEAL_ACC_REQUIRE_PICK_KEY
+                ):
+                    ud[_DEAL_ACC_OFFER_KEY] = int(offer_id)
+                else:
+                    ud.pop(_DEAL_ACC_OFFER_KEY, None)
+                    if len(candidates) > 1:
+                        ud[_DEAL_ACC_REQUIRE_PICK_KEY] = True
             except Exception:
                 logger.exception(
                     "deal_gate: clear offer flow failed uid=%s offer=%s",
@@ -5349,6 +5441,7 @@ async def _on_both_yes(
             reset_flow_user_bucket(user_data_store, int(party_uid))
     except Exception:
         logger.exception("deal_gate: clear offer flow failed offer=%s", offer_id)
+    prompt_gate = deal_gate_get(offer_id) or gate
     for uid, is_buyer in (
         (buyer_id, True),
         (seller_id, False),
@@ -5365,6 +5458,11 @@ async def _on_both_yes(
             )
         else:
             body = _seller_account_collection_message_html(hint)
+        body = _party_deal_identity_html(
+            prompt_gate,
+            uid,
+            stage_fa="دریافت اطلاعات حساب",
+        ) + body
         try:
             from utils.deal_outbound import deal_bot_send_message
 
@@ -5377,6 +5475,7 @@ async def _on_both_yes(
                 party=party,
                 tag=tag,
                 text=body,
+                reply_markup=_account_deal_pick_keyboard(offer_id),
             )
             _track_deal_msg(user_data_store, uid, offer_id, sent.message_id)
         except Exception:
@@ -5745,32 +5844,113 @@ def _clear_account_pending(context: ContextTypes.DEFAULT_TYPE) -> None:
 def _resolve_party_accounts_gate(
     context: ContextTypes.DEFAULT_TYPE, uid: int
 ) -> dict | None:
-    """گیت accounts برای طرف — اول offer_id ذخیره‌شده، سپس جستجوی فعال."""
+    """Resolve only an unambiguous or explicitly selected account-stage deal."""
+    candidates = deal_gate_accounts_for_user(int(uid))
+    if not candidates:
+        context.user_data.pop(_DEAL_ACC_OFFER_KEY, None)
+        context.user_data.pop(_DEAL_ACC_REQUIRE_PICK_KEY, None)
+        return None
+
     prefer = context.user_data.get(_DEAL_ACC_OFFER_KEY)
     if prefer is not None:
         try:
-            gate = deal_gate_get(int(prefer))
+            preferred_id = int(prefer)
         except (TypeError, ValueError):
-            gate = None
-        if gate and (gate.get("gate_status") or "").strip().lower() == "accounts":
-            party_ok = int(gate.get("buyer_telegram_id") or 0) == int(uid) or int(
-                gate.get("seller_telegram_id") or 0
-            ) == int(uid)
-            if party_ok:
+            preferred_id = 0
+        for gate in candidates:
+            if int(gate.get("offer_id") or 0) == preferred_id:
                 return gate
-    gate = deal_gate_active_for_user(uid)
-    if gate and (gate.get("gate_status") or "").strip().lower() == "accounts":
-        return gate
+        context.user_data.pop(_DEAL_ACC_OFFER_KEY, None)
+
+    if len(candidates) > 1:
+        context.user_data[_DEAL_ACC_REQUIRE_PICK_KEY] = True
+        return None
+    if context.user_data.get(_DEAL_ACC_REQUIRE_PICK_KEY):
+        return None
+    return candidates[0]
+
+
+async def _prompt_account_deal_choice(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    gates: list[dict],
+) -> bool:
+    if not update.message or not update.effective_user or not gates:
+        return False
+    context.user_data[_DEAL_ACC_REQUIRE_PICK_KEY] = True
+    context.user_data.pop(_DEAL_ACC_OFFER_KEY, None)
+    await update.message.reply_text(
+        f"{_RTL}⚠️ <b>چند معامله فعال دارید.</b>\n\n"
+        f"{_RTL}برای جلوگیری از ثبت حساب در معامله اشتباه، ابتدا معامله موردنظر را انتخاب کنید؛ "
+        f"سپس متن یا عکس حساب را بفرستید.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_account_deal_choices_keyboard(
+            gates, int(update.effective_user.id)
+        ),
+    )
+    return True
+
+
+async def _handle_account_deal_pick_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    offer_id: int,
+) -> None:
+    q = update.callback_query
+    if not q or not q.from_user:
+        return
+    uid = int(q.from_user.id)
+    candidates = deal_gate_accounts_for_user(uid)
+    gate = next(
+        (
+            item
+            for item in candidates
+            if int(item.get("offer_id") or 0) == int(offer_id)
+        ),
+        None,
+    )
+    if not gate:
+        await q.answer(
+            "این معامله دیگر در مرحله دریافت حساب نیست.",
+            show_alert=True,
+        )
+        return
+    _clear_account_pending(context)
+    context.user_data[_DEAL_ACC_OFFER_KEY] = int(offer_id)
+    context.user_data[_DEAL_ACC_REQUIRE_PICK_KEY] = len(candidates) > 1
+    await q.answer("این معامله انتخاب شد.")
+    await context.bot.send_message(
+        chat_id=uid,
+        text=(
+            _party_deal_identity_html(
+                gate,
+                uid,
+                stage_fa="دریافت اطلاعات حساب",
+            )
+            + f"{_RTL}✅ این معامله انتخاب شد. اکنون <b>متن یا عکس حساب همین معامله</b> را ارسال کنید."
+        ),
+        parse_mode=ParseMode.HTML,
+    )
     return None
 
 
-def _clear_party_accounts_offer(context: ContextTypes.DEFAULT_TYPE, uid: int) -> None:
+def _clear_party_accounts_offer(
+    context: ContextTypes.DEFAULT_TYPE,
+    uid: int,
+    *,
+    offer_id: int | None = None,
+) -> None:
     try:
-        context.user_data.pop(_DEAL_ACC_OFFER_KEY, None)
+        current = context.user_data.get(_DEAL_ACC_OFFER_KEY)
+        if offer_id is None or int(current or 0) == int(offer_id):
+            context.user_data.pop(_DEAL_ACC_OFFER_KEY, None)
     except Exception:
         pass
     try:
-        context.application.user_data[int(uid)].pop(_DEAL_ACC_OFFER_KEY, None)
+        ud = context.application.user_data[int(uid)]
+        current = ud.get(_DEAL_ACC_OFFER_KEY)
+        if offer_id is None or int(current or 0) == int(offer_id):
+            ud.pop(_DEAL_ACC_OFFER_KEY, None)
     except Exception:
         pass
 
@@ -5887,6 +6067,7 @@ async def _commit_party_account(
         uid,
         party,
     )
+    _clear_party_accounts_offer(context, int(uid), offer_id=oid)
 
     gate = deal_gate_get(oid) or gate
     both_done = bool(
@@ -6020,9 +6201,6 @@ async def deal_gate_accounts_photo_router(
     if not update.message or not update.effective_user:
         return
     uid = update.effective_user.id
-    gate = _resolve_party_accounts_gate(context, uid)
-    if not gate:
-        return
     from utils.flow_guards import user_offer_wizard_text_step
 
     if user_offer_wizard_text_step(context):
@@ -6033,6 +6211,14 @@ async def deal_gate_accounts_photo_router(
         "in",
         "out",
     ):
+        return
+    gate = _resolve_party_accounts_gate(context, uid)
+    if not gate:
+        candidates = deal_gate_accounts_for_user(int(uid))
+        if candidates and await _prompt_account_deal_choice(
+            update, context, candidates
+        ):
+            raise ApplicationHandlerStop
         return
 
     from handlers.offers import _clear_offer_flow
@@ -6171,21 +6357,21 @@ async def deal_gate_accounts_router(
     if not update.message or not update.effective_user:
         return
     uid = update.effective_user.id
+    from utils.flow_guards import user_offer_wizard_text_step
+
+    if user_offer_wizard_text_step(context):
+        return
     gate = _resolve_party_accounts_gate(context, uid)
     if not gate:
+        candidates = deal_gate_accounts_for_user(int(uid))
+        if candidates and await _prompt_account_deal_choice(
+            update, context, candidates
+        ):
+            raise ApplicationHandlerStop
         logger.debug(
             "deal_gate: skip text uid=%s — no accounts gate (gate=%s)",
             uid,
             gate.get("gate_status") if gate else None,
-        )
-        return
-    from utils.flow_guards import user_offer_wizard_text_step
-
-    if user_offer_wizard_text_step(context):
-        logger.info(
-            "deal_gate: skip text uid=%s offer=%s — offer wizard text step",
-            uid,
-            gate.get("offer_id"),
         )
         return
     ud = context.user_data or {}
@@ -6262,7 +6448,11 @@ async def _complete_deal(context: ContextTypes.DEFAULT_TYPE, offer_id: int) -> N
     for uid in (buyer_id, seller_id):
         if not uid:
             continue
-        _clear_party_accounts_offer(context, int(uid))
+        _clear_party_accounts_offer(
+            context,
+            int(uid),
+            offer_id=int(offer_id),
+        )
         await _purge_user_deal_chat(
             context.bot, user_data_store, int(uid), offer_id, gate
         )

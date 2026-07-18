@@ -132,6 +132,35 @@ class DealGateDatabaseTests(unittest.TestCase):
         db.deal_gate_delete(101)
         self.assertEqual(db.list_accepted_offers_for_advert(3196), [])
 
+    def test_all_account_deals_for_same_user_are_returned_separately(self):
+        db.deal_gate_upsert(
+            offer_id=201,
+            advert_rowid=3201,
+            buyer_telegram_id=10,
+            seller_telegram_id=21,
+            gate_status="accounts",
+        )
+        db.deal_gate_upsert(
+            offer_id=202,
+            advert_rowid=3202,
+            buyer_telegram_id=10,
+            seller_telegram_id=22,
+            gate_status="accounts",
+        )
+
+        rows = db.deal_gate_accounts_for_user(10)
+
+        self.assertEqual({int(item["offer_id"]) for item in rows}, {201, 202})
+        db.deal_gate_upsert(
+            offer_id=201,
+            advert_rowid=3201,
+            buyer_telegram_id=10,
+            seller_telegram_id=21,
+            buyer_accounts_text="synthetic account",
+        )
+        remaining = db.deal_gate_accounts_for_user(10)
+        self.assertEqual([int(item["offer_id"]) for item in remaining], [202])
+
 
 if __name__ == "__main__":
     unittest.main()
