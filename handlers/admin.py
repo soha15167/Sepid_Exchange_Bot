@@ -2805,7 +2805,6 @@ async def admin_dashboard_callback(update: Update, context: ContextTypes.DEFAULT
                 return
             party = "buyer" if parts[2] == "bacc" else "seller"
             party_fa = "خریدار یورو" if party == "buyer" else "فروشنده یورو"
-            from database.db import get_advert_offer_joined, get_euro_advert_by_rowid
             from handlers.deal_gate import _account_collection_hint
 
             row = get_advert_offer_joined(oid)
