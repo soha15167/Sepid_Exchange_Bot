@@ -1292,7 +1292,10 @@ async def _sync_deal_admin_notification_locked(
     seller_id = int(gate["seller_telegram_id"])
     buyer_acct = (gate.get("buyer_accounts_text") or "").strip()
     seller_acct = (gate.get("seller_accounts_text") or "").strip()
-    accounts_mode = not deal_complete
+    st = (gate.get("gate_status") or "").strip().lower()
+    # A newly accepted offer is still waiting for the parties' final answer.
+    # Do not render that first admin copy as if account collection had started.
+    accounts_mode = st == "accounts"
     if deal_complete:
         album_slides = _admin_deal_slides_plan(
             gate, oid, seq=seq, aid=aid, include_receipts=True
@@ -1332,8 +1335,11 @@ async def _sync_deal_admin_notification_locked(
     stored = _parse_admin_notify_mids(gate)
     updated = dict(stored)
     plain = re.sub(r"<[^>]+>", "", admin_html or "")
-    st = (gate.get("gate_status") or "").strip().lower()
-    if deal_complete:
+    if st == "closed":
+        reply_markup = None
+    elif st == "rejected":
+        reply_markup = _admin_gate_rejected_keyboard(oid)
+    elif deal_complete:
         reply_markup = deal_admin_main_keyboard(oid, gate, include_payment=True)
     elif st in ("pending", "accounts"):
         reply_markup = deal_admin_main_keyboard(oid, gate, include_payment=False)
@@ -1533,23 +1539,32 @@ def deal_admin_party_proxy_rows(
     if st == "pending":
         br = (gate.get("buyer_response") or "").strip().lower()
         sr = (gate.get("seller_response") or "").strip().lower()
-        row: list[InlineKeyboardButton] = []
         if br != "yes":
-            row.append(
-                InlineKeyboardButton(
-                    "✅ تأیید نهایی خریدار",
-                    callback_data=f"adm|pxy|{oid}|byes",
-                )
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "✅ تأیید خریدار",
+                        callback_data=f"adm|pxy|{oid}|byes",
+                    ),
+                    InlineKeyboardButton(
+                        "❌ رد خریدار",
+                        callback_data=f"adm|pxy|{oid}|bno",
+                    ),
+                ]
             )
         if sr != "yes":
-            row.append(
-                InlineKeyboardButton(
-                    "✅ تأیید نهایی فروشنده",
-                    callback_data=f"adm|pxy|{oid}|syes",
-                )
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "✅ تأیید فروشنده",
+                        callback_data=f"adm|pxy|{oid}|syes",
+                    ),
+                    InlineKeyboardButton(
+                        "❌ رد فروشنده",
+                        callback_data=f"adm|pxy|{oid}|sno",
+                    ),
+                ]
             )
-        if row:
-            rows.append(row)
 
     if st == "accounts":
         row = [
@@ -2193,6 +2208,55 @@ async def _admin_proxy_party_final_yes(
     )
 
 
+async def _admin_proxy_party_final_no(
+    context: ContextTypes.DEFAULT_TYPE,
+    offer_id: int,
+    party: str,
+    q,
+) -> None:
+    """Register a final refusal on behalf of one party and stop the deal."""
+    gate = deal_gate_get(offer_id)
+    if not gate or (gate.get("gate_status") or "").strip().lower() != "pending":
+        await q.answer("این مرحله دیگر فعال نیست", show_alert=True)
+        return
+    if party not in ("buyer", "seller"):
+        await q.answer()
+        return
+    role_key = f"{party}_response"
+    current = (gate.get(role_key) or "").strip().lower()
+    if current == "yes":
+        await q.answer("این طرف قبلاً تأیید کرده است", show_alert=True)
+        return
+    if current == "no":
+        await q.answer("قبلاً رد شده است", show_alert=True)
+        return
+    buyer_id = int(gate["buyer_telegram_id"])
+    seller_id = int(gate["seller_telegram_id"])
+    ts_key = "buyer_confirmed_at" if party == "buyer" else "seller_confirmed_at"
+    party_id = buyer_id if party == "buyer" else seller_id
+    party_fa = "خریدار" if party == "buyer" else "فروشنده"
+    deal_gate_upsert(
+        offer_id=offer_id,
+        advert_rowid=int(gate["advert_rowid"]),
+        buyer_telegram_id=buyer_id,
+        seller_telegram_id=seller_id,
+        **{role_key: "no", ts_key: int(time.time())},
+    )
+    _log(
+        offer_id,
+        f"ادمین به‌جای {party_fa}: رد نهایی (خیر)",
+        from_role="admin",
+    )
+    await q.answer(f"❌ رد {party_fa} ثبت شد")
+    await _on_gate_rejected(
+        context,
+        offer_id,
+        rejector_id=party_id,
+        party=party_fa,
+        acted_by_admin=True,
+    )
+
+
 async def _admin_begin_proxy_receipt(
     context: ContextTypes.DEFAULT_TYPE,
     q,
@@ -2303,6 +2367,12 @@ async def deal_admin_party_proxy_callback(
         return
     if action == "syes":
         await _admin_proxy_party_final_yes(context, oid, "seller", q)
+        return
+    if action == "bno":
+        await _admin_proxy_party_final_no(context, oid, "buyer", q)
+        return
+    if action == "sno":
+        await _admin_proxy_party_final_no(context, oid, "seller", q)
         return
     if action == "bacc":
         await _admin_prompt_party_account(context, q, oid, "buyer")
@@ -4404,6 +4474,14 @@ async def start_deal_final_gate(
         seller_id=seller_id,
     )
     _schedule_gate_jobs(context, oid)
+    try:
+        await sync_deal_admin_notification(context.bot, oid)
+        _log(oid, "اعلان معامله برای ادمین بلافاصله پس از پذیرش پیشنهاد")
+    except Exception:
+        # Party confirmation must continue even if one admin notification fails.
+        logger.exception(
+            "deal_gate: initial admin notification failed offer=%s", oid
+        )
 
 
 async def _job_reminder1(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5254,7 +5332,7 @@ async def _on_both_yes(
         except Exception:
             pass
     await sync_deal_admin_notification(context.bot, offer_id)
-    _log(offer_id, "اعلان اولیه معامله برای ادمین (پس از تأیید دوطرفه)")
+    _log(offer_id, "اعلان معامله ادمین پس از تأیید دوطرفه به‌روزرسانی شد")
 
 
 async def _on_gate_rejected(
@@ -5263,6 +5341,7 @@ async def _on_gate_rejected(
     *,
     rejector_id: int,
     party: str,
+    acted_by_admin: bool = False,
 ) -> None:
     gate = deal_gate_get(offer_id)
     if not gate:
@@ -5278,6 +5357,7 @@ async def _on_gate_rejected(
     )
     update_advert_offer_status(offer_id, "gate_rejected")
     _cancel_gate_jobs(context, offer_id)
+    actor_text = f"ادمین از طرف {party}" if acted_by_admin else party
     row = get_advert_offer_joined(offer_id)
     if row:
         aid = int(row["advert_rowid"])
@@ -5288,13 +5368,13 @@ async def _on_gate_rejected(
             resolved_text=(
                 f"{_RTL}❌ <b>تأیید نهایی لغو شد</b>\n\n"
                 f"{_RTL}پیشنهاد <b>{seq}</b> · آگهی <b>{aid}</b>\n"
-                f"{_RTL}{party} یورو «خیر» زد — این اعلان دیگر فعال نیست."
+                f"{_RTL}{actor_text} یورو «خیر» را ثبت کرد — این اعلان دیگر فعال نیست."
             ),
         )
-    _log(offer_id, f"معامله متوقف شد — {party} «خیر» زد")
+    _log(offer_id, f"معامله متوقف شد — {actor_text} «خیر» را ثبت کرد")
     msg = (
         f"{_RTL}❌ <b>تأیید نهایی لغو شد</b>\n\n"
-        f"{_RTL}<b>{party} یورو</b> «خیر» زد.\n"
+        f"{_RTL}<b>{actor_text} یورو</b> «خیر» را ثبت کرد.\n"
         f"{_RTL}معامله متوقف شد؛ ادمین مطلع می‌شود."
     )
     from utils.deal_outbound import deal_bot_send_message, party_for_uid
@@ -5315,7 +5395,10 @@ async def _on_gate_rejected(
             pass
     row = get_advert_offer_joined(offer_id)
     advert = get_euro_advert_by_rowid(int(row["advert_rowid"])) if row else None
-    if row and advert:
+    had_admin_message = bool(_parse_admin_notify_mids(gate))
+    if row and advert and had_admin_message:
+        await sync_deal_admin_notification(context.bot, offer_id)
+    elif row and advert:
         from handlers.offers import (
             _format_deal_party_identity_html,
             _send_deal_admin_notifications,
@@ -5324,7 +5407,7 @@ async def _on_gate_rejected(
         aid = int(row["advert_rowid"])
         body = (
             f"{_RTL}❌ <b>رد تأیید نهایی</b> · آگهی <b>{aid}</b>\n\n"
-            f"{_RTL}{party} یورو «خیر» زد.\n\n"
+            f"{_RTL}{actor_text} یورو «خیر» را ثبت کرد.\n\n"
             f"{_format_deal_party_identity_html(buyer_id, title='خریدار')}\n"
             f"{_format_deal_party_identity_html(seller_id, title='فروشنده')}"
         )

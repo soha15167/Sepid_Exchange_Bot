@@ -2613,6 +2613,23 @@ def _deal_admin_status_banner_html(gate: dict | None) -> str:
     from database.db import deal_gate_seller_toman_admin_list
 
     st = (gate.get("gate_status") or "").strip().lower()
+    if st == "pending":
+        br = (gate.get("buyer_response") or "").strip().lower()
+        sr = (gate.get("seller_response") or "").strip().lower()
+        waiting: list[str] = []
+        if br != "yes":
+            waiting.append("خریدار")
+        if sr != "yes":
+            waiting.append("فروشنده")
+        waiting_text = " و ".join(waiting) or "طرفین"
+        return (
+            f"{_RTL}⏳ <b>منتظر تأیید نهایی {waiting_text}</b>\n"
+            f"{_RTL}ادمین می‌تواند با دکمه‌های زیر از طرف خریدار یا فروشنده تأیید یا رد کند.\n"
+        )
+    if st == "accounts":
+        return f"{_RTL}⏳ <b>در حال دریافت اطلاعات حساب طرفین</b>\n"
+    if st == "rejected":
+        return f"{_RTL}❌ <b>تأیید نهایی رد شد و معامله متوقف است</b>\n"
     if st == "closed":
         return f"{_RTL}⛔ <b>معامله بسته شد</b>\n"
     oid = int(gate.get("offer_id") or 0)
@@ -2659,10 +2676,13 @@ def _post_acceptance_admin_message_html(
     buyer_ct, seller_ct = _offer_euro_buyer_seller_country_texts(advert, prop_ct)
 
     if compact:
+        gate_status = ((gate or {}).get("gate_status") or "").strip().lower()
         if deal_complete:
             status = "تکمیل شد"
         elif accounts_status_mode:
             status = "ثبت حساب"
+        elif gate_status == "pending":
+            status = "تأیید نهایی"
         else:
             status = "پذیرش"
         ad_link = advert_public_link_html(advert, aid)

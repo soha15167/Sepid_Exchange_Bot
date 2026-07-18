@@ -540,6 +540,7 @@ async def _set_bot_command_menus(bot) -> None:
     ]
     admin_cmds = public_cmds + [
         BotCommand("admin", "پنل مدیریت"),
+        BotCommand("neg_ad", "گزارش مذاکرات یک آگهی"),
         BotCommand("post_rates", "ارسال نرخ بن‌بست در کانال"),
         BotCommand("cards", "کارت‌های بانکی (قابل کپی)"),
         BotCommand("txin", "ثبت ورودی در سایت ایران"),
