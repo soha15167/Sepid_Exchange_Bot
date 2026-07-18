@@ -12,6 +12,7 @@ from telegram import Update
 from telegram.constants import ChatType
 from telegram.error import NetworkError, TelegramError, TimedOut
 from telegram.ext import ApplicationHandlerStop, ContextTypes
+from utils.app_logging import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
@@ -20,20 +21,19 @@ _MAX_ADMIN_TRACE = 2800
 
 def _update_context_snippet(update: Update) -> str:
     parts: list[str] = []
+    parts.append(f"شناسه بروزرسانی: <code>{update.update_id}</code>")
     user = update.effective_user
     if user:
-        uname = f"@{user.username}" if user.username else "—"
-        parts.append(f"کاربر: <code>{user.id}</code> {html.escape(uname)}")
+        parts.append(f"کاربر: <code>{user.id}</code>")
     chat = update.effective_chat
     if chat:
         parts.append(f"چت: <code>{chat.id}</code> ({html.escape(str(chat.type))})")
     if update.message:
-        if update.message.text:
-            parts.append(f"متن: <code>{html.escape(update.message.text[:300])}</code>")
-        elif update.message.caption:
-            parts.append(f"کپشن: <code>{html.escape(update.message.caption[:300])}</code>")
+        parts.append("نوع رویداد: <code>message</code>")
     elif update.callback_query:
-        parts.append(f"callback: <code>{html.escape((update.callback_query.data or '')[:200])}</code>")
+        parts.append("نوع رویداد: <code>callback_query</code>")
+    else:
+        parts.append("نوع رویداد: <code>other</code>")
     return "\n".join(parts) if parts else "—"
 
 
@@ -48,14 +48,16 @@ async def _notify_admins_about_error(
     if not admin_ids:
         return
 
-    tb = "".join(traceback.format_exception(type(err), err, err.__traceback__))
+    tb = redact_sensitive_text(
+        "".join(traceback.format_exception(type(err), err, err.__traceback__))
+    )
     if len(tb) > _MAX_ADMIN_TRACE:
         tb = "…\n" + tb[-_MAX_ADMIN_TRACE:]
 
     body = (
         f"{_update_context_snippet(update)}\n\n"
         f"<b>{html.escape(type(err).__name__)}:</b> "
-        f"{html.escape(str(err)[:500])}\n\n"
+        f"{html.escape(redact_sensitive_text(err)[:500])}\n\n"
         f"<pre>{html.escape(tb)}</pre>"
     )
     text = f"⚠️ <b>خطای ربات</b>\n\n{body}"
@@ -84,9 +86,16 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
         raise err
 
     logger.error(
-        "handler exception update=%s error=%s",
-        update,
-        err,
+        "handler exception update_id=%s event=%s error_type=%s",
+        update.update_id if isinstance(update, Update) else None,
+        (
+            "callback_query"
+            if isinstance(update, Update) and update.callback_query
+            else "message"
+            if isinstance(update, Update) and update.message
+            else "other"
+        ),
+        type(err).__name__,
         exc_info=err,
     )
 
