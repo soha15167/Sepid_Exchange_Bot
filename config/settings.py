@@ -174,25 +174,6 @@ BONBAST_CURRENCY_CODES = [c.strip().lower() for c in _bonbast_codes_raw.split(",
 _bonbast_ch_raw = (os.getenv("BONBAST_CHANNEL_ID") or "").strip()
 BONBAST_CHANNEL_ID = _bonbast_ch_raw or ADVERT_CHANNEL_ID
 
-# --- Web companion (optional; bot unchanged if web stack not running) ---
-WEB_API_HOST = (os.getenv("WEB_API_HOST") or "0.0.0.0").strip()
-try:
-    WEB_API_PORT = int((os.getenv("WEB_API_PORT") or "8100").strip())
-except ValueError:
-    WEB_API_PORT = 8100
-try:
-    WEB_FRONTEND_PORT = int((os.getenv("WEB_FRONTEND_PORT") or "3100").strip())
-except ValueError:
-    WEB_FRONTEND_PORT = 3100
-WEB_FRONTEND_URL = (os.getenv("WEB_FRONTEND_URL") or f"http://localhost:{WEB_FRONTEND_PORT}").strip().rstrip("/")
-WEB_JWT_SECRET = (os.getenv("WEB_JWT_SECRET") or "").strip()
-try:
-    WEB_JWT_EXPIRE_HOURS = int((os.getenv("WEB_JWT_EXPIRE_HOURS") or "720").strip())
-except ValueError:
-    WEB_JWT_EXPIRE_HOURS = 720
-_WEB_DEV_OTP_RAW = (os.getenv("WEB_DEV_OTP_IN_RESPONSE") or "").strip().lower()
-WEB_DEV_OTP_IN_RESPONSE = _WEB_DEV_OTP_RAW in ("1", "true", "yes", "on")
-
 # --- Validation / اعتبارسنجی ---
 if not BOT_TOKEN:
     raise ValueError("❌ BOT_TOKEN در فایل .env تعریف نشده است!")
