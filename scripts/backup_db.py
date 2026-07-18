@@ -22,6 +22,17 @@ def resolve_database_path(configured_path: str | os.PathLike[str]) -> Path:
     return path.resolve()
 
 
+def configured_backup_retention() -> int:
+    raw_value = (os.getenv("BACKUP_KEEP") or "14").strip()
+    try:
+        keep = int(raw_value)
+    except ValueError as exc:
+        raise ValueError("BACKUP_KEEP must be a positive integer") from exc
+    if keep < 1:
+        raise ValueError("BACKUP_KEEP must be a positive integer")
+    return keep
+
+
 def create_verified_backup(
     source_path: str | os.PathLike[str],
     backup_dir: str | os.PathLike[str],
@@ -86,7 +97,7 @@ def main() -> int:
         destination = create_verified_backup(
             source,
             ROOT / "backups",
-            keep=14,
+            keep=configured_backup_retention(),
         )
     except Exception as exc:
         print(f"ERROR {exc}", file=sys.stderr)

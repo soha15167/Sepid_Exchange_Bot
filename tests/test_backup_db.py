@@ -5,8 +5,9 @@ import unittest
 from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
-from scripts.backup_db import create_verified_backup
+from scripts.backup_db import configured_backup_retention, create_verified_backup
 
 
 class VerifiedDatabaseBackupTests(unittest.TestCase):
@@ -51,6 +52,17 @@ class VerifiedDatabaseBackupTests(unittest.TestCase):
 
         backups = list(self.backup_dir.glob("source.db.*.bak"))
         self.assertEqual(len(backups), 2)
+
+    def test_retention_can_be_configured_for_hourly_backups(self):
+        with patch.dict(os.environ, {"BACKUP_KEEP": "168"}):
+            self.assertEqual(configured_backup_retention(), 168)
+
+    def test_invalid_retention_is_rejected(self):
+        for value in ("0", "-1", "not-a-number"):
+            with self.subTest(value=value):
+                with patch.dict(os.environ, {"BACKUP_KEEP": value}):
+                    with self.assertRaisesRegex(ValueError, "positive integer"):
+                        configured_backup_retention()
 
 
 if __name__ == "__main__":

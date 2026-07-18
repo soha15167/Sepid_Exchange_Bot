@@ -1,0 +1,21 @@
+[Unit]
+Description=Sepid Telegram Bot verified SQLite backup
+After=local-fs.target
+ConditionPathExists=/root/telegram_bot_project2/eurobot.db
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/root/telegram_bot_project2
+Environment=DATABASE_NAME=/root/telegram_bot_project2/eurobot.db
+Environment=BACKUP_KEEP=168
+ExecStart=/root/telegram_bot_project2/venv/bin/python3 /root/telegram_bot_project2/scripts/backup_db.py
+UMask=0077
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+TimeoutStartSec=5min
