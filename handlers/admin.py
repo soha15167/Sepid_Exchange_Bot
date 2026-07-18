@@ -117,6 +117,28 @@ _ADMIN_RESTRICT_DAYS_STATE_NAME = (
 _ADMIN_KB_BACK = "⬅️ بازگشت"
 _ADMIN_KB_CANCEL = "❌ انصراف"
 
+_ADMIN_EDIT_ADVERT_FIELDS = frozenset(
+    {
+        "full_name",
+        "euro_amount",
+        "rate_toman",
+        "description",
+        "methods",
+        "account_country",
+        "instant_transfer",
+        "fee_override_eur",
+    }
+)
+_ADMIN_EDIT_ADVERT_VALUE_FIELDS = _ADMIN_EDIT_ADVERT_FIELDS - {
+    "methods",
+    "instant_transfer",
+}
+
+
+def _is_admin_editable_advert_value_field(value: object) -> bool:
+    """Allow only known column names before building the admin UPDATE query."""
+    return isinstance(value, str) and value in _ADMIN_EDIT_ADVERT_VALUE_FIELDS
+
 
 def _admin_edit_advert_fields_inline_kb(*, show_rate_row: bool) -> InlineKeyboardMarkup:
     def cell(label: str, field: str) -> InlineKeyboardButton:
@@ -1454,17 +1476,7 @@ async def admin_advert_inline_callback(update: Update, context: ContextTypes.DEF
             parts = data.split("|")
             if len(parts) >= 3 and parts[1] == "pick":
                 field = parts[2]
-                allowed = {
-                    "full_name",
-                    "euro_amount",
-                    "rate_toman",
-                    "description",
-                    "methods",
-                    "account_country",
-                    "instant_transfer",
-                    "fee_override_eur",
-                }
-                if field in allowed:
+                if field in _ADMIN_EDIT_ADVERT_FIELDS:
                     await _admin_apply_edit_advert_field_from_callback(
                         update, context, query, field
                     )
@@ -3771,7 +3783,7 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"{_RTL}✏️ کدام فیلد آگهی را ویرایش کنیم؟",
                     reply_markup=_admin_edit_advert_fields_inline_kb(show_rate_row=show_b),
                 )
-            if not isinstance(advert_id, int) or not isinstance(field, str):
+            if not isinstance(advert_id, int) or not _is_admin_editable_advert_value_field(field):
                 context.user_data["state"] = UserState.ADMIN_MENU.name
                 return await _admin_reply(update,"❌ خطا در وضعیت. دوباره تلاش کنید.", reply_markup=None, context=context)
 

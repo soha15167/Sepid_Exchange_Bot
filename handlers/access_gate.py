@@ -217,7 +217,6 @@ _RESTRICTED_OK_CALLBACKS = frozenset(
         "start_begin",
         "terms_accept",
         "terms_decline",
-        "terms_decline",
         "reg_otp_telegram",
         "reg_otp_resend_sms",
         "reg_cancel",

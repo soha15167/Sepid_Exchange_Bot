@@ -1,9 +1,8 @@
-"""اعتبارسنجی کارت، شبا، مبلغ، تاریخ."""
+"""اعتبارسنجی کارت، شبا، مبلغ، تاریخ و ساعت بانکی."""
 
 from __future__ import annotations
 
 import re
-from datetime import datetime
 
 from banking_recognition.banks.database import (
     detect_bank_from_card,
@@ -52,6 +51,10 @@ def validate_card(card: str) -> tuple[bool, str]:
     d = re.sub(r"\D", "", card or "")
     if len(d) != 16:
         return False, "card_length"
+    # A repeated digit (for example 0000... or 1111...) is never a usable
+    # payment-card number, even when it happens to satisfy the Luhn checksum.
+    if len(set(d)) == 1:
+        return False, "card_repeated_digits"
     if not luhn_check(d):
         return False, "luhn"
     return True, ""
@@ -83,7 +86,13 @@ def validate_jdate(jdate: str) -> tuple[bool, str]:
     if not re.match(r"^\d{4}/\d{2}/\d{2}$", s):
         return False, "jdate_format"
     y, m, d = (int(x) for x in s.split("/"))
-    if y < 1300 or y > 1500 or m < 1 or m > 12 or d < 1 or d > 31:
+    if y < 1300 or y > 1500 or m < 1 or m > 12 or d < 1:
+        return False, "jdate_range"
+    # Jalali months 1-6 have at most 31 days; months 7-12 have at most 30.
+    # Esfand leap-year validation is intentionally left to the banking source,
+    # because receipts from leap years legitimately contain 12/30.
+    max_day = 31 if m <= 6 else 30
+    if d > max_day:
         return False, "jdate_range"
     return True, ""
 
@@ -92,9 +101,13 @@ def validate_time(t: str) -> tuple[bool, str]:
     s = (t or "").strip()
     if not s:
         return True, ""
-    if re.match(r"^\d{1,2}:\d{2}(:\d{2})?$", s):
-        return True, ""
-    return False, "time_format"
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", s)
+    if not match:
+        return False, "time_format"
+    hour, minute, second = (int(part or 0) for part in match.groups())
+    if hour > 23 or minute > 59 or second > 59:
+        return False, "time_range"
+    return True, ""
 
 
 def cross_validate_fields(
