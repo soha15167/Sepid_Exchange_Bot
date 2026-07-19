@@ -479,6 +479,28 @@ def _setup_seller_stom_reminder_job(application: Application) -> None:
     logger.info("Seller stom close reminder sweep every 1h (8h interval)")
 
 
+def _setup_admin_toman_receipt_reminder_job(application: Application) -> None:
+    from handlers.deal_gate import run_admin_toman_receipt_reminder_sweep
+
+    if not application.job_queue:
+        return
+
+    async def _sweep(context):
+        n = await run_admin_toman_receipt_reminder_sweep(context.bot)
+        if n:
+            logger.info("admin_toman_receipt_reminder_sweep: sent %s", n)
+
+    # Check frequently, while the persistent per-deal/admin log enforces the
+    # actual one-hour interval and prevents duplicates after restarts.
+    application.job_queue.run_repeating(
+        _sweep,
+        interval=300,
+        first=60,
+        name="admin_toman_receipt_reminder_sweep",
+    )
+    logger.info("Admin Toman receipt reminders: check every 5m (1h interval)")
+
+
 def _setup_daily_admin_report_job(application: Application) -> None:
     from config.settings import DAILY_REPORT_ENABLED, DAILY_REPORT_HOUR, DAILY_REPORT_MINUTE
     from handlers.daily_report import post_daily_admin_report
@@ -846,6 +868,7 @@ def main():
         _setup_bonbast_daily_job(app)
         _setup_daily_admin_report_job(app)
         _setup_seller_stom_reminder_job(app)
+        _setup_admin_toman_receipt_reminder_job(app)
         try:
             await _set_bot_command_menus(app.bot)
         except Exception:

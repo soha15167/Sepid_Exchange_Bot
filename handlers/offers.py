@@ -1043,7 +1043,7 @@ def _offer_bank_country_lines_html(advert: dict, proposer_bank_country: str | No
 
 def _ltr_rate_toman_html(rate: int) -> str:
     """نرخ و «تومان» در بلوک چپ‌به‌راست تا در متن راست‌به‌چپ کنار هم بمانند."""
-    return f"\u202a<b>{int(rate):,}</b> تومان\u202c"
+    return f"\u202a{_copyable_toman_html(int(rate))}\u202c"
 
 
 def _offer_flow_effective_euro(advert: dict, context_user_data: dict) -> int:
@@ -1931,15 +1931,15 @@ def _financial_blocks_html(advert: dict, rate: int, eur_amt: int) -> tuple[str, 
     eur_ln = _fee_eur_line_for_party(fee_eur, advert)
     if op not in ("خرید", "فروش") or eur_amt <= 0:
         gen = (
-            f"🧮 نرخ: <b>{rate:,}</b> تومان — مقدار یورو: <b>{eur_amt:,}</b> — "
-            f"جمع پایه: <b>{base:,}</b> تومان\n"
+            f"🧮 نرخ: {_copyable_toman_html(rate)} — مقدار یورو: <b>{eur_amt:,}</b> — "
+            f"جمع پایه: {_copyable_toman_html(base)}\n"
         )
         if fee_eur > 0:
             gen += f"🧾 کارمزد شما (یورو): <b>{_fmt_fee_eur_display(fee_eur)}</b> (تقریبی)\n"
-            gen += f"🧾 کارمزد شما (تومان، تقریبی): <b>{fee_party_toman:,}</b> تومان\n"
+            gen += f"🧾 کارمزد شما (تقریبی): {_copyable_toman_html(fee_party_toman)}\n"
         elif ov is not None and fee_eur == 0:
             gen += f"🧾 کارمزد شما (یورو): <b>0</b> (ثابت ادمین)\n"
-            gen += f"🧾 کارمزد شما (تومان، تقریبی): <b>{fee_party_toman:,}</b> تومان\n"
+            gen += f"🧾 کارمزد شما (تقریبی): {_copyable_toman_html(fee_party_toman)}\n"
         return gen + "\n", gen + "\n"
 
     if op == "فروش":
@@ -1947,19 +1947,19 @@ def _financial_blocks_html(advert: dict, rate: int, eur_amt: int) -> tuple[str, 
         buyer_pay = base + fee_party_toman
         owner_blk = (
             f"🧮 <b>خلاصه برای شما (آگهی‌دهنده — فروشنده یورو):</b>\n"
-            f"• نرخ: <b>{rate:,}</b> تومان\n"
+            f"• نرخ: {_copyable_toman_html(rate)}\n"
             f"• مقدار یورو: <b>{eur_amt:,}</b>\n"
             f"{eur_ln}"
-            f"• کارمزد شما (تومان): <b>{fee_party_toman:,}</b> تومان\n"
+            f"• کارمزد شما: {_copyable_toman_html(fee_party_toman)}\n"
             f"• مبلغ نهایی (بعد از کسر کارمزد — مبلغی که برای شما واریز می‌شود): "
             f"{_copyable_toman_html(owner_net)}\n\n"
         )
         prop_blk = (
             f"🧮 <b>خلاصه برای شما (پیشنهاد دهنده — خریدار یورو):</b>\n"
-            f"• نرخ: <b>{rate:,}</b> تومان\n"
+            f"• نرخ: {_copyable_toman_html(rate)}\n"
             f"• مقدار یورو: <b>{eur_amt:,}</b>\n"
             f"{eur_ln}"
-            f"• کارمزد شما (تومان): <b>{fee_party_toman:,}</b> تومان\n"
+            f"• کارمزد شما: {_copyable_toman_html(fee_party_toman)}\n"
             f"• مبلغ نهایی (با جمع کارمزد — مبلغ واریز شما): "
             f"{_copyable_toman_html(buyer_pay)}\n\n"
         )
@@ -1969,19 +1969,19 @@ def _financial_blocks_html(advert: dict, rate: int, eur_amt: int) -> tuple[str, 
     seller_recv = base - fee_party_toman
     owner_blk = (
         f"🧮 <b>خلاصه برای شما (آگهی‌دهنده — خریدار یورو):</b>\n"
-        f"• نرخ: <b>{rate:,}</b> تومان\n"
+        f"• نرخ: {_copyable_toman_html(rate)}\n"
         f"• مقدار یورو: <b>{eur_amt:,}</b>\n"
         f"{eur_ln}"
-        f"• کارمزد شما (تومان): <b>{fee_party_toman:,}</b> تومان\n"
+        f"• کارمزد شما: {_copyable_toman_html(fee_party_toman)}\n"
         f"• مبلغ نهایی (با جمع کارمزد — مبلغ واریز شما): "
         f"{_copyable_toman_html(buyer_pay)}\n\n"
     )
     prop_blk = (
         f"🧮 <b>خلاصه برای شما (پیشنهاد دهنده — فروشنده یورو):</b>\n"
-        f"• نرخ: <b>{rate:,}</b> تومان\n"
+        f"• نرخ: {_copyable_toman_html(rate)}\n"
         f"• مقدار یورو: <b>{eur_amt:,}</b>\n"
         f"{eur_ln}"
-        f"• کارمزد شما (تومان): <b>{fee_party_toman:,}</b> تومان\n"
+        f"• کارمزد شما: {_copyable_toman_html(fee_party_toman)}\n"
         f"• مبلغ نهایی (بعد از کسر کارمزد — مبلغی که برای شما واریز می‌شود): "
         f"{_copyable_toman_html(seller_recv)}\n\n"
     )
@@ -2078,7 +2078,6 @@ def _financial_party_summary_compact_html(
         owner_view = op == "فروش"
     else:
         owner_view = True
-    party_fa = "فروشنده" if party == "seller" else "خریدار"
     if op not in ("خرید", "فروش") or eur_amt <= 0:
         return _financial_party_summary_html(advert, rate, eur_amt, party=party)
     base = int(eur_amt) * int(rate)
@@ -2094,7 +2093,7 @@ def _financial_party_summary_compact_html(
     if fee_eur > 0 or (ov is not None and fee_eur == 0):
         fee_part = f"کارمزد <b>{fee_eur_s}</b> یورو · "
     return (
-        f"{_RTL}🧮 <b>{party_fa}</b> · {fee_part}"
+        f"{_RTL}🧮 {fee_part}"
         f"نهایی: {_copyable_toman_html(final_amt)}\n"
     )
 
@@ -2136,7 +2135,7 @@ def _format_deal_party_identity_compact_html(
     if urow and urow.get("username"):
         uname = str(urow.get("username") or "").strip().lstrip("@")
     line = (
-        f"{_RTL}🛒 <b>{html_module.escape(title)}:</b> "
+        f"{_RTL}👤 <b>{html_module.escape(title)}:</b> "
         f"{html_module.escape(display)}"
     )
     if uname:
@@ -2233,15 +2232,24 @@ def _post_acceptance_admin_party_section_html(
     acct_raw = (accounts_text or "").strip()
     if acct_raw:
         acct_lbl = "📝 حساب:" if compact else "📝 <b>اطلاعات حساب:</b>"
-        if acct_raw.startswith("📷"):
+        if _account_text_is_photo_marker(acct_raw):
+            photo_caption = _account_photo_caption_text(acct_raw)
+            caption_blk = (
+                f"<pre>{html_module.escape(photo_caption)}</pre>\n"
+                if photo_caption
+                else ""
+            )
             if account_embedded_photo:
-                acct_blk = ""
+                acct_blk = f"\n{caption_blk}" if caption_blk else ""
             elif compact:
-                acct_blk = f"\n{_RTL}📝 حساب: 📷 عکس (پیام جدا)\n"
+                acct_blk = (
+                    f"\n{_RTL}📝 حساب: 📷 عکس در پیام زیر\n"
+                    f"{caption_blk}"
+                )
             else:
                 acct_blk = (
-                    f"\n{_RTL}📝 <b>اطلاعات حساب:</b> 📷 عکس ارسال شد "
-                    f"(پیام جداگانه — از روی عکس کپی کنید)\n"
+                    f"\n{_RTL}📝 <b>اطلاعات حساب:</b> 📷 عکس در پیام زیر\n"
+                    f"{caption_blk}"
                 )
         else:
             if compact:
@@ -2261,7 +2269,7 @@ def _post_acceptance_admin_party_section_html(
             else f"\n{_RTL}📝 <b>اطلاعات حساب:</b> ⏳ در انتظار ارسال کاربر\n"
         )
     if compact:
-        identity = _format_deal_party_identity_compact_html(tid, title=title)
+        identity = _format_deal_party_identity_compact_html(tid, title="مشخصات")
         if op == "فروش":
             methods_lbl = "پرداخت" if party == "buyer" else "دریافت"
         elif op == "خرید":
@@ -2712,7 +2720,7 @@ def _post_acceptance_admin_message_html(
             offer_sequence=seq,
             advert_link_html=ad_link,
         ) + (
-            f"{_RTL}💶 <b>{eur_amt:,}</b> یورو · نرخ <b>{rate:,}</b>\n\n"
+            f"{_RTL}💶 <b>{eur_amt:,}</b> یورو · نرخ {_copyable_toman_html(rate)}\n\n"
         )
         if gate:
             hdr += _deal_admin_steps_checklist_html(gate)
@@ -2857,7 +2865,24 @@ def _post_acceptance_admin_message_html(
 
 
 def _account_text_is_photo_marker(text: str | None) -> bool:
-    return bool(text and str(text).strip().startswith("📷"))
+    if not text:
+        return False
+    return any(
+        line.strip().startswith("📷 عکس حساب")
+        for line in str(text).splitlines()
+    )
+
+
+def _account_photo_caption_text(text: str | None) -> str:
+    """Return the user caption without the bot's internal photo marker."""
+    if not text:
+        return ""
+    lines = [
+        line.rstrip()
+        for line in str(text).splitlines()
+        if not line.strip().startswith("📷 عکس حساب")
+    ]
+    return "\n".join(lines).strip()
 
 
 def _deal_admin_username() -> str:
@@ -2974,12 +2999,12 @@ def _financial_accept_summary_html(
 
     lines = [
         f"{_RTL}🧮 <b>خلاصه مالی</b>\n",
-        f"{_RTL}• نرخ <b>{rate:,}</b> تومان · <b>{eur_amt:,}</b> یورو\n",
+        f"{_RTL}• نرخ {_copyable_toman_html(rate)} · <b>{eur_amt:,}</b> یورو\n",
     ]
     if fee_eur > 0 or (ov is not None and fee_eur == 0):
         lines.append(
             f"{_RTL}• کارمزد شما: <b>{fee_eur_s}</b> یورو "
-            f"(<b>{fee_toman:,}</b> تومان)\n"
+            f"({_copyable_toman_html(fee_toman)})\n"
         )
     lines.append(
         f"{_RTL}• مبلغ نهایی ({final_lbl}): {_copyable_toman_html(final_amt)}\n\n"

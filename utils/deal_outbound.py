@@ -25,7 +25,12 @@ from database.db import bot_outbound_log_insert, bot_outbound_log_list
 logger = logging.getLogger(__name__)
 
 _RTL = "\u200f"
-_PARTY_FA = {"buyer": "خریدار", "seller": "فروشنده", "user": "کاربر"}
+_PARTY_FA = {
+    "buyer": "خریدار",
+    "seller": "فروشنده",
+    "user": "کاربر",
+    "admin": "ادمین",
+}
 
 
 def party_for_uid(gate: dict | None, uid: int) -> str:
@@ -170,7 +175,14 @@ async def deal_admin_replay_outbound(
     offer_id: int,
 ) -> bool:
     """بازپخش پیام‌های ذخیره‌شده برای ادمین (همان متن/عکس)."""
-    rows = bot_outbound_log_list(offer_id)
+    # Internal admin reminders use this table only as a persistent delivery
+    # clock. They must not appear in the admin's "messages sent to parties"
+    # replay, which is intentionally limited to user-facing deal messages.
+    rows = [
+        row
+        for row in bot_outbound_log_list(offer_id)
+        if (row.get("party") or "").strip().lower() != "admin"
+    ]
     if not rows:
         return False
     intro = (

@@ -110,6 +110,58 @@ class DealGateDatabaseTests(unittest.TestCase):
         )
         self.assertEqual(db.deal_gate_list_awaiting_seller_toman_confirm(), [])
 
+    def test_admin_toman_receipt_reminder_query_tracks_only_unfinished_delivery(self):
+        for offer_id, status in (
+            (201, "pending"),
+            (202, "accounts"),
+            (203, "completed"),
+            (204, "rejected"),
+            (205, "closed"),
+        ):
+            db.deal_gate_upsert(
+                offer_id=offer_id,
+                advert_rowid=3200 + offer_id,
+                buyer_telegram_id=10,
+                seller_telegram_id=20,
+                gate_status=status,
+            )
+
+        self.assertEqual(
+            [
+                item["offer_id"]
+                for item in db.deal_gate_list_awaiting_admin_toman_receipt()
+            ],
+            [201, 202, 203],
+        )
+
+        db.deal_gate_upsert(
+            offer_id=203,
+            advert_rowid=3403,
+            buyer_telegram_id=10,
+            seller_telegram_id=20,
+            seller_toman_close_enabled_at=123456,
+        )
+        self.assertEqual(
+            [
+                item["offer_id"]
+                for item in db.deal_gate_list_awaiting_admin_toman_receipt()
+            ],
+            [201, 202],
+        )
+
+    def test_admin_outbound_log_party_is_preserved_for_persistent_timing(self):
+        self._create_gate()
+        db.bot_outbound_log_insert(
+            101,
+            7001,
+            "admin",
+            "synthetic hourly reminder",
+            body_html="reminder",
+        )
+        rows = db.bot_outbound_log_list(101)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["party"], "admin")
+
     def test_selected_offer_remains_linked_to_gate_until_reactivation(self):
         with sqlite3.connect(self.path) as conn:
             conn.execute(

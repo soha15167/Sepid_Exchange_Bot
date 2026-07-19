@@ -57,6 +57,7 @@ from database.db import (
     deal_gate_seller_receipt_list,
     deal_gate_seller_toman_admin_list,
     deal_gate_get,
+    deal_gate_list_awaiting_admin_toman_receipt,
     deal_gate_list_for_admin,
     deal_gate_mark_seller_toman_settled,
     deal_gate_upsert,
@@ -112,6 +113,8 @@ _ACCOUNT_PHOTO_MARKER = "📷 عکس حساب"
 _REMINDER1_SEC = 3600
 _REMINDER2_SEC = 7200
 _SELLER_STOM_REMINDER_SEC = 8 * 3600
+_ADMIN_TOMAN_REMINDER_SEC = 3600
+_ADMIN_TOMAN_REMINDER_TAG = "یادآوری ساعتی ادمین: فیش تومان فروشنده"
 _HOURLY_SEC = 3600
 _admin_sync_locks: dict[int, asyncio.Lock] = {}
 
@@ -319,7 +322,12 @@ def _parse_admin_album_fids(gate: dict) -> dict[int, list[str]]:
 
 
 def _account_text_is_photo_marker(text: str | None) -> bool:
-    return bool(text and str(text).strip().startswith(_ACCOUNT_PHOTO_MARKER))
+    if not text:
+        return False
+    return any(
+        line.strip().startswith(_ACCOUNT_PHOTO_MARKER)
+        for line in str(text).splitlines()
+    )
 
 
 def _photo_caption_html(html: str, *, limit: int = 1024) -> str:
@@ -2524,6 +2532,32 @@ async def _deal_admin_proxy_receipt_try_photo(
 # =============================================================================
 
 
+def _buyer_toman_deposit_message_html(
+    *,
+    advert_id: int,
+    offer_sequence: int,
+    euro_amount: int,
+    toman_amount: int,
+    card_html: str,
+) -> str:
+    """Build the buyer deposit instruction with one copyable amount+unit."""
+    from handlers.offers import _copyable_toman_html
+
+    return (
+        f"{_RTL}💳 <b>حساب واریز تومان (امانت)</b>\n\n"
+        f"{_RTL}آگهی <b>{int(advert_id)}</b> · پیشنهاد <b>{int(offer_sequence)}</b>\n"
+        f"{_RTL}💶 <b>{int(euro_amount):,}</b> یورو\n\n"
+        f"{_RTL}لطفاً مبلغ {_copyable_toman_html(int(toman_amount))} را "
+        f"به حساب زیر واریز کنید:\n\n"
+        f"{card_html}\n\n"
+        f"{_RTL}📝 <b>توضیحات:</b>\n"
+        f"{_RTL}• این مبلغ به‌صورت <b>امانت</b> نزد ادمین می‌ماند تا "
+        f"فروشنده یورو را به حساب شما واریز کند.\n"
+        f"{_RTL}• پس از واریز، دکمهٔ <b>ارسال فیش واریزی</b> را بزنید.\n"
+        f"{_RTL}• تا تأیید ادمین، مبلغ دیگری واریز نکنید.\n"
+    )
+
+
 async def deal_admin_payment_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -2629,7 +2663,6 @@ async def _admin_send_toman_deposit_card(
         return
 
     from handlers.offers import (
-        _copyable_toman_html,
         _offer_effective_euro_amount,
         buyer_deposit_toman_amount,
     )
@@ -2649,18 +2682,12 @@ async def _admin_send_toman_deposit_card(
     aid = int(row["advert_rowid"])
     card_html = format_bank_card_html(picked)
 
-    msg = (
-        f"{_RTL}💳 <b>حساب واریز تومان (امانت)</b>\n\n"
-        f"{_RTL}آگهی <b>{aid}</b> · پیشنهاد <b>{seq}</b>\n"
-        f"{_RTL}💶 <b>{eur_amt:,}</b> یورو\n\n"
-        f"{_RTL}لطفاً مبلغ {_copyable_toman_html(amount)} تومان را "
-        f"به حساب زیر واریز کنید:\n\n"
-        f"{card_html}\n\n"
-        f"{_RTL}📝 <b>توضیحات:</b>\n"
-        f"{_RTL}• این مبلغ به‌صورت <b>امانت</b> نزد ادمین می‌ماند تا "
-        f"فروشنده یورو را به حساب شما واریز کند.\n"
-        f"{_RTL}• پس از واریز، دکمهٔ <b>ارسال فیش واریزی</b> را بزنید.\n"
-        f"{_RTL}• تا تأیید ادمین، مبلغ دیگری واریز نکنید.\n"
+    msg = _buyer_toman_deposit_message_html(
+        advert_id=aid,
+        offer_sequence=seq,
+        euro_amount=eur_amt,
+        toman_amount=amount,
+        card_html=card_html,
     )
     recipient_id = buyer_id
     party_fa = "خریدار"
@@ -3963,6 +3990,119 @@ async def run_seller_stom_reminder_sweep(bot) -> int:
         oid = int(gate.get("offer_id") or 0)
         if await _send_seller_stom_close_reminder(bot, offer_id=oid, gate=gate):
             sent += 1
+    return sent
+
+
+def _gate_awaiting_admin_toman_receipt(gate: dict | None) -> bool:
+    """Whether admin still needs to drive the deal through Toman receipt delivery."""
+    if not gate:
+        return False
+    status = (gate.get("gate_status") or "").strip().lower()
+    if status not in {"pending", "accounts", "completed"}:
+        return False
+    if int(gate.get("offer_id") or 0) <= 0:
+        return False
+    if int(gate.get("seller_toman_settled_at") or 0) > 0:
+        return False
+    return int(gate.get("seller_toman_close_enabled_at") or 0) <= 0
+
+
+def _last_admin_toman_reminder_at(offer_id: int, admin_id: int) -> int:
+    aid = int(admin_id)
+    last = 0
+    for row in bot_outbound_log_list(int(offer_id)):
+        if int(row.get("recipient_telegram_id") or 0) != aid:
+            continue
+        if (row.get("party") or "").strip().lower() != "admin":
+            continue
+        if (row.get("tag") or "").strip() != _ADMIN_TOMAN_REMINDER_TAG:
+            continue
+        last = max(last, int(row.get("created_at") or 0))
+    return last
+
+
+def _admin_toman_reminder_due(
+    gate: dict,
+    admin_id: int,
+    *,
+    now: int | None = None,
+) -> bool:
+    """At most one reminder per deal/admin/hour, persisted across restarts."""
+    if not _gate_awaiting_admin_toman_receipt(gate):
+        return False
+    ts = int(now if now is not None else time.time())
+    last = _last_admin_toman_reminder_at(int(gate["offer_id"]), int(admin_id))
+    started_at = int(gate.get("started_at") or 0)
+    anchor = last if last > 0 else started_at
+    return anchor <= 0 or ts - anchor >= _ADMIN_TOMAN_REMINDER_SEC
+
+
+def _admin_toman_reminder_stage(gate: dict) -> str:
+    return {
+        "pending": "تأیید نهایی طرفین",
+        "accounts": "دریافت اطلاعات حساب",
+        "completed": "پرداخت و تسویه",
+    }.get((gate.get("gate_status") or "").strip().lower(), "در حال پیگیری")
+
+
+async def run_admin_toman_receipt_reminder_sweep(
+    bot,
+    *,
+    now: int | None = None,
+) -> int:
+    """Send hourly Persian reminders until the Toman receipt reaches seller."""
+    from handlers.offers import _deal_admin_recipient_ids
+    from utils.deal_outbound import deal_bot_log_text
+
+    sent = 0
+    admin_ids = _deal_admin_recipient_ids()
+    if not admin_ids:
+        return 0
+    for gate in deal_gate_list_awaiting_admin_toman_receipt():
+        oid = int(gate.get("offer_id") or 0)
+        row = get_advert_offer_joined(oid) or {}
+        advert_id = int(gate.get("advert_rowid") or row.get("advert_rowid") or 0)
+        offer_seq = int(row.get("seq_in_advert") or oid)
+        stage = _admin_toman_reminder_stage(gate)
+        body = (
+            f"{_RTL}⏰ <b>یادآوری ساعتی ادمین</b>\n\n"
+            f"{_RTL}آگهی <b>{advert_id}</b> · پیشنهاد <b>{offer_seq}</b>\n"
+            f"{_RTL}کد معامله <code>{oid}</code>\n"
+            f"{_RTL}مرحله فعلی: <b>{stage}</b>\n\n"
+            f"{_RTL}این معامله هنوز به مرحلهٔ <b>ارسال فیش واریز تومان به فروشنده</b> "
+            "نرسیده است.\n"
+            f"{_RTL}لطفاً وضعیت معامله را بررسی و مرحله‌های باقی‌مانده را پیگیری کنید.\n"
+            f"{_RTL}<i>این یادآوری پس از ارسال موفق فیش تومان به فروشنده متوقف می‌شود.</i>"
+        )
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📋 مشاهده معامله", callback_data=f"adm|dgs|{oid}")]]
+        )
+        for admin_id in admin_ids:
+            if not _admin_toman_reminder_due(gate, admin_id, now=now):
+                continue
+            try:
+                await bot.send_message(
+                    chat_id=int(admin_id),
+                    text=body,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard,
+                    disable_web_page_preview=True,
+                )
+                deal_bot_log_text(
+                    oid,
+                    int(admin_id),
+                    "admin",
+                    _ADMIN_TOMAN_REMINDER_TAG,
+                    body,
+                )
+                sent += 1
+            except Exception as exc:
+                logger.warning(
+                    "admin_toman_reminder: send failed admin=%s offer=%s: %s",
+                    admin_id,
+                    oid,
+                    exc,
+                )
     return sent
 
 

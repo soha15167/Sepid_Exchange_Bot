@@ -22,12 +22,12 @@ async def main(offer_id: int, *, card_id: str | None = None) -> int:
     from config.settings import BANK_CARDS, BOT_TOKEN
     from database.db import deal_gate_get, deal_gate_upsert, get_advert_offer_joined, get_euro_advert_by_rowid
     from handlers.deal_gate import (
+        _buyer_toman_deposit_message_html,
         _buyer_toman_pay_keyboard,
         _track_pay_card_msg,
         sync_deal_admin_notification,
     )
     from handlers.offers import (
-        _copyable_toman_html,
         _offer_effective_euro_amount,
         buyer_deposit_toman_amount,
     )
@@ -65,18 +65,12 @@ async def main(offer_id: int, *, card_id: str | None = None) -> int:
     aid = int(row["advert_rowid"])
     card_html = format_bank_card_html(picked)
 
-    msg = (
-        f"{_RTL}💳 <b>حساب واریز تومان (امانت)</b>\n\n"
-        f"{_RTL}آگهی <b>{aid}</b> · پیشنهاد <b>{seq}</b>\n"
-        f"{_RTL}💶 <b>{eur_amt:,}</b> یورو\n\n"
-        f"{_RTL}لطفاً مبلغ {_copyable_toman_html(amount)} تومان را "
-        f"به حساب زیر واریز کنید:\n\n"
-        f"{card_html}\n\n"
-        f"{_RTL}📝 <b>توضیحات:</b>\n"
-        f"{_RTL}• این مبلغ به‌صورت <b>امانت</b> نزد ادمین می‌ماند تا "
-        f"فروشنده یورو را به حساب شما واریز کند.\n"
-        f"{_RTL}• پس از واریز، دکمهٔ <b>ارسال فیش واریزی</b> را بزنید.\n"
-        f"{_RTL}• تا تأیید ادمین، مبلغ دیگری واریز نکنید.\n"
+    msg = _buyer_toman_deposit_message_html(
+        advert_id=aid,
+        offer_sequence=seq,
+        euro_amount=eur_amt,
+        toman_amount=amount,
+        card_html=card_html,
     )
 
     bot = Bot(BOT_TOKEN)

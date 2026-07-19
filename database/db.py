@@ -512,7 +512,7 @@ def bot_outbound_log_insert(
     except (TypeError, ValueError):
         return
     pr = (party or "").strip().lower()
-    if pr not in ("buyer", "seller", "user"):
+    if pr not in ("buyer", "seller", "user", "admin"):
         pr = "user"
     mt = (msg_type or "text").strip().lower()
     if mt not in ("text", "photo"):
@@ -3123,6 +3123,24 @@ def deal_gate_list_awaiting_seller_toman_confirm() -> list[dict]:
             d["offer_id"] = int(d["offer_id"])
             out.append(d)
     return out
+
+
+def deal_gate_list_awaiting_admin_toman_receipt() -> list[dict]:
+    """Open deals that have not reached successful Toman-receipt delivery."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT * FROM offer_deal_gates
+            WHERE LOWER(TRIM(COALESCE(gate_status, ''))) IN (
+                'pending', 'accounts', 'completed'
+            )
+              AND COALESCE(seller_toman_settled_at, 0) = 0
+              AND COALESCE(seller_toman_close_enabled_at, 0) = 0
+            ORDER BY offer_id ASC
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def deal_gate_lookup_for_admin(
