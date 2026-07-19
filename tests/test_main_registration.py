@@ -66,6 +66,7 @@ class MainRegistrationTests(unittest.TestCase):
             {
                 "^main_services$",
                 r"^(deal\||adm\|dg\|)",
+                r"^adm\|stomset\|",
                 r"^adm\|",
                 r"^offer_\d+$",
                 "^confirm_advert$",

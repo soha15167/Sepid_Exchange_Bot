@@ -2970,6 +2970,40 @@ def deal_gate_enable_seller_toman_close(offer_id: int) -> int:
     return now
 
 
+def deal_gate_mark_seller_toman_settled(
+    offer_id: int, *, settled_at: int | None = None
+) -> bool:
+    """Atomically claim the final seller-Toman confirmation for one deal."""
+    try:
+        oid = int(offer_id)
+    except (TypeError, ValueError):
+        return False
+    now = int(settled_at or time.time())
+    conn = sqlite3.connect(DB_PATH, timeout=15.0, isolation_level=None)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            """
+            UPDATE offer_deal_gates
+            SET seller_toman_settled_at = ?
+            WHERE offer_id = ?
+              AND lower(trim(COALESCE(gate_status, ''))) = 'completed'
+              AND COALESCE(seller_toman_settled_at, 0) = 0
+              AND COALESCE(seller_toman_close_enabled_at, 0) > 0
+              AND trim(COALESCE(seller_toman_admin_log, '')) NOT IN ('', '[]')
+            """,
+            (now, oid),
+        )
+        changed = cur.rowcount == 1
+        conn.commit()
+        return changed
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def deal_gate_delete(offer_id: int) -> None:
     try:
         oid = int(offer_id)

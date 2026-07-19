@@ -146,6 +146,7 @@ from handlers.deal_gate import (
     deal_admin_party_proxy_callback,
     deal_admin_payment_callback,
     deal_admin_seller_toman_receipt_callback,
+    deal_admin_seller_toman_settled_callback,
     deal_admin_send_buyer_eur_account_callback,
     deal_admin_toman_settled_callback,
     deal_admin_view_outbound_logs_callback,
@@ -762,6 +763,12 @@ def main():
         CallbackQueryHandler(
             deal_admin_euro_settled_callback,
             pattern=r"^adm\|eurcfm\|",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            deal_admin_seller_toman_settled_callback,
+            pattern=r"^adm\|stomset\|",
         )
     )
     application.add_handler(

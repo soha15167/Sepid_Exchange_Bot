@@ -58,6 +58,7 @@ from database.db import (
     deal_gate_seller_toman_admin_list,
     deal_gate_get,
     deal_gate_list_for_admin,
+    deal_gate_mark_seller_toman_settled,
     deal_gate_upsert,
     get_advert_offer_joined,
     get_euro_advert_by_rowid,
@@ -1692,6 +1693,15 @@ def deal_admin_payment_only_rows(
                 )
             ]
         )
+    if _gate_awaiting_seller_toman_close(gate):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "✅ تومان به فروشنده نشست — پایان معامله",
+                    callback_data=f"adm|stomset|{oid}",
+                )
+            ]
+        )
     rows.append(
         [
             InlineKeyboardButton(
@@ -3199,6 +3209,71 @@ async def deal_admin_seller_toman_receipt_callback(
         _track_rcpt_prompt_msg(user_data_store, uid, oid, sent.message_id)
     except Exception:
         logger.exception("deal_stom: prompt failed offer=%s", oid)
+
+
+async def deal_admin_seller_toman_settled_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Admin confirms seller received Toman and closes that specific deal."""
+    q = update.callback_query
+    if not q or not q.from_user:
+        return
+    if q.from_user.id not in set(ADMIN_IDS or []):
+        await q.answer("فقط ادمین", show_alert=True)
+        return
+    parts = (q.data or "").split("|")
+    if len(parts) != 3 or parts[0] != "adm" or parts[1] != "stomset":
+        return
+    try:
+        oid = int(parts[2])
+    except (TypeError, ValueError):
+        return
+
+    gate = deal_gate_get(oid)
+    if not gate:
+        await q.answer("معامله پیدا نشد.", show_alert=True)
+        return
+    if (
+        (gate.get("gate_status") or "").strip().lower() == "closed"
+        or int(gate.get("seller_toman_settled_at") or 0) > 0
+    ):
+        await q.answer("این معامله قبلاً بسته شده یا دریافت تومان تأیید شده است.", show_alert=True)
+        await refresh_admin_deal_markup(context.bot, oid)
+        return
+    if not _gate_awaiting_seller_toman_close(gate):
+        await q.answer(
+            "ابتدا فیش واریز تومان باید برای فروشنده ارسال شود.",
+            show_alert=True,
+        )
+        await refresh_admin_deal_markup(context.bot, oid)
+        return
+
+    row = get_advert_offer_joined(oid)
+    if not row:
+        await q.answer("پیشنهاد پیدا نشد.", show_alert=True)
+        return
+    now = int(time.time())
+    if not deal_gate_mark_seller_toman_settled(oid, settled_at=now):
+        await q.answer(
+            "این معامله هم‌زمان تأیید شد یا دیگر در مرحله پایان نیست.",
+            show_alert=True,
+        )
+        await refresh_admin_deal_markup(context.bot, oid)
+        return
+    gate = deal_gate_get(oid) or {**gate, "seller_toman_settled_at": now}
+    _log(
+        oid,
+        "ادمین از طرف فروشنده تأیید کرد: تومان نشست",
+        from_role="admin",
+    )
+    await _finalize_deal_close(
+        context,
+        oid,
+        gate,
+        row,
+        closed_by="admin",
+        answer_query=q,
+    )
 
 
 async def _deal_admin_stom_try_message(
@@ -5793,13 +5868,12 @@ async def _handle_seller_toman_settled_callback(
         await q.answer("پیشنهاد پیدا نشد.", show_alert=True)
         return
     now = int(time.time())
-    deal_gate_upsert(
-        offer_id=oid,
-        advert_rowid=int(gate["advert_rowid"]),
-        buyer_telegram_id=int(gate["buyer_telegram_id"]),
-        seller_telegram_id=seller_id,
-        seller_toman_settled_at=now,
-    )
+    if not deal_gate_mark_seller_toman_settled(oid, settled_at=now):
+        await q.answer(
+            "این معامله هم‌زمان تأیید شد یا دیگر در مرحله پایان نیست.",
+            show_alert=True,
+        )
+        return
     gate = deal_gate_get(oid) or gate
     await _finalize_deal_close(
         context, oid, gate, row, closed_by="seller", answer_query=q

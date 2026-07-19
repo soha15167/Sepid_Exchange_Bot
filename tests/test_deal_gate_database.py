@@ -99,6 +99,17 @@ class DealGateDatabaseTests(unittest.TestCase):
         awaiting = db.deal_gate_list_awaiting_seller_toman_confirm()
         self.assertEqual([item["offer_id"] for item in awaiting], [101])
 
+        self.assertTrue(
+            db.deal_gate_mark_seller_toman_settled(101, settled_at=123456)
+        )
+        self.assertFalse(
+            db.deal_gate_mark_seller_toman_settled(101, settled_at=123457)
+        )
+        self.assertEqual(
+            int(db.deal_gate_get(101)["seller_toman_settled_at"]), 123456
+        )
+        self.assertEqual(db.deal_gate_list_awaiting_seller_toman_confirm(), [])
+
     def test_selected_offer_remains_linked_to_gate_until_reactivation(self):
         with sqlite3.connect(self.path) as conn:
             conn.execute(
