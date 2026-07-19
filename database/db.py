@@ -144,6 +144,16 @@ def ensure_schema() -> None:
         cur.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES ('channel_post_template_v', '2')"
         )
+        # Fixed activation boundary for hourly admin deal reminders. Existing
+        # databases receive the current time once; subsequent restarts retain
+        # it, so historical deals can never become eligible later.
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO settings (key, value)
+            VALUES ('admin_toman_reminder_cutoff_at', ?)
+            """,
+            (str(int(time.time())),),
+        )
 
         _ensure_admin_audit_log_table(conn)
 
@@ -3126,7 +3136,7 @@ def deal_gate_list_awaiting_seller_toman_confirm() -> list[dict]:
 
 
 def deal_gate_list_awaiting_admin_toman_receipt() -> list[dict]:
-    """Open deals that have not reached successful Toman-receipt delivery."""
+    """New deals, after feature activation, awaiting Toman-receipt delivery."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -3137,6 +3147,14 @@ def deal_gate_list_awaiting_admin_toman_receipt() -> list[dict]:
             )
               AND COALESCE(seller_toman_settled_at, 0) = 0
               AND COALESCE(seller_toman_close_enabled_at, 0) = 0
+              AND COALESCE(started_at, 0) >= COALESCE(
+                  (
+                      SELECT CAST(value AS INTEGER)
+                      FROM settings
+                      WHERE key = 'admin_toman_reminder_cutoff_at'
+                  ),
+                  0
+              )
             ORDER BY offer_id ASC
             """
         ).fetchall()

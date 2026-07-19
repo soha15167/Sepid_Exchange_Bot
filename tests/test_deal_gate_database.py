@@ -149,6 +149,40 @@ class DealGateDatabaseTests(unittest.TestCase):
             [201, 202],
         )
 
+    def test_admin_toman_receipt_reminders_exclude_deals_before_activation(self):
+        self._create_gate()
+        with sqlite3.connect(self.path) as conn:
+            cutoff = int(
+                conn.execute(
+                    """
+                    SELECT value FROM settings
+                    WHERE key = 'admin_toman_reminder_cutoff_at'
+                    """
+                ).fetchone()[0]
+            )
+            conn.execute(
+                "UPDATE offer_deal_gates SET started_at = ? WHERE offer_id = 101",
+                (cutoff - 1,),
+            )
+            conn.commit()
+
+        self.assertEqual(db.deal_gate_list_awaiting_admin_toman_receipt(), [])
+
+        db.deal_gate_upsert(
+            offer_id=102,
+            advert_rowid=3197,
+            buyer_telegram_id=11,
+            seller_telegram_id=21,
+            gate_status="pending",
+        )
+        self.assertEqual(
+            [
+                item["offer_id"]
+                for item in db.deal_gate_list_awaiting_admin_toman_receipt()
+            ],
+            [102],
+        )
+
     def test_admin_outbound_log_party_is_preserved_for_persistent_timing(self):
         self._create_gate()
         db.bot_outbound_log_insert(

@@ -46,6 +46,12 @@ class DatabaseSchemaTests(unittest.TestCase):
                 db.ensure_schema()
                 first = _schema_snapshot(path)
                 with sqlite3.connect(path) as conn:
+                    first_cutoff = conn.execute(
+                        """
+                        SELECT value FROM settings
+                        WHERE key = 'admin_toman_reminder_cutoff_at'
+                        """
+                    ).fetchone()[0]
                     conn.execute(
                         "UPDATE settings SET value = '0' WHERE key = 'bot_enabled'"
                     )
@@ -65,9 +71,17 @@ class DatabaseSchemaTests(unittest.TestCase):
                 self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
                 settings = dict(conn.execute("SELECT key, value FROM settings"))
                 self.assertEqual(
-                    settings,
-                    {"bot_enabled": "0", "channel_post_template_v": "2"},
+                    set(settings),
+                    {
+                        "bot_enabled",
+                        "channel_post_template_v",
+                        "admin_toman_reminder_cutoff_at",
+                    },
                 )
+                self.assertEqual(settings["bot_enabled"], "0")
+                self.assertEqual(settings["channel_post_template_v"], "2")
+                self.assertEqual(settings["admin_toman_reminder_cutoff_at"], first_cutoff)
+                self.assertGreater(int(first_cutoff), 0)
                 for table in CRITICAL_TABLES - {"settings"}:
                     count = conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
                     self.assertEqual(count, 0, table)
