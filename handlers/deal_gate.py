@@ -1701,11 +1701,18 @@ def deal_admin_payment_only_rows(
                 )
             ]
         )
-    if _gate_awaiting_seller_toman_close(gate):
+    gate_status = (gate.get("gate_status") or "").strip().lower()
+    seller_toman_settled = int(gate.get("seller_toman_settled_at") or 0) > 0
+    seller_received_button_visible = _gate_awaiting_seller_toman_close(gate) or (
+        gate_status == "completed"
+        and not seller_toman_settled
+        and _seller_euro_fully_confirmed_gate(gate)
+    )
+    if seller_received_button_visible:
         rows.append(
             [
                 InlineKeyboardButton(
-                    "✅ تومان به فروشنده نشست — پایان معامله",
+                    "✅ فروشنده تومان را دریافت کرد",
                     callback_data=f"adm|stomset|{oid}",
                 )
             ]

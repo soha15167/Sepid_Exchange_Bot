@@ -35,8 +35,35 @@ class TestAdminSellerTomanSettlement(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(matching), 1)
         self.assertEqual(
             matching[0].text,
-            "✅ تومان به فروشنده نشست — پایان معامله",
+            "✅ فروشنده تومان را دریافت کرد",
         )
+
+    def test_admin_button_is_visible_at_final_payment_stage_before_receipt(self):
+        from handlers import deal_gate
+
+        gate = {
+            "offer_id": 262,
+            "gate_status": "completed",
+            "seller_toman_close_enabled_at": 0,
+            "seller_toman_settled_at": 0,
+        }
+        with (
+            patch.object(
+                deal_gate,
+                "_gate_awaiting_seller_toman_close",
+                return_value=False,
+            ),
+            patch(
+                "handlers.offers._seller_euro_fully_confirmed_gate",
+                return_value=True,
+            ),
+        ):
+            rows = deal_gate.deal_admin_payment_only_rows(262, gate)
+
+        buttons = [button for row in rows for button in row]
+        matching = [b for b in buttons if b.callback_data == "adm|stomset|262"]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0].text, "✅ فروشنده تومان را دریافت کرد")
 
     async def test_admin_confirmation_records_milestone_and_closes_deal(self):
         from handlers import deal_gate
