@@ -3274,9 +3274,14 @@ async def deal_admin_seller_toman_settled_callback(
         await q.answer("این معامله قبلاً بسته شده یا دریافت تومان تأیید شده است.", show_alert=True)
         await refresh_admin_deal_markup(context.bot, oid)
         return
-    if not _gate_awaiting_seller_toman_close(gate):
+    from handlers.offers import _seller_euro_fully_confirmed_gate
+
+    if not (
+        _gate_awaiting_seller_toman_close(gate)
+        or _seller_euro_fully_confirmed_gate(gate)
+    ):
         await q.answer(
-            "ابتدا فیش واریز تومان باید برای فروشنده ارسال شود.",
+            "این معامله هنوز به مرحلهٔ نهایی پرداخت به فروشنده نرسیده است.",
             show_alert=True,
         )
         await refresh_admin_deal_markup(context.bot, oid)
@@ -3287,7 +3292,11 @@ async def deal_admin_seller_toman_settled_callback(
         await q.answer("پیشنهاد پیدا نشد.", show_alert=True)
         return
     now = int(time.time())
-    if not deal_gate_mark_seller_toman_settled(oid, settled_at=now):
+    if not deal_gate_mark_seller_toman_settled(
+        oid,
+        settled_at=now,
+        require_receipt=False,
+    ):
         await q.answer(
             "این معامله هم‌زمان تأیید شد یا دیگر در مرحله پایان نیست.",
             show_alert=True,

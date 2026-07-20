@@ -2992,9 +2992,12 @@ def deal_gate_enable_seller_toman_close(offer_id: int) -> int:
 
 
 def deal_gate_mark_seller_toman_settled(
-    offer_id: int, *, settled_at: int | None = None
+    offer_id: int,
+    *,
+    settled_at: int | None = None,
+    require_receipt: bool = True,
 ) -> bool:
-    """Atomically claim the final seller-Toman confirmation for one deal."""
+    """Atomically claim seller settlement; admins may explicitly waive receipt."""
     try:
         oid = int(offer_id)
     except (TypeError, ValueError):
@@ -3003,15 +3006,18 @@ def deal_gate_mark_seller_toman_settled(
     conn = sqlite3.connect(DB_PATH, timeout=15.0, isolation_level=None)
     try:
         conn.execute("BEGIN IMMEDIATE")
+        receipt_guard = """
+              AND COALESCE(seller_toman_close_enabled_at, 0) > 0
+              AND trim(COALESCE(seller_toman_admin_log, '')) NOT IN ('', '[]')
+        """ if require_receipt else ""
         cur = conn.execute(
-            """
+            f"""
             UPDATE offer_deal_gates
             SET seller_toman_settled_at = ?
             WHERE offer_id = ?
               AND lower(trim(COALESCE(gate_status, ''))) = 'completed'
               AND COALESCE(seller_toman_settled_at, 0) = 0
-              AND COALESCE(seller_toman_close_enabled_at, 0) > 0
-              AND trim(COALESCE(seller_toman_admin_log, '')) NOT IN ('', '[]')
+              {receipt_guard}
             """,
             (now, oid),
         )

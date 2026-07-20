@@ -122,6 +122,7 @@ class TestAdminSellerTomanSettlement(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(mark_settled.call_args.args, (41,))
         self.assertGreater(mark_settled.call_args.kwargs["settled_at"], 0)
+        self.assertFalse(mark_settled.call_args.kwargs["require_receipt"])
         log.assert_called_once_with(
             41,
             "ادمین از طرف فروشنده تأیید کرد: تومان نشست",
@@ -136,7 +137,7 @@ class TestAdminSellerTomanSettlement(unittest.IsolatedAsyncioTestCase):
             answer_query=query,
         )
 
-    async def test_admin_cannot_confirm_before_receipt_delivery(self):
+    async def test_admin_can_confirm_without_recorded_receipt_at_final_stage(self):
         from handlers import deal_gate
 
         gate = {
@@ -155,19 +156,35 @@ class TestAdminSellerTomanSettlement(unittest.IsolatedAsyncioTestCase):
             answer=AsyncMock(),
         )
         context = SimpleNamespace(bot=object())
+        settled_gate = {**gate, "seller_toman_settled_at": 456}
 
         with (
             patch.object(deal_gate, "ADMIN_IDS", [999]),
-            patch.object(deal_gate, "deal_gate_get", return_value=gate),
+            patch.object(
+                deal_gate,
+                "deal_gate_get",
+                side_effect=[gate, settled_gate],
+            ),
             patch.object(
                 deal_gate,
                 "_gate_awaiting_seller_toman_close",
                 return_value=False,
             ),
+            patch(
+                "handlers.offers._seller_euro_fully_confirmed_gate",
+                return_value=True,
+            ),
             patch.object(
                 deal_gate,
                 "deal_gate_mark_seller_toman_settled",
+                return_value=True,
             ) as mark_settled,
+            patch.object(
+                deal_gate,
+                "get_advert_offer_joined",
+                return_value={"advert_rowid": 77},
+            ),
+            patch.object(deal_gate, "_log"),
             patch.object(
                 deal_gate,
                 "refresh_admin_deal_markup",
@@ -183,11 +200,15 @@ class TestAdminSellerTomanSettlement(unittest.IsolatedAsyncioTestCase):
                 SimpleNamespace(callback_query=query), context
             )
 
-        mark_settled.assert_not_called()
-        finalize.assert_not_awaited()
-        query.answer.assert_awaited_once_with(
-            "ابتدا فیش واریز تومان باید برای فروشنده ارسال شود.",
-            show_alert=True,
+        mark_settled.assert_called_once()
+        self.assertFalse(mark_settled.call_args.kwargs["require_receipt"])
+        finalize.assert_awaited_once_with(
+            context,
+            41,
+            settled_gate,
+            {"advert_rowid": 77},
+            closed_by="admin",
+            answer_query=query,
         )
 
 

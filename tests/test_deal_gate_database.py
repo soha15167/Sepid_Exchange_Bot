@@ -110,6 +110,31 @@ class DealGateDatabaseTests(unittest.TestCase):
         )
         self.assertEqual(db.deal_gate_list_awaiting_seller_toman_confirm(), [])
 
+    def test_admin_can_atomically_settle_seller_without_recorded_receipt(self):
+        self._create_gate()
+        db.deal_gate_upsert(
+            offer_id=101,
+            advert_rowid=3196,
+            buyer_telegram_id=10,
+            seller_telegram_id=20,
+            gate_status="completed",
+        )
+
+        self.assertFalse(
+            db.deal_gate_mark_seller_toman_settled(101, settled_at=123456)
+        )
+        self.assertTrue(
+            db.deal_gate_mark_seller_toman_settled(
+                101,
+                settled_at=123456,
+                require_receipt=False,
+            )
+        )
+        self.assertEqual(
+            int(db.deal_gate_get(101)["seller_toman_settled_at"]),
+            123456,
+        )
+
     def test_admin_toman_receipt_reminder_query_tracks_only_unfinished_delivery(self):
         for offer_id, status in (
             (201, "pending"),
