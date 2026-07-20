@@ -308,10 +308,17 @@ def ensure_schema() -> None:
                 body_html TEXT,
                 caption_html TEXT,
                 photo_file_id TEXT,
+                telegram_message_id INTEGER,
                 created_at INTEGER NOT NULL
             )
             """
         )
+        outbound_cols = _table_columns(conn, "offer_bot_outbound_log")
+        if "telegram_message_id" not in outbound_cols:
+            cur.execute(
+                "ALTER TABLE offer_bot_outbound_log "
+                "ADD COLUMN telegram_message_id INTEGER"
+            )
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_bot_outbound_offer ON offer_bot_outbound_log(offer_id)"
         )
@@ -514,6 +521,7 @@ def bot_outbound_log_insert(
     body_html: str = "",
     caption_html: str = "",
     photo_file_id: str = "",
+    telegram_message_id: int = 0,
 ) -> None:
     """ذخیرهٔ کپی پیام ارسالی ربات به کاربر (برای نمایش ادمین)."""
     try:
@@ -533,8 +541,9 @@ def bot_outbound_log_insert(
             """
             INSERT INTO offer_bot_outbound_log (
                 offer_id, recipient_telegram_id, party, tag, msg_type,
-                body_html, caption_html, photo_file_id, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                body_html, caption_html, photo_file_id, telegram_message_id,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 oid,
@@ -545,6 +554,7 @@ def bot_outbound_log_insert(
                 (body_html or "")[:12000],
                 (caption_html or "")[:4000],
                 (photo_file_id or "").strip()[:256],
+                max(0, int(telegram_message_id or 0)),
                 int(time.time()),
             ),
         )
@@ -561,7 +571,8 @@ def bot_outbound_log_list(offer_id: int) -> list[dict]:
         rows = conn.execute(
             """
             SELECT id, recipient_telegram_id, party, tag, msg_type,
-                   body_html, caption_html, photo_file_id, created_at
+                   body_html, caption_html, photo_file_id,
+                   telegram_message_id, created_at
             FROM offer_bot_outbound_log
             WHERE offer_id = ?
             ORDER BY id ASC

@@ -191,10 +191,12 @@ class DealGateDatabaseTests(unittest.TestCase):
             "admin",
             "synthetic hourly reminder",
             body_html="reminder",
+            telegram_message_id=8123,
         )
         rows = db.bot_outbound_log_list(101)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["party"], "admin")
+        self.assertEqual(rows[0]["telegram_message_id"], 8123)
 
     def test_selected_offer_remains_linked_to_gate_until_reactivation(self):
         with sqlite3.connect(self.path) as conn:

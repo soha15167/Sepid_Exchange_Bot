@@ -53,6 +53,8 @@ def deal_bot_log_text(
     party: str,
     tag: str,
     body_html: str,
+    *,
+    telegram_message_id: int = 0,
 ) -> None:
     if not (body_html or "").strip():
         return
@@ -64,6 +66,7 @@ def deal_bot_log_text(
             tag,
             msg_type="text",
             body_html=body_html,
+            telegram_message_id=telegram_message_id,
         )
     except Exception:
         logger.exception("deal_outbound: log text failed offer=%s", offer_id)

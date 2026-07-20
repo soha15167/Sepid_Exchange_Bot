@@ -4008,8 +4008,17 @@ def _gate_awaiting_admin_toman_receipt(gate: dict | None) -> bool:
 
 
 def _last_admin_toman_reminder_at(offer_id: int, admin_id: int) -> int:
+    return _last_admin_toman_reminder_delivery(offer_id, admin_id)[0]
+
+
+def _last_admin_toman_reminder_delivery(
+    offer_id: int,
+    admin_id: int,
+) -> tuple[int, int]:
+    """Return the latest reminder timestamp and Telegram message ID."""
     aid = int(admin_id)
     last = 0
+    message_id = 0
     for row in bot_outbound_log_list(int(offer_id)):
         if int(row.get("recipient_telegram_id") or 0) != aid:
             continue
@@ -4017,8 +4026,11 @@ def _last_admin_toman_reminder_at(offer_id: int, admin_id: int) -> int:
             continue
         if (row.get("tag") or "").strip() != _ADMIN_TOMAN_REMINDER_TAG:
             continue
-        last = max(last, int(row.get("created_at") or 0))
-    return last
+        created_at = int(row.get("created_at") or 0)
+        if created_at >= last:
+            last = created_at
+            message_id = int(row.get("telegram_message_id") or 0)
+    return last, message_id
 
 
 def _admin_toman_reminder_due(
@@ -4075,26 +4087,59 @@ async def run_admin_toman_receipt_reminder_sweep(
             f"{_RTL}<i>این یادآوری پس از ارسال موفق فیش تومان به فروشنده متوقف می‌شود.</i>"
         )
         keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("📋 مشاهده معامله", callback_data=f"adm|dgs|{oid}")]]
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ فروشنده تومان را دریافت کرد",
+                        callback_data=f"adm|stomset|{oid}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "📋 مشاهده معامله",
+                        callback_data=f"adm|dgs|{oid}",
+                    )
+                ],
+            ]
         )
         for admin_id in admin_ids:
             if not _admin_toman_reminder_due(gate, admin_id, now=now):
                 continue
+            _last_sent_at, previous_message_id = _last_admin_toman_reminder_delivery(
+                oid, int(admin_id)
+            )
             try:
-                await bot.send_message(
+                sent_message = await bot.send_message(
                     chat_id=int(admin_id),
                     text=body,
                     parse_mode=ParseMode.HTML,
                     reply_markup=keyboard,
                     disable_web_page_preview=True,
                 )
+                new_message_id = int(getattr(sent_message, "message_id", 0) or 0)
                 deal_bot_log_text(
                     oid,
                     int(admin_id),
                     "admin",
                     _ADMIN_TOMAN_REMINDER_TAG,
                     body,
+                    telegram_message_id=new_message_id,
                 )
+                if previous_message_id > 0 and previous_message_id != new_message_id:
+                    try:
+                        await bot.delete_message(
+                            chat_id=int(admin_id),
+                            message_id=previous_message_id,
+                        )
+                    except Exception as delete_exc:
+                        logger.warning(
+                            "admin_toman_reminder: old message delete failed "
+                            "admin=%s offer=%s message=%s: %s",
+                            admin_id,
+                            oid,
+                            previous_message_id,
+                            delete_exc,
+                        )
                 sent += 1
             except Exception as exc:
                 logger.warning(
