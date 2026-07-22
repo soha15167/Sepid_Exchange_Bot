@@ -26,7 +26,9 @@ from telegram.ext import (
 from telegram import BotCommand, BotCommandScopeChat, Update
 from telegram.constants import ChatType
 import logging
+import asyncio
 import sys
+import time as time_module
 from datetime import time
 from zoneinfo import ZoneInfo
 
@@ -501,6 +503,88 @@ def _setup_admin_toman_receipt_reminder_job(application: Application) -> None:
     logger.info("Admin Toman receipt reminders: check every 5m (1h interval)")
 
 
+def _setup_deal_delivery_retry_job(application: Application) -> None:
+    """Retry critical deal deliveries quietly; dedupe keys prevent repeated notices."""
+    from handlers.deal_gate import run_deal_delivery_retry_sweep
+
+    if not application.job_queue:
+        return
+
+    async def _sweep(context):
+        n = await run_deal_delivery_retry_sweep(context.bot)
+        if n:
+            logger.info("deal_delivery_retry_sweep: delivered %s", n)
+
+    application.job_queue.run_repeating(
+        _sweep,
+        interval=60,
+        first=20,
+        name="deal_delivery_retry_sweep",
+    )
+
+
+def _setup_deal_operations_jobs(application: Application) -> None:
+    """Verified backups and privacy cleanup run quietly in the background."""
+    if not application.job_queue:
+        return
+
+    async def _backup(_context):
+        from utils.deal_operations import run_deal_verified_backup
+
+        try:
+            path = await asyncio.to_thread(run_deal_verified_backup)
+            logger.info("verified deal backup: %s", path)
+        except Exception:
+            logger.exception("verified deal backup failed")
+
+    async def _privacy(_context):
+        from utils.deal_operations import run_deal_privacy_retention
+
+        try:
+            count = await asyncio.to_thread(run_deal_privacy_retention)
+            if count:
+                logger.info("deal privacy retention redacted %s records", count)
+        except Exception:
+            logger.exception("deal privacy retention failed")
+
+    async def _restore_drill(_context):
+        from utils.deal_operations import run_deal_restore_drill
+
+        try:
+            await asyncio.to_thread(run_deal_restore_drill)
+            logger.info("deal backup restore drill passed")
+        except Exception:
+            logger.exception("deal backup restore drill failed")
+
+    async def _reconciliation(_context):
+        from utils.deal_operations import run_deal_reconciliation
+
+        try:
+            path = await asyncio.to_thread(run_deal_reconciliation)
+            logger.info("deal reconciliation report: %s", path)
+        except Exception:
+            logger.exception("deal reconciliation report failed")
+
+    application.job_queue.run_repeating(
+        _backup, interval=6 * 3600, first=120, name="deal_verified_backup"
+    )
+    application.job_queue.run_repeating(
+        _privacy, interval=24 * 3600, first=300, name="deal_privacy_retention"
+    )
+    application.job_queue.run_repeating(
+        _restore_drill,
+        interval=7 * 24 * 3600,
+        first=15 * 60,
+        name="deal_backup_restore_drill",
+    )
+    application.job_queue.run_repeating(
+        _reconciliation,
+        interval=24 * 3600,
+        first=20 * 60,
+        name="deal_daily_reconciliation",
+    )
+
+
 def _setup_daily_admin_report_job(application: Application) -> None:
     from config.settings import DAILY_REPORT_ENABLED, DAILY_REPORT_HOUR, DAILY_REPORT_MINUTE
     from handlers.daily_report import post_daily_admin_report
@@ -659,6 +743,9 @@ def main():
     print("🚀 بوت رباط در حال اجراست...")
     try:
         ensure_schema()
+        from database.db import set_setting
+
+        set_setting("bot_process_started_at", str(int(time_module.time())))
         logging.getLogger(__name__).info("ensure_schema completed")
     except Exception:
         logging.getLogger(__name__).exception("ensure_schema failed")
@@ -869,6 +956,8 @@ def main():
         _setup_daily_admin_report_job(app)
         _setup_seller_stom_reminder_job(app)
         _setup_admin_toman_receipt_reminder_job(app)
+        _setup_deal_delivery_retry_job(app)
+        _setup_deal_operations_jobs(app)
         try:
             await _set_bot_command_menus(app.bot)
         except Exception:

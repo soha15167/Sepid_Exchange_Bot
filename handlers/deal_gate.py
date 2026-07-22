@@ -30,6 +30,7 @@ File sections (search: "Section" or "بخش"):
 from __future__ import annotations
 
 import asyncio
+from io import BytesIO
 import html as html_module
 import json
 import logging
@@ -38,33 +39,51 @@ import re
 import tempfile
 import time
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputFile,
+    InputMediaPhoto,
+    Update,
+)
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, Forbidden, TelegramError
+from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import ApplicationHandlerStop, ContextTypes
 
-from config.settings import ADMIN_IDS, BANK_CARDS
+from config.settings import ADMIN_IDS, BANK_CARDS, DEAL_SUPPORT_ADMIN_IDS
 from database.db import (
+    bot_outbound_log_insert,
     bot_outbound_log_list,
+    deal_delivery_claim,
+    deal_delivery_list_for_offer,
+    deal_delivery_due,
+    deal_delivery_defer_rate_limit,
+    deal_delivery_enqueue,
+    deal_delivery_mark_failed,
+    deal_delivery_mark_sent,
     deal_gate_accounts_for_user,
+    deal_gate_archive_and_reactivate,
+    deal_gate_audit,
     deal_gate_append_buyer_receipt,
     deal_gate_append_seller_receipt,
-    deal_gate_append_seller_toman_admin,
     deal_gate_buyer_receipt_list,
     deal_gate_confirm_seller_receipt_buyer,
-    deal_gate_delete,
-    deal_gate_enable_seller_toman_close,
     deal_gate_seller_receipt_list,
     deal_gate_seller_toman_admin_list,
     deal_gate_get,
     deal_gate_list_awaiting_admin_toman_receipt,
     deal_gate_list_for_admin,
-    deal_gate_mark_seller_toman_settled,
+    deal_operational_health,
+    deal_gate_record_seller_toman_delivery,
+    deal_gate_repair_safe,
+    deal_gate_close_atomic,
+    deal_gate_settle_and_close_atomic,
     deal_gate_upsert,
     get_advert_offer_joined,
     get_euro_advert_by_rowid,
     get_user,
     negotiation_transcript_append_line,
+    negotiation_transcript_list,
     update_advert_offer_status,
     update_euro_advert_status,
 )
@@ -117,6 +136,95 @@ _ADMIN_TOMAN_REMINDER_SEC = 3600
 _ADMIN_TOMAN_REMINDER_TAG = "یادآوری ساعتی ادمین: فیش تومان فروشنده"
 _HOURLY_SEC = 3600
 _admin_sync_locks: dict[int, asyncio.Lock] = {}
+_ADMIN_DEAL_CONFIRM_KEY = "admin_deal_sensitive_confirm"
+
+
+def _is_full_deal_admin(user_id: int) -> bool:
+    uid = int(user_id)
+    return uid in set(ADMIN_IDS or []) and uid not in set(
+        DEAL_SUPPORT_ADMIN_IDS or []
+    )
+
+
+async def _require_full_deal_admin(query) -> bool:
+    if _is_full_deal_admin(int(query.from_user.id)):
+        return True
+    try:
+        await query.answer(
+            "این حساب دسترسی مشاهده دارد؛ اقدام مالی فقط برای مدیر کامل مجاز است.",
+            show_alert=True,
+        )
+    except Exception:
+        pass
+    return False
+
+
+async def _admin_sensitive_confirmation(
+    context: ContextTypes.DEFAULT_TYPE,
+    query,
+    *,
+    action: str,
+    offer_id: int,
+    confirm_data: str,
+    prompt: str,
+    is_confirmation: bool,
+) -> bool:
+    """Require a fresh per-admin confirmation before a financial mutation."""
+    key = (action, int(offer_id))
+    now = int(time.time())
+    user_data = getattr(context, "user_data", None)
+    if not isinstance(user_data, dict):
+        user_data = {}
+        context.user_data = user_data
+    pending = user_data.get(_ADMIN_DEAL_CONFIRM_KEY)
+    if is_confirmation:
+        valid = (
+            isinstance(pending, dict)
+            and (pending.get("action"), int(pending.get("offer_id") or 0)) == key
+            and now - int(pending.get("created_at") or 0) <= 120
+        )
+        user_data.pop(_ADMIN_DEAL_CONFIRM_KEY, None)
+        if valid:
+            _log(
+                int(offer_id),
+                f"admin_id={int(query.from_user.id)} confirmed sensitive action: {action}",
+                from_role="admin",
+            )
+            return True
+        await _expire_stale_deal_button(
+            query, "تأیید منقضی شده است؛ اقدام را دوباره از پیام جدید شروع کنید."
+        )
+        return False
+    user_data[_ADMIN_DEAL_CONFIRM_KEY] = {
+        "action": action,
+        "offer_id": int(offer_id),
+        "created_at": now,
+    }
+    try:
+        await query.answer(
+            "برای انجام نهایی یک‌بار دیگر تأیید کنید.", show_alert=True
+        )
+    except Exception:
+        pass
+    try:
+        await query.message.edit_reply_markup(
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(prompt, callback_data=confirm_data),
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "❌ انصراف",
+                            callback_data=f"adm|dgs|resync|{int(offer_id)}",
+                        )
+                    ],
+                ]
+            )
+        )
+    except Exception:
+        pass
+    return False
 
 
 def is_deal_receipt_flow_active(context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -1910,6 +2018,76 @@ def _deal_gate_allows_party_receipts(gate: dict | None) -> bool:
     return st == "completed"
 
 
+def _receipt_consistency_warnings(
+    gate: dict, text: str, *, receipt_kind: str
+) -> list[str]:
+    """Conservative admin warnings only; never approve or reject money."""
+    raw = (text or "").strip()
+    warnings: list[str] = []
+    if not raw:
+        warnings.append("تصویر فیش توضیح متنی ندارد؛ مبلغ و گیرنده دستی بررسی شود")
+        return warnings
+    digit_text = re.sub(r"\D", "", raw.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")))
+    if len(digit_text) < 6:
+        warnings.append("مبلغ یا شماره پیگیری قابل تشخیص نیست")
+    account_key = {
+        "seller_toman": "seller_accounts_text",
+        "seller_euro": "buyer_accounts_text",
+    }.get(receipt_kind)
+    account = (gate.get(account_key) or "").translate(
+        str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")
+    ) if account_key else ""
+    account_digits = re.sub(r"\D", "", account)
+    if len(account_digits) >= 10 and len(digit_text) >= 6:
+        suffix = account_digits[-4:]
+        if suffix not in digit_text:
+            warnings.append(f"چهار رقم آخر حساب مقصد ({suffix}) در متن فیش دیده نشد")
+    return warnings
+
+
+def _log_receipt_consistency(
+    offer_id: int, gate: dict, text: str, *, receipt_kind: str
+) -> list[str]:
+    warnings = _receipt_consistency_warnings(
+        gate, text, receipt_kind=receipt_kind
+    )
+    for warning in warnings:
+        _log(int(offer_id), f"هشدار بررسی فیش: {warning}", from_role="system")
+    return warnings
+
+
+async def _expire_stale_deal_button(query, message: str) -> None:
+    """Reject an old callback and remove only the keyboard that produced it."""
+    try:
+        await query.answer(message, show_alert=True)
+    except Exception:
+        pass
+    try:
+        if query.message:
+            await query.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
+def _party_callback_authorized(
+    gate: dict | None,
+    user_id: int,
+    *,
+    party: str,
+    allowed_statuses: set[str],
+) -> tuple[bool, str]:
+    """Authorize a financial callback against role and current persisted stage."""
+    if not gate:
+        return False, "missing"
+    role_key = "buyer_telegram_id" if party == "buyer" else "seller_telegram_id"
+    if int(gate.get(role_key) or 0) != int(user_id):
+        return False, "role"
+    status = (gate.get("gate_status") or "").strip().lower()
+    if status not in allowed_statuses:
+        return False, "stage"
+    return True, "ok"
+
+
 async def _admin_receipt_upload_done(
     bot,
     update: Update,
@@ -2351,8 +2529,7 @@ async def deal_admin_party_proxy_callback(
     q = update.callback_query
     if not q or not q.from_user:
         return
-    if q.from_user.id not in set(ADMIN_IDS or []):
-        await q.answer("فقط ادمین", show_alert=True)
+    if not await _require_full_deal_admin(q):
         return
     parts = (q.data or "").split("|")
     if len(parts) != 4 or parts[0] != "adm" or parts[1] != "pxy":
@@ -2454,8 +2631,14 @@ async def _deal_admin_proxy_receipt_try_message(
         await update.message.reply_text(f"{_RTL}متن فیش را کامل‌تر بفرستید.")
         return True
     if party == "seller":
-        items = deal_gate_append_seller_receipt(oid, entry_type="text", text=text)
+        items = deal_gate_append_seller_receipt(
+            oid,
+            entry_type="text",
+            text=text,
+            source_message_id=update.message.message_id,
+        )
         gate = deal_gate_get(oid) or gate
+        _log_receipt_consistency(oid, gate, text, receipt_kind="seller_euro")
         idx = len(items) - 1
         _log(oid, f"ادمین — فیش یورو متنی فروشنده", from_role="admin")
         await _notify_buyer_euro_receipt_confirm(
@@ -2467,7 +2650,12 @@ async def _deal_admin_proxy_receipt_try_message(
             text=text,
         )
     else:
-        deal_gate_append_buyer_receipt(oid, entry_type="text", text=text)
+        deal_gate_append_buyer_receipt(
+            oid,
+            entry_type="text",
+            text=text,
+            source_message_id=update.message.message_id,
+        )
         gate = deal_gate_get(oid) or gate
         _log(oid, f"ادمین — فیش تومان متنی خریدار", from_role="admin")
     await _admin_receipt_upload_done(context.bot, update, oid)
@@ -2508,7 +2696,11 @@ async def _deal_admin_proxy_receipt_try_photo(
     entry_type = "document" if media_kind == "document" else "photo"
     if party == "seller":
         items = deal_gate_append_seller_receipt(
-            oid, entry_type=entry_type, text=cap, file_id=fid
+            oid,
+            entry_type=entry_type,
+            text=cap,
+            file_id=fid,
+            source_message_id=update.message.message_id,
         )
         gate = deal_gate_get(oid) or gate
         idx = len(items) - 1
@@ -2524,7 +2716,11 @@ async def _deal_admin_proxy_receipt_try_photo(
         )
     else:
         deal_gate_append_buyer_receipt(
-            oid, entry_type=entry_type, text=cap, file_id=fid
+            oid,
+            entry_type=entry_type,
+            text=cap,
+            file_id=fid,
+            source_message_id=update.message.message_id,
         )
         gate = deal_gate_get(oid) or gate
         _log(oid, f"ادمین — فیش تومان {entry_type} خریدار", from_role="admin")
@@ -2572,11 +2768,7 @@ async def deal_admin_payment_callback(
     q = update.callback_query
     if not q or not q.from_user or not q.message:
         return
-    if q.from_user.id not in set(ADMIN_IDS or []):
-        try:
-            await q.answer("فقط ادمین", show_alert=True)
-        except Exception:
-            pass
+    if not await _require_full_deal_admin(q):
         return
 
     parts = (q.data or "").split("|")
@@ -2590,10 +2782,7 @@ async def deal_admin_payment_callback(
 
     gate = deal_gate_get(oid)
     if not gate or not _deal_gate_allows_admin_payment(gate):
-        try:
-            await q.answer("معامله در مرحلهٔ واریز نیست", show_alert=True)
-        except Exception:
-            pass
+        await _expire_stale_deal_button(q, "معامله در مرحلهٔ واریز نیست")
         return
 
     if len(parts) == 3:
@@ -2955,11 +3144,10 @@ async def deal_admin_toman_settled_callback(
     q = update.callback_query
     if not q or not q.from_user or not q.message:
         return
-    if q.from_user.id not in set(ADMIN_IDS or []):
-        await q.answer("فقط ادمین", show_alert=True)
+    if not await _require_full_deal_admin(q):
         return
     parts = (q.data or "").split("|")
-    if len(parts) != 3 or parts[0] != "adm" or parts[1] != "tomset":
+    if len(parts) not in (3, 4) or parts[0] != "adm" or parts[1] != "tomset":
         return
     try:
         oid = int(parts[2])
@@ -2977,6 +3165,16 @@ async def deal_admin_toman_settled_callback(
     if not card_ok:
         await q.answer("ابتدا کارت واریز به خریدار ارسال شود.", show_alert=True)
         await refresh_admin_deal_markup(context.bot, oid)
+        return
+    if not await _admin_sensitive_confirmation(
+        context,
+        q,
+        action="buyer_toman_settled",
+        offer_id=oid,
+        confirm_data=f"adm|tomset|{oid}|yes",
+        prompt="✅ تأیید نهایی دریافت تومان خریدار",
+        is_confirmation=len(parts) == 4 and parts[3] == "yes",
+    ):
         return
     now = int(time.time())
     upsert_kw: dict = {
@@ -3025,8 +3223,7 @@ async def deal_admin_send_buyer_eur_account_callback(
     q = update.callback_query
     if not q or not q.from_user:
         return
-    if q.from_user.id not in set(ADMIN_IDS or []):
-        await q.answer("فقط ادمین", show_alert=True)
+    if not await _require_full_deal_admin(q):
         return
     parts = (q.data or "").split("|")
     if len(parts) != 3 or parts[0] != "adm" or parts[1] != "buyeur":
@@ -3081,18 +3278,20 @@ async def _apply_euro_settled(
     gate = deal_gate_get(offer_id)
     if not gate:
         if answer_query:
-            await answer_query.answer("معامله پیدا نشد", show_alert=True)
+            await _expire_stale_deal_button(answer_query, "معامله پیدا نشد")
         return
     items = deal_gate_seller_receipt_list(offer_id)
     if not items:
         if answer_query:
-            await answer_query.answer("فیشی ثبت نشده", show_alert=True)
+            await _expire_stale_deal_button(answer_query, "فیشی ثبت نشده")
         return
     if not deal_gate_confirm_seller_receipt_buyer(
         offer_id, receipt_index, confirmed_by=confirmed_by
     ):
         if answer_query:
-            await answer_query.answer("فیش نامعتبر", show_alert=True)
+            await _expire_stale_deal_button(
+                answer_query, "این تأیید قبلاً استفاده شده یا دیگر معتبر نیست."
+            )
         return
     gate = deal_gate_get(offer_id) or gate
     role = "buyer" if confirmed_by == "buyer" else "admin"
@@ -3125,6 +3324,11 @@ async def _apply_euro_settled(
             await answer_query.answer("✅ یورو نشست ثبت شد", show_alert=True)
         except Exception:
             pass
+        try:
+            if answer_query.message:
+                await answer_query.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
         if answer_query.from_user.id not in set(ADMIN_IDS or []):
             await _show_user_main_menu(
                 context,
@@ -3141,11 +3345,10 @@ async def deal_admin_euro_settled_callback(
     q = update.callback_query
     if not q or not q.from_user:
         return
-    if q.from_user.id not in set(ADMIN_IDS or []):
-        await q.answer("فقط ادمین", show_alert=True)
+    if not await _require_full_deal_admin(q):
         return
     parts = (q.data or "").split("|")
-    if len(parts) != 4 or parts[0] != "adm" or parts[1] != "eurcfm":
+    if len(parts) not in (4, 5) or parts[0] != "adm" or parts[1] != "eurcfm":
         return
     try:
         oid = int(parts[2])
@@ -3154,7 +3357,17 @@ async def deal_admin_euro_settled_callback(
         return
     gate = deal_gate_get(oid)
     if not gate or not _deal_gate_allows_admin_payment(gate):
-        await q.answer("معامله در این مرحله نیست", show_alert=True)
+        await _expire_stale_deal_button(q, "معامله در این مرحله نیست")
+        return
+    if not await _admin_sensitive_confirmation(
+        context,
+        q,
+        action=f"euro_settled:{ridx}",
+        offer_id=oid,
+        confirm_data=f"adm|eurcfm|{oid}|{ridx}|yes",
+        prompt="✅ تأیید نهایی دریافت یورو",
+        is_confirmation=len(parts) == 5 and parts[4] == "yes",
+    ):
         return
     await _apply_euro_settled(
         context,
@@ -3190,8 +3403,7 @@ async def deal_admin_seller_toman_receipt_callback(
     q = update.callback_query
     if not q or not q.from_user:
         return
-    if q.from_user.id not in set(ADMIN_IDS or []):
-        await q.answer("فقط ادمین", show_alert=True)
+    if not await _require_full_deal_admin(q):
         return
     parts = (q.data or "").split("|")
     if len(parts) < 4 or parts[0] != "adm" or parts[1] != "stom":
@@ -3203,7 +3415,7 @@ async def deal_admin_seller_toman_receipt_callback(
     action = parts[3]
     gate = deal_gate_get(oid)
     if not gate or not _deal_gate_allows_admin_payment(gate):
-        await q.answer("معامله در این مرحله نیست", show_alert=True)
+        await _expire_stale_deal_button(q, "معامله در این مرحله نیست")
         return
     from handlers.offers import _seller_euro_fully_confirmed_gate
 
@@ -3252,11 +3464,10 @@ async def deal_admin_seller_toman_settled_callback(
     q = update.callback_query
     if not q or not q.from_user:
         return
-    if q.from_user.id not in set(ADMIN_IDS or []):
-        await q.answer("فقط ادمین", show_alert=True)
+    if not await _require_full_deal_admin(q):
         return
     parts = (q.data or "").split("|")
-    if len(parts) != 3 or parts[0] != "adm" or parts[1] != "stomset":
+    if len(parts) not in (3, 4) or parts[0] != "adm" or parts[1] != "stomset":
         return
     try:
         oid = int(parts[2])
@@ -3271,7 +3482,9 @@ async def deal_admin_seller_toman_settled_callback(
         (gate.get("gate_status") or "").strip().lower() == "closed"
         or int(gate.get("seller_toman_settled_at") or 0) > 0
     ):
-        await q.answer("این معامله قبلاً بسته شده یا دریافت تومان تأیید شده است.", show_alert=True)
+        await _expire_stale_deal_button(
+            q, "این معامله قبلاً بسته شده یا دریافت تومان تأیید شده است."
+        )
         await refresh_admin_deal_markup(context.bot, oid)
         return
     from handlers.offers import _seller_euro_fully_confirmed_gate
@@ -3287,13 +3500,25 @@ async def deal_admin_seller_toman_settled_callback(
         await refresh_admin_deal_markup(context.bot, oid)
         return
 
+    if not await _admin_sensitive_confirmation(
+        context,
+        q,
+        action="seller_toman_settled",
+        offer_id=oid,
+        confirm_data=f"adm|stomset|{oid}|yes",
+        prompt="✅ تأیید نهایی دریافت تومان فروشنده",
+        is_confirmation=len(parts) == 4 and parts[3] == "yes",
+    ):
+        return
+
     row = get_advert_offer_joined(oid)
     if not row:
         await q.answer("پیشنهاد پیدا نشد.", show_alert=True)
         return
     now = int(time.time())
-    if not deal_gate_mark_seller_toman_settled(
+    if not deal_gate_settle_and_close_atomic(
         oid,
+        int(row["advert_rowid"]),
         settled_at=now,
         require_receipt=False,
     ):
@@ -3316,7 +3541,178 @@ async def deal_admin_seller_toman_settled_callback(
         row,
         closed_by="admin",
         answer_query=q,
+        persist_close=False,
     )
+
+
+def _seller_toman_delivery_payload(
+    *,
+    offer_id: int,
+    entry_type: str,
+    text: str,
+    file_id: str,
+    body_html: str,
+    source_chat_id: int = 0,
+    source_message_id: int = 0,
+) -> dict:
+    return {
+        "offer_id": int(offer_id),
+        "entry_type": (entry_type or "text").strip().lower(),
+        "receipt_text": (text or "")[:2000],
+        "file_id": (file_id or "").strip(),
+        "body_html": body_html,
+        "keyboard": "seller_toman_settled",
+        "after_hook": "record_seller_toman_receipt",
+        "source_chat_id": int(source_chat_id or 0),
+        "source_message_id": int(source_message_id or 0),
+    }
+
+
+async def _deliver_deal_queue_item(bot, delivery: dict) -> bool:
+    """Deliver one durable item. Repeated calls never resend a completed row."""
+    if (delivery.get("status") or "").strip().lower() == "sent":
+        return True
+    delivery_id = int(delivery["id"])
+    if not deal_delivery_claim(delivery_id):
+        return False
+    oid = int(delivery["offer_id"])
+    chat_id = int(delivery["recipient_telegram_id"])
+    payload = json.loads(delivery.get("payload_json") or "{}")
+    payload_type = (delivery.get("payload_type") or "text").strip().lower()
+    body = payload.get("body_html") or ""
+    markup = None
+    if payload.get("keyboard") == "seller_toman_settled":
+        markup = seller_toman_settled_keyboard(oid)
+    try:
+        if payload_type == "photo":
+            sent = await bot.send_photo(
+                chat_id,
+                payload.get("file_id") or "",
+                caption=_photo_caption_html(body),
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+            )
+        elif payload_type == "document":
+            sent = await bot.send_document(
+                chat_id,
+                payload.get("file_id") or "",
+                caption=_photo_caption_html(body),
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+            )
+        else:
+            sent = await bot.send_message(
+                chat_id=chat_id,
+                text=body,
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+        message_id = int(getattr(sent, "message_id", 0) or 0)
+        if payload.get("after_hook") == "record_seller_toman_receipt":
+            recorded = deal_gate_record_seller_toman_delivery(
+                oid,
+                entry_type=payload.get("entry_type") or payload_type,
+                text=payload.get("receipt_text") or "",
+                file_id=payload.get("file_id") or "",
+                delivery_key=delivery.get("dedupe_key") or str(delivery_id),
+                queue_delivery_id=delivery_id,
+                telegram_message_id=message_id,
+            )
+            if not recorded:
+                # Telegram already accepted the message. Never retry and duplicate it;
+                # leave the stage mismatch for the admin repair audit.
+                deal_delivery_mark_sent(delivery_id, message_id)
+                logger.error(
+                    "deal_delivery: receipt delivered but stage changed offer=%s id=%s",
+                    oid,
+                    delivery_id,
+                )
+        else:
+            deal_delivery_mark_sent(delivery_id, message_id)
+        try:
+            bot_outbound_log_insert(
+                oid,
+                chat_id,
+                delivery.get("party") or "user",
+                delivery.get("tag") or "پیام معامله",
+                msg_type=payload_type,
+                body_html=body if payload_type == "text" else None,
+                caption_html=body if payload_type != "text" else None,
+                photo_file_id=(payload.get("file_id") or "") if payload_type != "text" else None,
+                telegram_message_id=message_id,
+            )
+        except Exception:
+            logger.exception("deal_delivery: outbound log failed id=%s", delivery_id)
+        source_chat_id = int(payload.get("source_chat_id") or 0)
+        source_message_id = int(payload.get("source_message_id") or 0)
+        if source_chat_id > 0 and source_message_id > 0:
+            await _delete_message_safe(bot, source_chat_id, source_message_id)
+        return True
+    except RetryAfter as exc:
+        retry_after = getattr(exc, "retry_after", 1)
+        try:
+            seconds = int(retry_after.total_seconds())
+        except AttributeError:
+            seconds = int(retry_after or 1)
+        deal_delivery_defer_rate_limit(delivery_id, seconds, str(exc))
+        logger.info(
+            "deal_delivery: Telegram rate limit id=%s retry_after=%s",
+            delivery_id,
+            seconds,
+        )
+        return False
+    except Exception as exc:
+        deal_delivery_mark_failed(delivery_id, str(exc))
+        logger.warning(
+            "deal_delivery: failed id=%s offer=%s chat=%s: %s",
+            delivery_id,
+            oid,
+            chat_id,
+            exc,
+        )
+        return False
+
+
+async def _enqueue_and_deliver_deal_message(
+    bot,
+    *,
+    offer_id: int,
+    chat_id: int,
+    party: str,
+    tag: str,
+    payload_type: str,
+    payload: dict,
+    dedupe_key: str,
+) -> bool:
+    delivery = deal_delivery_enqueue(
+        offer_id=int(offer_id),
+        recipient_telegram_id=int(chat_id),
+        party=party,
+        tag=tag,
+        payload_type=payload_type,
+        payload=payload,
+        dedupe_key=dedupe_key,
+    )
+    return await _deliver_deal_queue_item(bot, delivery)
+
+
+async def run_deal_delivery_retry_sweep(bot) -> int:
+    """Quietly retry critical messages; users receive no separate failure notices."""
+    delivered = 0
+    touched_offers: set[int] = set()
+    for item in deal_delivery_due(limit=50):
+        if await _deliver_deal_queue_item(bot, item):
+            delivered += 1
+            touched_offers.add(int(item.get("offer_id") or 0))
+    for oid in touched_offers:
+        if oid <= 0 or not deal_gate_get(oid):
+            continue
+        try:
+            await sync_deal_admin_notification(bot, oid, deal_complete=True)
+        except Exception:
+            logger.exception("deal_delivery: admin resync failed offer=%s", oid)
+    return delivered
 
 
 async def _deal_admin_stom_try_message(
@@ -3353,39 +3749,57 @@ async def _deal_admin_stom_try_message(
         await update.message.reply_text(f"{_RTL}متن فیش را کامل‌تر بفرستید.")
         return True
     seller_id = int(gate.get("seller_telegram_id") or 0)
-    deal_gate_append_seller_toman_admin(oid, entry_type="text", text=text)
-    gate = deal_gate_get(oid) or gate
+    receipt_warnings = _log_receipt_consistency(
+        oid, gate, text, receipt_kind="seller_toman"
+    )
     row = get_advert_offer_joined(oid)
     seq = int((row or {}).get("seq_in_advert") or oid)
-    from utils.deal_outbound import deal_bot_send_message
-
     body = (
         f"{_RTL}💳 <b>فیش واریز تومان</b>\n\n"
         f"{_RTL}پیشنهاد <b>{seq}</b>\n\n"
         f"{_RTL}ادمین فیش واریز تومان به شما را ارسال کرد:\n\n"
         f"<pre>{html_module.escape(text[:3500])}</pre>"
     )
-    try:
-        await deal_bot_send_message(
-            context.bot,
+    dedupe_key = (
+        f"seller_toman:{oid}:{int(update.effective_user.id)}:"
+        f"{int(update.message.message_id)}"
+    )
+    delivered = await _enqueue_and_deliver_deal_message(
+        context.bot,
+        offer_id=oid,
+        chat_id=seller_id,
+        party="seller",
+        tag="فیش تومان از ادمین",
+        payload_type="text",
+        payload=_seller_toman_delivery_payload(
             offer_id=oid,
-            chat_id=seller_id,
-            party="seller",
-            tag="فیش تومان از ادمین",
-            text=body,
-            disable_web_page_preview=True,
-            reply_markup=seller_toman_settled_keyboard(oid),
-        )
-        deal_gate_enable_seller_toman_close(oid)
+            entry_type="text",
+            text=text,
+            file_id="",
+            body_html=body,
+            source_chat_id=update.message.chat_id,
+            source_message_id=update.message.message_id,
+        ),
+        dedupe_key=dedupe_key,
+    )
+    if delivered:
+        if receipt_warnings:
+            await context.bot.send_message(
+                chat_id=int(update.effective_user.id),
+                text="⚠️ بررسی دستی فیش: " + "؛ ".join(receipt_warnings),
+            )
         gate = deal_gate_get(oid) or gate
         from utils.deal_milestones import notify_toman_to_seller_buyer
 
         await notify_toman_to_seller_buyer(context.bot, offer_id=oid, gate=gate)
         schedule_seller_stom_close_reminder(context.application, oid)
-    except Exception as e:
-        logger.warning("deal_stom: send seller=%s: %s", seller_id, e)
-    _log(oid, "ادمین فیش تومان برای فروشنده فرستاد (متن)", from_role="admin")
-    await _admin_receipt_upload_done(context.bot, update, oid)
+        _log(oid, "ادمین فیش تومان برای فروشنده فرستاد (متن)", from_role="admin")
+        await _admin_receipt_upload_done(context.bot, update, oid)
+    else:
+        _log(oid, "ارسال فیش تومان در صف تلاش مجدد (متن)", from_role="admin")
+        await update.message.reply_text(
+            f"{_RTL}⏳ ارسال فیش ناموفق بود و بدون پیام اضافه برای کاربر، خودکار دوباره تلاش می‌شود."
+        )
     return True
 
 
@@ -3425,13 +3839,11 @@ async def _deal_admin_stom_try_photo(
     entry_type = "document" if media_kind == "document" else "photo"
     cap = (update.message.caption or "").strip()
     seller_id = int(gate.get("seller_telegram_id") or 0)
-    deal_gate_append_seller_toman_admin(
-        oid, entry_type=entry_type, text=cap, file_id=fid
+    receipt_warnings = _log_receipt_consistency(
+        oid, gate, cap, receipt_kind="seller_toman"
     )
     row = get_advert_offer_joined(oid)
     seq = int((row or {}).get("seq_in_advert") or oid)
-    from utils.deal_outbound import deal_bot_send_message, deal_bot_send_photo, deal_bot_send_document
-
     body = (
         f"{_RTL}💳 <b>فیش واریز تومان</b>\n\n"
         f"{_RTL}پیشنهاد <b>{seq}</b>\n\n"
@@ -3439,39 +3851,46 @@ async def _deal_admin_stom_try_photo(
     )
     if cap:
         body += f"\n\n<i>{html_module.escape(cap[:400])}</i>"
-    try:
-        if entry_type == "document":
-            await deal_bot_send_document(
-                context.bot,
-                offer_id=oid,
-                chat_id=seller_id,
-                party="seller",
-                tag="فیش تومان از ادمین",
-                document_file_id=fid,
-                caption=_photo_caption_html(body),
-                reply_markup=seller_toman_settled_keyboard(oid),
+    dedupe_key = (
+        f"seller_toman:{oid}:{int(update.effective_user.id)}:"
+        f"{int(update.message.message_id)}"
+    )
+    delivered = await _enqueue_and_deliver_deal_message(
+        context.bot,
+        offer_id=oid,
+        chat_id=seller_id,
+        party="seller",
+        tag="فیش تومان از ادمین",
+        payload_type=entry_type,
+        payload=_seller_toman_delivery_payload(
+            offer_id=oid,
+            entry_type=entry_type,
+            text=cap,
+            file_id=fid,
+            body_html=body,
+            source_chat_id=update.message.chat_id,
+            source_message_id=update.message.message_id,
+        ),
+        dedupe_key=dedupe_key,
+    )
+    if delivered:
+        if receipt_warnings:
+            await context.bot.send_message(
+                chat_id=int(update.effective_user.id),
+                text="⚠️ بررسی دستی فیش: " + "؛ ".join(receipt_warnings),
             )
-        else:
-            await deal_bot_send_photo(
-                context.bot,
-                offer_id=oid,
-                chat_id=seller_id,
-                party="seller",
-                tag="فیش تومان از ادمین",
-                photo_file_id=fid,
-                caption=_photo_caption_html(body),
-                reply_markup=seller_toman_settled_keyboard(oid),
-            )
-        deal_gate_enable_seller_toman_close(oid)
         gate = deal_gate_get(oid) or gate
         from utils.deal_milestones import notify_toman_to_seller_buyer
 
         await notify_toman_to_seller_buyer(context.bot, offer_id=oid, gate=gate)
         schedule_seller_stom_close_reminder(context.application, oid)
-    except Exception as e:
-        logger.warning("deal_stom: photo to seller=%s: %s", seller_id, e)
-    _log(oid, f"ادمین فیش تومان برای فروشنده فرستاد ({entry_type})", from_role="admin")
-    await _admin_receipt_upload_done(context.bot, update, oid)
+        _log(oid, f"ادمین فیش تومان برای فروشنده فرستاد ({entry_type})", from_role="admin")
+        await _admin_receipt_upload_done(context.bot, update, oid)
+    else:
+        _log(oid, f"ارسال فیش تومان در صف تلاش مجدد ({entry_type})", from_role="admin")
+        await update.message.reply_text(
+            f"{_RTL}⏳ ارسال فیش ناموفق بود و بدون پیام اضافه برای کاربر، خودکار دوباره تلاش می‌شود."
+        )
     return True
 
 
@@ -3867,7 +4286,7 @@ def _last_seller_stom_reminder_at(offer_id: int, seller_id: int) -> int:
 
 
 def _seller_stom_reminder_due(gate: dict, *, now: int | None = None) -> bool:
-    """اولین یادآوری ۸ ساعت پس از فیش؛ بعدی هر ۸ ساعت تا تأیید فروشنده."""
+    """Only one seller reminder, eight hours after receipt delivery."""
     if not _gate_awaiting_seller_toman_close(gate):
         return False
     oid = int(gate.get("offer_id") or 0)
@@ -3877,12 +4296,13 @@ def _seller_stom_reminder_due(gate: dict, *, now: int | None = None) -> bool:
         return False
     ts = int(now if now is not None else time.time())
     last_rem = _last_seller_stom_reminder_at(oid, seller_id)
-    anchor = last_rem if last_rem > 0 else enabled_at
-    return ts - anchor >= _SELLER_STOM_REMINDER_SEC
+    if last_rem > 0:
+        return False
+    return ts - enabled_at >= _SELLER_STOM_REMINDER_SEC
 
 
 def schedule_seller_stom_close_reminder(application, offer_id: int) -> None:
-    """هر ۸ ساعت یادآوری تأیید پایان تا فروشنده بزند."""
+    """Schedule the single, quiet seller reminder."""
     jq = getattr(application, "job_queue", None)
     if not jq:
         return
@@ -3952,9 +4372,6 @@ async def _job_seller_stom_close_reminder(context: ContextTypes.DEFAULT_TYPE) ->
     if oid <= 0:
         return
     await _send_seller_stom_close_reminder(context.bot, offer_id=oid)
-    gate = deal_gate_get(oid)
-    if _gate_awaiting_seller_toman_close(gate):
-        schedule_seller_stom_close_reminder(context.application, oid)
 
 
 async def resend_seller_stom_close_prompt(bot, offer_id: int) -> bool:
@@ -4073,6 +4490,35 @@ def _admin_toman_reminder_stage(gate: dict) -> str:
     }.get((gate.get("gate_status") or "").strip().lower(), "در حال پیگیری")
 
 
+def _admin_toman_reminder_keyboard(
+    offer_id: int,
+    gate: dict,
+) -> InlineKeyboardMarkup:
+    """Reminder actions: continue the workflow, never confirm receipt for seller."""
+    from handlers.offers import _seller_euro_fully_confirmed_gate
+
+    oid = int(offer_id)
+    rows: list[list[InlineKeyboardButton]] = []
+    if _seller_euro_fully_confirmed_gate(gate):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "📎 ارسال فیش واریزی تومان به فروشنده",
+                    callback_data=f"adm|stom|{oid}|go",
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "📋 مشاهده معامله",
+                callback_data=f"adm|dgs|resync|{oid}",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
 async def run_admin_toman_receipt_reminder_sweep(
     bot,
     *,
@@ -4102,22 +4548,7 @@ async def run_admin_toman_receipt_reminder_sweep(
             f"{_RTL}لطفاً وضعیت معامله را بررسی و مرحله‌های باقی‌مانده را پیگیری کنید.\n"
             f"{_RTL}<i>این یادآوری پس از ارسال موفق فیش تومان به فروشنده متوقف می‌شود.</i>"
         )
-        keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "✅ فروشنده تومان را دریافت کرد",
-                        callback_data=f"adm|stomset|{oid}",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "📋 مشاهده معامله",
-                        callback_data=f"adm|dgs|{oid}",
-                    )
-                ],
-            ]
-        )
+        keyboard = _admin_toman_reminder_keyboard(oid, gate)
         for admin_id in admin_ids:
             if not _admin_toman_reminder_due(gate, admin_id, now=now):
                 continue
@@ -4306,6 +4737,24 @@ _GATE_STATUS_FA = {
     "closed": "⛔ بسته",
 }
 
+_DEAL_PROBLEM_FA = {
+    "invalid_gate_status": "وضعیت نامعتبر",
+    "stage_without_both_confirmations": "مرحله بدون تأیید دو طرف",
+    "payment_stage_without_both_accounts": "حساب یکی از طرفین ناقص",
+    "invalid_seller_receipt_log": "لاگ فیش یورو خراب",
+    "invalid_seller_toman_log": "لاگ فیش تومان خراب",
+    "seller_close_enabled_without_delivered_receipt": "دکمه پایان بدون فیش تحویل‌شده",
+    "seller_receipt_missing_delivery_confirmation": "تحویل فیش تأیید نشده",
+    "seller_settled_but_gate_not_closed": "تسویه شده ولی باز است",
+    "seller_receipt_before_euro_account": "فیش پیش از ارسال حساب یورو",
+    "closed_gate_offer_status_mismatch": "وضعیت پیشنهاد با معامله فرق دارد",
+    "closed_gate_advert_status_mismatch": "وضعیت آگهی با معامله فرق دارد",
+    "critical_delivery_pending": "ارسال تلگرام ناموفق یا متوقف",
+    "stuck_pending": "بیش از ۲ ساعت منتظر تأیید",
+    "stuck_accounts": "بیش از ۱۲ ساعت منتظر حساب",
+    "stuck_completed": "بیش از ۱۲ ساعت در پرداخت",
+}
+
 
 def _admin_reactivate_close_row(offer_id: int) -> list[InlineKeyboardButton]:
     oid = int(offer_id)
@@ -4326,6 +4775,16 @@ def _deal_gate_admin_terminal_keyboard(offer_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             _admin_reactivate_close_row(oid),
+            [
+                InlineKeyboardButton(
+                    "🛠 بررسی و تعمیر وضعیت",
+                    callback_data=f"adm|dgs|repair|{oid}",
+                )
+            ],
+            [
+                InlineKeyboardButton("🕒 تاریخچه", callback_data=f"adm|dgs|timeline|{oid}"),
+                InlineKeyboardButton("📄 خروجی", callback_data=f"adm|dgs|export|{oid}"),
+            ],
             [InlineKeyboardButton("🔙 لیست معاملات", callback_data="adm|dgs")],
             [InlineKeyboardButton("🔙 پنل مدیریت", callback_data="adm|panel")],
         ]
@@ -4342,6 +4801,16 @@ def _deal_gate_admin_list_keyboard(gates: list[dict]) -> InlineKeyboardMarkup:
         rows.append(
             [InlineKeyboardButton(label[:60], callback_data=f"adm|dgs|{oid}")]
         )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "⚠️ معاملات نیازمند بررسی", callback_data="adm|dgs|problems"
+            )
+        ]
+    )
+    rows.append(
+        [InlineKeyboardButton("🩺 سلامت عملیات", callback_data="adm|dgs|health")]
+    )
     rows.append(
         [InlineKeyboardButton("🔄 بروزرسانی", callback_data="adm|dgs")]
     )
@@ -4370,6 +4839,12 @@ def _deal_gate_admin_detail_keyboard(offer_id: int, gate: dict | None = None) ->
         )
     rows.extend(list(_admin_gate_keyboard(oid).inline_keyboard))
     rows.append(
+        [
+            InlineKeyboardButton("🕒 تاریخچه", callback_data=f"adm|dgs|timeline|{oid}"),
+            InlineKeyboardButton("📄 خروجی", callback_data=f"adm|dgs|export|{oid}"),
+        ]
+    )
+    rows.append(
         [InlineKeyboardButton("🔙 لیست معاملات", callback_data="adm|dgs")]
     )
     rows.append(
@@ -4389,6 +4864,20 @@ def _deal_gate_admin_completed_keyboard(offer_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(
                 "🔄 بروزرسانی پیام ادمین",
                 callback_data=f"adm|dgs|resync|{oid}",
+            )
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton("🕒 تاریخچه", callback_data=f"adm|dgs|timeline|{oid}"),
+            InlineKeyboardButton("📄 خروجی", callback_data=f"adm|dgs|export|{oid}"),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "🛠 بررسی و تعمیر وضعیت",
+                callback_data=f"adm|dgs|repair|{oid}",
             )
         ]
     )
@@ -4421,6 +4910,62 @@ def build_admin_deal_list_html(gates: list[dict]) -> str:
             f"  <code>{html_module.escape(snap)}</code>"
         )
     return "".join(parts)
+
+
+def _problem_age_fa(seconds: int) -> str:
+    hours = max(0, int(seconds)) // 3600
+    if hours < 1:
+        return "کمتر از یک ساعت"
+    if hours < 24:
+        return f"{hours} ساعت"
+    return f"{hours // 24} روز"
+
+
+def build_admin_problem_deals_html(gates: list[dict]) -> str:
+    if not gates:
+        return (
+            f"{_RTL}✅ <b>معامله نیازمند بررسی پیدا نشد.</b>\n\n"
+            f"{_RTL}این صفحه فقط هنگام باز کردن پنل بررسی می‌شود و برای کاربران پیامی نمی‌فرستد."
+        )
+    parts = [
+        f"{_RTL}⚠️ <b>معاملات نیازمند بررسی</b> ({len(gates)})\n",
+        f"{_RTL}این فهرست غیرفعال است؛ هیچ اعلان خودکاری برای کاربران ارسال نمی‌شود.\n",
+    ]
+    for gate in gates[:20]:
+        oid = int(gate["offer_id"])
+        aid = int(gate["advert_rowid"])
+        issues = gate.get("problem_issues") or []
+        labels = [_DEAL_PROBLEM_FA.get(str(issue), str(issue)) for issue in issues[:3]]
+        parts.append(
+            f"\n{_RTL}• آگهی <b>{aid}</b> · offer <code>{oid}</code>"
+            f" · {_problem_age_fa(int(gate.get('problem_age_seconds') or 0))}\n"
+            f"{_RTL}<code>{html_module.escape('، '.join(labels))}</code>"
+        )
+    return "".join(parts)
+
+
+def _deal_problem_list_keyboard(gates: list[dict]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for gate in gates[:20]:
+        oid = int(gate["offer_id"])
+        aid = int(gate["advert_rowid"])
+        count = len(gate.get("problem_issues") or [])
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"⚠️ آگهی {aid} · offer {oid} ({count})"[:60],
+                    callback_data=f"adm|dgs|{oid}",
+                )
+            ]
+        )
+    rows.extend(
+        [
+            [InlineKeyboardButton("🔄 بررسی دوباره", callback_data="adm|dgs|problems")],
+            [InlineKeyboardButton("📊 همه معاملات", callback_data="adm|dgs")],
+            [InlineKeyboardButton("🔙 پنل مدیریت", callback_data="adm|panel")],
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
 
 
 def build_admin_deal_detail_html(
@@ -4555,6 +5100,177 @@ async def admin_show_deal_gate_list(
     text = build_admin_deal_list_html(gates)
     kb = _deal_gate_admin_list_keyboard(gates)
     await _admin_edit_or_send(update, context, text, kb)
+
+
+async def admin_show_problem_deals(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    from database.db import deal_gate_list_problems
+
+    context.user_data["admin_deal_gate_browse"] = True
+    gates = deal_gate_list_problems()
+    await _admin_edit_or_send(
+        update,
+        context,
+        build_admin_problem_deals_html(gates),
+        _deal_problem_list_keyboard(gates),
+    )
+
+
+def build_deal_timeline_text(offer_id: int) -> str:
+    """Plain-text, admin-only chronological record suitable for display/export."""
+    oid = int(offer_id)
+    events: list[tuple[int, str]] = []
+    gate = deal_gate_get(oid) or {}
+    if gate:
+        events.append(
+            (
+                int(gate.get("started_at") or 0),
+                f"STATE gate={gate.get('gate_status') or 'unknown'} "
+                f"admin_decision={gate.get('admin_decision') or '-'}",
+            )
+        )
+        for label, key in (
+            ("buyer_toman", "buyer_receipt_log"),
+            ("seller_euro", "seller_receipt_log"),
+            ("seller_toman", "seller_toman_admin_log"),
+        ):
+            try:
+                receipts = json.loads(gate.get(key) or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                receipts = []
+            for index, receipt in enumerate(receipts if isinstance(receipts, list) else []):
+                events.append(
+                    (
+                        int(receipt.get("at") or receipt.get("delivered_at") or 0),
+                        f"RECEIPT [{label}] index={index} type={receipt.get('type') or 'text'} "
+                        f"file={'yes' if receipt.get('file_id') else 'no'} "
+                        f"confirmed_at={receipt.get('buyer_confirmed_at') or receipt.get('delivered_at') or 0}",
+                    )
+                )
+    for item in negotiation_transcript_list(oid):
+        ts = int(item.get("created_at") or 0)
+        events.append(
+            (ts, f"EVENT [{item.get('from') or 'system'}] {item.get('text') or ''}")
+        )
+    for item in bot_outbound_log_list(oid):
+        ts = int(item.get("created_at") or 0)
+        events.append(
+            (
+                ts,
+                f"OUTBOUND [{item.get('party')}] {item.get('tag')} "
+                f"chat={item.get('recipient_telegram_id')} mid={item.get('telegram_message_id') or 0}",
+            )
+        )
+    for item in deal_delivery_list_for_offer(oid):
+        ts = int(item.get("updated_at") or item.get("created_at") or 0)
+        error = (item.get("last_error") or "").strip()
+        events.append(
+            (
+                ts,
+                f"DELIVERY [{item.get('status')}] {item.get('tag')} "
+                f"attempts={item.get('attempts') or 0}"
+                + (f" error={error}" if error else ""),
+            )
+        )
+    events.sort(key=lambda row: row[0])
+    lines = [f"Deal timeline — offer {oid}"]
+    for ts, body in events:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "unknown"
+        lines.append(f"{stamp} | {body}")
+    if len(lines) == 1:
+        lines.append("No recorded events.")
+    return "\n".join(lines)
+
+
+async def admin_show_deal_timeline(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, offer_id: int
+) -> None:
+    text = build_deal_timeline_text(offer_id)
+    escaped = html_module.escape(text[-3600:])
+    await _admin_edit_or_send(
+        update,
+        context,
+        f"{_RTL}🕒 <b>تاریخچه معامله</b> · offer <code>{int(offer_id)}</code>\n\n"
+        f"<pre>{escaped}</pre>",
+        InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "📄 دریافت فایل کامل",
+                        callback_data=f"adm|dgs|export|{int(offer_id)}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🔙 جزئیات معامله", callback_data=f"adm|dgs|{int(offer_id)}"
+                    )
+                ],
+            ]
+        ),
+    )
+
+
+async def admin_export_deal_timeline(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, offer_id: int
+) -> None:
+    q = update.callback_query
+    if not q or not q.message:
+        return
+    data = build_deal_timeline_text(offer_id).encode("utf-8")
+    await context.bot.send_document(
+        chat_id=int(q.message.chat_id),
+        document=InputFile(BytesIO(data), filename=f"deal-{int(offer_id)}-timeline.txt"),
+        caption=f"تاریخچه کامل معامله {int(offer_id)}",
+    )
+    await q.answer("فایل تاریخچه ارسال شد.")
+
+
+async def admin_show_deal_health(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    health = deal_operational_health()
+    now = int(time.time())
+
+    def age(value: int) -> str:
+        if not value:
+            return "—"
+        hours = max(0, now - int(value)) // 3600
+        return f"{hours} ساعت پیش"
+
+    text = (
+        f"{_RTL}🩺 <b>سلامت عملیات معاملات</b>\n\n"
+        f"{_RTL}دیتابیس: <code>{html_module.escape(str(health['database_integrity']))}</code>\n"
+        f"{_RTL}ارسال‌های باز: <b>{health['queue_open']}</b> · ناموفق: <b>{health['queue_failed']}</b>\n"
+        f"{_RTL}معاملات نیازمند بررسی: <b>{health['problem_deals']}</b>\n"
+        f"{_RTL}آخرین بکاپ سالم: <b>{age(health['last_backup_at'])}</b>\n"
+        f"{_RTL}آخرین بکاپ خارج سرور: <b>{age(health['last_offsite_backup_at'])}</b>\n"
+        f"{_RTL}آخرین تست بازیابی: <b>{age(health['last_restore_drill_at'])}</b>\n"
+        f"{_RTL}آخرین تطبیق مالی: <b>{age(health['last_reconciliation_at'])}</b>"
+        f" · مغایرت: <b>{health['last_reconciliation_issues']}</b>\n"
+        f"{_RTL}آخرین پاک‌سازی حریم خصوصی: <b>{age(health['last_privacy_run_at'])}</b>\n"
+        f"{_RTL}زمان اجرای ربات: <b>{age(health['started_at'])}</b>\n"
+    )
+    if health["last_backup_error"]:
+        text += f"\n{_RTL}⚠️ خطای بکاپ: <code>{html_module.escape(health['last_backup_error'][:300])}</code>"
+    if health["last_offsite_backup_error"]:
+        text += f"\n{_RTL}⚠️ خطای بکاپ خارج سرور: <code>{html_module.escape(health['last_offsite_backup_error'][:300])}</code>"
+    if health["last_restore_drill_error"]:
+        text += f"\n{_RTL}⚠️ خطای تست بازیابی: <code>{html_module.escape(health['last_restore_drill_error'][:300])}</code>"
+    if health["last_reconciliation_error"]:
+        text += f"\n{_RTL}⚠️ خطای تطبیق مالی: <code>{html_module.escape(health['last_reconciliation_error'][:300])}</code>"
+    await _admin_edit_or_send(
+        update,
+        context,
+        text,
+        InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🔄 بروزرسانی", callback_data="adm|dgs|health")],
+                [InlineKeyboardButton("⚠️ نیازمند بررسی", callback_data="adm|dgs|problems")],
+                [InlineKeyboardButton("🔙 پنل مدیریت", callback_data="adm|panel")],
+            ]
+        ),
+    )
 
 
 async def admin_deal_gate_search_by_number(
@@ -5174,8 +5890,16 @@ async def _handle_deal_receipt_callback(
         return
     uid = q.from_user.id
     gate = deal_gate_get(offer_id)
-    if not gate or int(gate.get("buyer_telegram_id") or 0) != uid:
+    allowed, reason = _party_callback_authorized(
+        gate, uid, party="buyer", allowed_statuses={"completed"}
+    )
+    if reason == "role":
         await q.answer("فقط خریدار این معامله", show_alert=True)
+        return
+    if not allowed:
+        await _expire_stale_deal_button(
+            q, "این دکمه منقضی شده است؛ وضعیت جدید معامله را باز کنید."
+        )
         return
     buyer_id = int(gate.get("buyer_telegram_id") or 0)
     card_ok = int(gate.get("buyer_toman_card_sent_at") or 0) > 0 or (
@@ -5184,10 +5908,6 @@ async def _handle_deal_receipt_callback(
     if not card_ok:
         await q.answer("ابتدا ادمین کارت واریز را ارسال کند.", show_alert=True)
         return
-    if not _deal_gate_allows_party_receipts(gate):
-        await q.answer("این معامله بسته شده است.", show_alert=True)
-        return
-
     if action == "cancel":
         await q.answer("انصراف")
         _clear_deal_receipt_pending(context)
@@ -5256,8 +5976,16 @@ async def _handle_deal_seller_receipt_callback(
         return
     uid = q.from_user.id
     gate = deal_gate_get(offer_id)
-    if not gate or int(gate.get("seller_telegram_id") or 0) != uid:
+    allowed, reason = _party_callback_authorized(
+        gate, uid, party="seller", allowed_statuses={"completed"}
+    )
+    if reason == "role":
         await q.answer("فقط فروشنده این معامله", show_alert=True)
+        return
+    if not allowed:
+        await _expire_stale_deal_button(
+            q, "این دکمه منقضی شده است؛ وضعیت جدید معامله را باز کنید."
+        )
         return
     seller_id = int(gate.get("seller_telegram_id") or 0)
     eur_ok = int(gate.get("seller_eur_account_sent_at") or 0) > 0 or (
@@ -5266,10 +5994,6 @@ async def _handle_deal_seller_receipt_callback(
     if not eur_ok:
         await q.answer("ابتدا حساب یورو به فروشنده ارسال شود.", show_alert=True)
         return
-    if not _deal_gate_allows_party_receipts(gate):
-        await q.answer("این معامله بسته شده است.", show_alert=True)
-        return
-
     if action == "cancel":
         await q.answer("انصراف")
         _clear_deal_receipt_pending(context)
@@ -5338,8 +6062,16 @@ async def _handle_buyer_euro_settled_callback(
         return
     uid = q.from_user.id
     gate = deal_gate_get(offer_id)
-    if not gate or int(gate.get("buyer_telegram_id") or 0) != uid:
+    allowed, reason = _party_callback_authorized(
+        gate, uid, party="buyer", allowed_statuses={"completed"}
+    )
+    if reason == "role":
         await q.answer("فقط خریدار این معامله", show_alert=True)
+        return
+    if not allowed:
+        await _expire_stale_deal_button(
+            q, "این تأیید منقضی شده است؛ وضعیت معامله تغییر کرده."
+        )
         return
     await _apply_euro_settled(
         context,
@@ -5391,7 +6123,12 @@ async def _deal_receipt_try_message(
         await update.message.reply_text(f"{_RTL}متن فیش را کامل‌تر بفرستید.")
         return True
     if party == "seller":
-        items = deal_gate_append_seller_receipt(oid, entry_type="text", text=text)
+        items = deal_gate_append_seller_receipt(
+            oid,
+            entry_type="text",
+            text=text,
+            source_message_id=update.message.message_id,
+        )
         gate = deal_gate_get(oid) or gate
         idx = len(items) - 1
         _log(oid, f"فیش یورو متنی فروشنده ({len(text)} کاراکتر)", from_role="seller")
@@ -5410,8 +6147,14 @@ async def _deal_receipt_try_message(
             advert_rowid=int(gate.get("advert_rowid") or 0),
         )
         return True
-    deal_gate_append_buyer_receipt(oid, entry_type="text", text=text)
+    deal_gate_append_buyer_receipt(
+        oid,
+        entry_type="text",
+        text=text,
+        source_message_id=update.message.message_id,
+    )
     gate = deal_gate_get(oid) or gate
+    _log_receipt_consistency(oid, gate, text, receipt_kind="buyer_toman")
     _log(oid, f"فیش واریز متنی خریدار ({len(text)} کاراکتر)", from_role="buyer")
     await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
     await _party_receipt_ack(
@@ -5466,9 +6209,14 @@ async def _deal_receipt_try_photo(
     cap = (update.message.caption or "").strip()
     if party == "seller":
         items = deal_gate_append_seller_receipt(
-            oid, entry_type=entry_type, text=cap, file_id=fid
+            oid,
+            entry_type=entry_type,
+            text=cap,
+            file_id=fid,
+            source_message_id=update.message.message_id,
         )
         gate = deal_gate_get(oid) or gate
+        _log_receipt_consistency(oid, gate, cap, receipt_kind="seller_euro")
         idx = len(items) - 1
         _log(oid, f"فیش یورو {entry_type} فروشنده", from_role="seller")
         await _notify_buyer_euro_receipt_confirm(
@@ -5488,9 +6236,14 @@ async def _deal_receipt_try_photo(
         )
         return True
     deal_gate_append_buyer_receipt(
-        oid, entry_type=entry_type, text=cap, file_id=fid
+        oid,
+        entry_type=entry_type,
+        text=cap,
+        file_id=fid,
+        source_message_id=update.message.message_id,
     )
     gate = deal_gate_get(oid) or gate
+    _log_receipt_consistency(oid, gate, cap, receipt_kind="buyer_toman")
     _log(oid, f"فیش واریز {entry_type} خریدار", from_role="buyer")
     await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
     await _party_receipt_ack(
@@ -5531,14 +6284,28 @@ async def deal_gate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     parts = (q.data or "").strip().split("|")
     if len(parts) < 3:
+        await _expire_stale_deal_button(q, "دکمه نامعتبر یا منقضی است.")
+        return
+    oid_index = (
+        3
+        if (parts[0] == "adm" and parts[1] == "dg")
+        or (parts[0] == "deal" and parts[1] == "acc")
+        else 2
+    )
+    try:
+        callback_offer_id = int(parts[oid_index])
+        if callback_offer_id <= 0:
+            raise ValueError
+    except (IndexError, TypeError, ValueError):
+        await _expire_stale_deal_button(q, "دکمه نامعتبر یا منقضی است.")
         return
     if parts[0] == "deal" and parts[1] == "rcpt" and len(parts) >= 4:
         await _handle_deal_receipt_callback(
-            update, context, parts[3], int(parts[2])
+            update, context, parts[3], callback_offer_id
         )
     elif parts[0] == "deal" and parts[1] == "srcpt" and len(parts) >= 4:
         await _handle_deal_seller_receipt_callback(
-            update, context, parts[3], int(parts[2])
+            update, context, parts[3], callback_offer_id
         )
     elif parts[0] == "deal" and parts[1] == "eurset" and len(parts) >= 4:
         try:
@@ -5546,22 +6313,24 @@ async def deal_gate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except (TypeError, ValueError):
             return
         await _handle_buyer_euro_settled_callback(
-            update, context, int(parts[2]), ridx
+            update, context, callback_offer_id, ridx
         )
     elif parts[0] == "deal" and parts[1] == "stomcfm" and len(parts) >= 3:
         await _handle_seller_toman_settled_callback(
-            update, context, int(parts[2])
+            update, context, callback_offer_id
         )
     elif parts[0] == "deal" and parts[1] == "accpick" and len(parts) >= 3:
         await _handle_account_deal_pick_callback(
-            update, context, int(parts[2])
+            update, context, callback_offer_id
         )
     elif parts[0] == "deal" and parts[1] == "acc" and len(parts) >= 4:
-        await _handle_account_confirm_callback(update, context, parts[2], int(parts[3]))
+        await _handle_account_confirm_callback(
+            update, context, parts[2], callback_offer_id
+        )
     elif parts[0] == "deal":
-        await _handle_party_response(update, context, parts[1], int(parts[2]))
+        await _handle_party_response(update, context, parts[1], callback_offer_id)
     elif parts[0] == "adm" and parts[1] == "dg" and len(parts) >= 4:
-        await _handle_admin_decision(update, context, parts[2], int(parts[3]))
+        await _handle_admin_decision(update, context, parts[2], callback_offer_id)
 
 
 async def _handle_party_response(
@@ -5576,7 +6345,7 @@ async def _handle_party_response(
     uid = q.from_user.id
     gate = deal_gate_get(offer_id)
     if not gate or (gate.get("gate_status") or "").strip().lower() != "pending":
-        await q.answer("این مرحله دیگر فعال نیست.", show_alert=True)
+        await _expire_stale_deal_button(q, "این مرحله دیگر فعال نیست.")
         return
     buyer_id = int(gate["buyer_telegram_id"])
     seller_id = int(gate["seller_telegram_id"])
@@ -5854,8 +6623,7 @@ async def _handle_admin_decision(
     q = update.callback_query
     if not q or not q.from_user:
         return
-    if q.from_user.id not in set(ADMIN_IDS or []):
-        await q.answer("فقط ادمین.", show_alert=True)
+    if not await _require_full_deal_admin(q):
         return
     gate = deal_gate_get(offer_id)
     if not gate:
@@ -5886,11 +6654,31 @@ async def _handle_admin_decision(
             pass
         return
 
-    if action == "react":
+    if action in {"react", "reactok"}:
+        if not await _admin_sensitive_confirmation(
+            context,
+            q,
+            action="reactivate",
+            offer_id=offer_id,
+            confirm_data=f"adm|dg|reactok|{offer_id}",
+            prompt="✅ تأیید نهایی فعال‌سازی مجدد",
+            is_confirmation=action == "reactok",
+        ):
+            return
         await _reactivate_advert(context, offer_id, gate, row, q)
         return
 
-    if action == "close":
+    if action in {"close", "closeok"}:
+        if not await _admin_sensitive_confirmation(
+            context,
+            q,
+            action="close",
+            offer_id=offer_id,
+            confirm_data=f"adm|dg|closeok|{offer_id}",
+            prompt="✅ تأیید نهایی بستن معامله",
+            is_confirmation=action == "closeok",
+        ):
+            return
         await _close_deal(context, offer_id, gate, row, q)
         return
 
@@ -5916,6 +6704,57 @@ async def _purge_gate_ui(
     )
 
 
+async def _replace_admin_deal_messages_with_status(
+    bot,
+    *,
+    gate: dict,
+    text: str,
+) -> None:
+    """Replace every stored admin deal card and remove its now-stale album."""
+    stored = _parse_admin_notify_mids(gate)
+    album_mids = _parse_admin_album_mids(gate)
+    chat_ids = set(stored) | set(album_mids)
+    for chat_id in chat_ids:
+        text_mid = stored.get(int(chat_id))
+        await _delete_all_admin_album_messages_for_chat(
+            bot,
+            chat_id=int(chat_id),
+            gate=gate,
+            text_mid=text_mid,
+            extra_mids=album_mids.get(int(chat_id)),
+        )
+        if text_mid:
+            try:
+                await bot.edit_message_text(
+                    chat_id=int(chat_id),
+                    message_id=int(text_mid),
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    reply_markup=None,
+                )
+                continue
+            except Exception:
+                logger.exception(
+                    "deal_gate: admin terminal status edit failed chat=%s offer=%s",
+                    chat_id,
+                    gate.get("offer_id"),
+                )
+        try:
+            await bot.send_message(
+                chat_id=int(chat_id),
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            logger.exception(
+                "deal_gate: admin terminal status send failed chat=%s offer=%s",
+                chat_id,
+                gate.get("offer_id"),
+            )
+
+
 async def _reactivate_advert(
     context: ContextTypes.DEFAULT_TYPE,
     offer_id: int,
@@ -5926,30 +6765,44 @@ async def _reactivate_advert(
     aid = int(row["advert_rowid"])
     buyer_id = int(gate["buyer_telegram_id"])
     seller_id = int(gate["seller_telegram_id"])
-    update_advert_offer_status(offer_id, "gate_aborted")
-    update_euro_advert_status(aid, "فعال")
+    seq = int(row.get("seq_in_advert") or offer_id)
+    if not deal_gate_archive_and_reactivate(offer_id, aid):
+        await q.answer("وضعیت معامله هم‌زمان تغییر کرد.", show_alert=True)
+        return
     _log(offer_id, "ادمین: فعال‌سازی مجدد آگهی", from_role="admin")
     await _purge_gate_ui(context, gate, offer_id)
     _cancel_gate_jobs(context, offer_id)
-    deal_gate_delete(offer_id)
     from handlers.offers import refresh_advert_channel_post
 
     await refresh_advert_channel_post(context.bot, aid)
     note = (
-        f"{_RTL}🔄 ادمین آگهی <b>{aid}</b> را دوباره فعال کرد.\n"
+        f"{_RTL}🔄 <b>معامله لغو و آگهی دوباره فعال شد</b>\n\n"
+        f"{_RTL}آگهی <b>{aid}</b> · پیشنهاد <b>{seq}</b>\n"
+        f"{_RTL}کد معامله <code>{offer_id}</code>\n\n"
         f"{_RTL}تأیید نهایی قبلی لغو شد؛ می‌توانید پیشنهاد جدید دهید."
     )
-    for uid in (buyer_id, seller_id):
+    await _replace_admin_deal_messages_with_status(
+        context.bot,
+        gate=gate,
+        text=note,
+    )
+    for uid, party in ((buyer_id, "buyer"), (seller_id, "seller")):
         if uid:
-            try:
-                await context.bot.send_message(uid, note, parse_mode=ParseMode.HTML)
-            except Exception:
-                pass
+            await _enqueue_and_deliver_deal_message(
+                context.bot,
+                offer_id=offer_id,
+                chat_id=uid,
+                party=party,
+                tag="وضعیت: فعال‌سازی مجدد آگهی",
+                payload_type="text",
+                payload={"body_html": note},
+                dedupe_key=f"deal_reactivated:{offer_id}:{uid}",
+            )
     await q.answer("آگهی فعال شد.")
     try:
         if q.message:
             await q.message.edit_text(
-                f"{_RTL}✅ آگهی {aid} دوباره فعال شد.",
+                note,
                 parse_mode=ParseMode.HTML,
             )
     except Exception:
@@ -5964,18 +6817,19 @@ async def _finalize_deal_close(
     *,
     closed_by: str = "admin",
     answer_query=None,
+    persist_close: bool = True,
 ) -> None:
     aid = int(row["advert_rowid"])
     buyer_id = int(gate["buyer_telegram_id"])
     seller_id = int(gate["seller_telegram_id"])
-    update_advert_offer_status(offer_id, "gate_closed")
-    update_euro_advert_status(aid, "بسته")
-    await _set_deal_gate_stage(
+    if persist_close and not deal_gate_close_atomic(offer_id, aid):
+        if answer_query:
+            await answer_query.answer("وضعیت معامله هم‌زمان تغییر کرد.", show_alert=True)
+        return
+    await _refresh_deal_channel_status(
         context,
+        aid,
         offer_id=offer_id,
-        advert_rowid=aid,
-        buyer_telegram_id=buyer_id,
-        seller_telegram_id=seller_id,
         gate_status="closed",
     )
     who = "فروشنده" if closed_by == "seller" else "ادمین"
@@ -5983,15 +6837,24 @@ async def _finalize_deal_close(
     cancel_seller_stom_close_reminder(context.application, int(offer_id))
     await _purge_gate_ui(context, gate, offer_id)
     _cancel_gate_jobs(context, offer_id)
-    from utils.deal_milestones import notify_deal_closed_parties
-
-    await notify_deal_closed_parties(
-        context.bot,
-        offer_id=offer_id,
-        gate=gate,
-        aid=aid,
-        closed_by_fa=who,
+    seq = int(row.get("seq_in_advert") or offer_id)
+    close_note = (
+        f"{_RTL}⛔ <b>معامله بسته شد</b>\n\n"
+        f"{_RTL}آگهی <b>{aid}</b> · پیشنهاد <b>{seq}</b>\n"
+        f"{_RTL}این معامله و آگهی توسط <b>{html_module.escape(who)}</b> بسته شد."
     )
+    for uid, party in ((buyer_id, "buyer"), (seller_id, "seller")):
+        if uid:
+            await _enqueue_and_deliver_deal_message(
+                context.bot,
+                offer_id=offer_id,
+                chat_id=uid,
+                party=party,
+                tag="وضعیت: بستن معامله",
+                payload_type="text",
+                payload={"body_html": close_note},
+                dedupe_key=f"deal_closed:{offer_id}:{uid}",
+            )
     if closed_by == "seller":
         from utils.deal_milestones import notify_admins_deal_closed_by_seller
 
@@ -6069,7 +6932,12 @@ async def _handle_seller_toman_settled_callback(
         await q.answer("پیشنهاد پیدا نشد.", show_alert=True)
         return
     now = int(time.time())
-    if not deal_gate_mark_seller_toman_settled(oid, settled_at=now):
+    if not deal_gate_settle_and_close_atomic(
+        oid,
+        int(row["advert_rowid"]),
+        settled_at=now,
+        require_receipt=True,
+    ):
         await q.answer(
             "این معامله هم‌زمان تأیید شد یا دیگر در مرحله پایان نیست.",
             show_alert=True,
@@ -6077,13 +6945,13 @@ async def _handle_seller_toman_settled_callback(
         return
     gate = deal_gate_get(oid) or gate
     await _finalize_deal_close(
-        context, oid, gate, row, closed_by="seller", answer_query=q
-    )
-    await _show_user_main_menu(
         context,
-        seller_id,
-        text=f"{_RTL}✅ معامله بسته شد — ممنون از همکاری شما.",
-        parse_mode=ParseMode.HTML,
+        oid,
+        gate,
+        row,
+        closed_by="seller",
+        answer_query=q,
+        persist_close=False,
     )
 
 
@@ -6548,13 +7416,15 @@ async def _handle_account_confirm_callback(
     uid = q.from_user.id
     pending = context.user_data.get(_ACC_PENDING_KEY)
     if not isinstance(pending, dict) or int(pending.get("offer_id") or 0) != offer_id:
-        await q.answer("این پیش‌نمایش منقضی شده — دوباره عکس بفرستید.", show_alert=True)
+        await _expire_stale_deal_button(
+            q, "این پیش‌نمایش منقضی شده — دوباره عکس بفرستید."
+        )
         return
 
     gate = deal_gate_get(offer_id)
     if not gate or (gate.get("gate_status") or "").strip().lower() != "accounts":
         _clear_account_pending(context)
-        await q.answer("این مرحله دیگر فعال نیست.", show_alert=True)
+        await _expire_stale_deal_button(q, "این مرحله دیگر فعال نیست.")
         return
 
     buyer_id = int(gate["buyer_telegram_id"])
@@ -6567,7 +7437,7 @@ async def _handle_account_confirm_callback(
     key = "buyer_accounts_text" if is_buyer else "seller_accounts_text"
     if (gate.get(key) or "").strip():
         _clear_account_pending(context)
-        await q.answer("حساب شما قبلاً ثبت شده.", show_alert=True)
+        await _expire_stale_deal_button(q, "حساب شما قبلاً ثبت شده.")
         return
 
     if action == "cancel":

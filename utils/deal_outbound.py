@@ -220,17 +220,25 @@ async def deal_admin_replay_outbound(
         if not body:
             body = "—"
         try:
-            if mt == "photo" and (row.get("photo_file_id") or "").strip():
+            if mt in {"photo", "document"} and (row.get("photo_file_id") or "").strip():
                 cap = _caption_fit(
                     meta,
                     (row.get("caption_html") or row.get("body_html") or ""),
                 )
-                await bot.send_photo(
-                    admin_chat_id,
-                    (row.get("photo_file_id") or "").strip(),
-                    caption=cap,
-                    parse_mode=ParseMode.HTML,
-                )
+                if mt == "document":
+                    await bot.send_document(
+                        admin_chat_id,
+                        (row.get("photo_file_id") or "").strip(),
+                        caption=cap,
+                        parse_mode=ParseMode.HTML,
+                    )
+                else:
+                    await bot.send_photo(
+                        admin_chat_id,
+                        (row.get("photo_file_id") or "").strip(),
+                        caption=cap,
+                        parse_mode=ParseMode.HTML,
+                    )
             else:
                 await bot.send_message(
                     admin_chat_id,
