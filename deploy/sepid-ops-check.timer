@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Sepid operational health every five minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=sepid-ops-check.service
+
+[Install]
+WantedBy=timers.target

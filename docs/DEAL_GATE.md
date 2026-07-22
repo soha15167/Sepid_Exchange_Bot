@@ -154,3 +154,33 @@ flowchart TB
 **EN:** After receipt upload, cancel, or confirm — `_show_user_main_menu`: `admin_home_inline_keyboard` for admins, `main_menu_inline_keyboard` for users.
 
 **FA:** پس از فیش/انصراف/تأیید — منوی اصلی؛ ادمین پنل admin_home، کاربران منوی عادی. پس از آپلود فیش ادمین، پیام جداگانهٔ «به آلبوم اضافه شد» ارسال نمی‌شود — فقط sync پیام اصلی.
+
+## Reliability and notification policy | پایداری و سیاست اعلان
+
+- Critical seller-receipt and terminal status messages use `deal_delivery_queue` with a unique
+  `dedupe_key`. Failed Telegram deliveries are retried silently with exponential backoff.
+- A seller Toman receipt is added to `seller_toman_admin_log` and enables final confirmation only
+  after Telegram accepts the receipt. Queue completion and receipt recording share one DB commit.
+- Close updates the offer, advert, and gate status in one transaction. Reactivation archives the
+  complete gate in `offer_deal_gate_archive` before deleting the active gate.
+- Repeated callbacks and repeated Telegram updates reuse the same delivery/source key and do not
+  create duplicate receipts or user messages.
+- Users receive only essential financial/status messages. The seller receives at most one delayed
+  final-confirmation reminder; retry failures and repair details remain admin-only.
+- `deal_gate_audit` reports invariant violations. `deal_gate_repair_safe` only repairs metadata and
+  never invents a payment or confirmation. Admins can run it with `adm|dgs|repair|{offer_id}`.
+- Financial callbacks are authorized against the persisted party and current stage. Clicking an
+  old button removes that stale keyboard instead of leaving a reusable action behind.
+- `adm|dgs|problems` is a passive admin-only work queue for stuck stages, failed delivery, and
+  state mismatches. It is evaluated only when opened and never sends user notifications.
+- Sensitive admin actions (payment overrides, close, reopen, and repair) require a fresh second
+  confirmation that expires after two minutes. Support operators configured with
+  `DEAL_SUPPORT_ADMIN_ID` remain read-only for financial actions.
+- Admin deal details include a chronological timeline and UTF-8 export. Receipt consistency
+  checks create admin-only warnings and never approve or reject a payment automatically.
+- Verified SQLite backups run every six hours. Financial artifacts from closed deals are redacted
+  after `DEAL_FINANCIAL_RETENTION_DAYS` while milestone history is preserved.
+- The passive operations-health page shows database integrity, delivery queue state, problem-deal
+  count, last verified backup, privacy cleanup, and process start time.
+- Critical delivery retries honor Telegram `RetryAfter`; concurrent settlement remains a
+  single-winner atomic transaction.

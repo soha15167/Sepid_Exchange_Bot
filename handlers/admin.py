@@ -2788,9 +2788,88 @@ async def admin_dashboard_callback(update: Update, context: ContextTypes.DEFAULT
 
     if action == "dgs":
         from handlers.deal_gate import (
+            admin_export_deal_timeline,
+            admin_show_deal_health,
             admin_show_deal_gate_detail,
             admin_show_deal_gate_list,
+            admin_show_deal_timeline,
+            admin_show_problem_deals,
         )
+
+        if len(parts) > 2 and parts[2] == "problems":
+            context.user_data["state"] = UserState.ADMIN_MENU.name
+            _persist_admin_wizard_state(admin_uid, context)
+            await admin_show_problem_deals(update, context)
+            return
+
+        if len(parts) > 2 and parts[2] == "health":
+            context.user_data["state"] = UserState.ADMIN_MENU.name
+            _persist_admin_wizard_state(admin_uid, context)
+            await admin_show_deal_health(update, context)
+            return
+
+        if len(parts) > 3 and parts[2] in {"timeline", "export"}:
+            try:
+                oid = int(parts[3])
+            except (TypeError, ValueError):
+                await query.answer("شناسه نامعتبر", show_alert=True)
+                return
+            if parts[2] == "timeline":
+                await admin_show_deal_timeline(update, context, oid)
+            else:
+                await admin_export_deal_timeline(update, context, oid)
+            return
+
+        if len(parts) > 3 and parts[2] in {"repair", "repairyes"}:
+            try:
+                oid = int(parts[3])
+            except (TypeError, ValueError):
+                await query.answer("شناسه نامعتبر", show_alert=True)
+                return
+            from database.db import deal_gate_audit, deal_gate_get, deal_gate_repair_safe
+            from handlers.deal_gate import (
+                _admin_sensitive_confirmation,
+                _require_full_deal_admin,
+                sync_deal_admin_notification,
+            )
+
+            if not await _require_full_deal_admin(query):
+                return
+            if not await _admin_sensitive_confirmation(
+                context,
+                query,
+                action="repair",
+                offer_id=oid,
+                confirm_data=f"adm|dgs|repairyes|{oid}",
+                prompt="✅ تأیید نهایی تعمیر امن",
+                is_confirmation=parts[2] == "repairyes",
+            ):
+                return
+
+            gate = deal_gate_get(oid)
+            if not gate:
+                await query.answer("معامله پیدا نشد", show_alert=True)
+                return
+            before = deal_gate_audit(oid)
+            after = deal_gate_repair_safe(oid)
+            gate = deal_gate_get(oid) or gate
+            status = (gate.get("gate_status") or "").strip().lower()
+            await sync_deal_admin_notification(
+                context.bot,
+                oid,
+                deal_complete=status in {"completed", "closed"},
+            )
+            if after:
+                result = "، ".join(after[:4])
+                await query.answer(
+                    f"بررسی شد؛ نیازمند تصمیم ادمین: {result}",
+                    show_alert=True,
+                )
+            elif before:
+                await query.answer("ناهماهنگی‌های امن اصلاح و پیام‌ها بازسازی شد", show_alert=True)
+            else:
+                await query.answer("وضعیت سالم است؛ پیام‌ها بازسازی شد", show_alert=True)
+            return
 
         if len(parts) > 3 and parts[2] == "resync":
             try:
@@ -2802,11 +2881,16 @@ async def admin_dashboard_callback(update: Update, context: ContextTypes.DEFAULT
             from handlers.deal_gate import sync_deal_admin_notification
 
             gate = deal_gate_get(oid)
-            if not gate or (gate.get("gate_status") or "").strip().lower() != "completed":
-                await query.answer("فقط برای معاملات تکمیل‌شده", show_alert=True)
+            if not gate:
+                await query.answer("معامله پیدا نشد", show_alert=True)
                 return
-            await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
-            await query.answer("پیام ادمین بروزرسانی شد", show_alert=True)
+            status = (gate.get("gate_status") or "").strip().lower()
+            await sync_deal_admin_notification(
+                context.bot,
+                oid,
+                deal_complete=status in {"completed", "closed"},
+            )
+            await query.answer("پیام کامل معامله برای ادمین نمایش داده شد", show_alert=True)
             return
 
         if len(parts) > 3 and parts[2] in ("bacc", "sacc"):
@@ -2814,6 +2898,10 @@ async def admin_dashboard_callback(update: Update, context: ContextTypes.DEFAULT
                 oid = int(parts[3])
             except (TypeError, ValueError):
                 await query.answer("شناسه نامعتبر", show_alert=True)
+                return
+            from handlers.deal_gate import _require_full_deal_admin
+
+            if not await _require_full_deal_admin(query):
                 return
             party = "buyer" if parts[2] == "bacc" else "seller"
             party_fa = "خریدار یورو" if party == "buyer" else "فروشنده یورو"

@@ -76,6 +76,9 @@ def _env_int_id_list(*keys: str) -> list[int]:
 
 
 ADMIN_IDS = _env_int_id_list("ADMIN_USER_ID")
+# Optional subset of ADMIN_IDS with read-only deal operations. They can inspect,
+# resync, view health, and export timelines, but cannot approve or mutate money.
+DEAL_SUPPORT_ADMIN_IDS = _env_int_id_list("DEAL_SUPPORT_ADMIN_ID")
 # اختیاری: گروه/چت اضافه برای اعلان معامله (مثلاً گروه ادمین‌ها)
 ADMIN_NOTIFY_CHAT_IDS = _env_int_id_list(
     "DEAL_ADMIN_NOTIFY_CHAT_ID", "ADMIN_NOTIFY_CHAT_ID"
@@ -152,6 +155,27 @@ BOT_RESTART_COMMAND = (os.getenv("BOT_RESTART_COMMAND") or "").strip()
 # Broadcast fresh menu before server restart (0 = off) / منوی تازه قبل از ری‌استارت
 _RESTART_BROADCAST_RAW = (os.getenv("BOT_RESTART_BROADCAST_MENU") or "1").strip().lower()
 BOT_RESTART_BROADCAST_MENU = _RESTART_BROADCAST_RAW not in ("0", "false", "no", "off")
+
+try:
+    DEAL_FINANCIAL_RETENTION_DAYS = max(
+        30, int((os.getenv("DEAL_FINANCIAL_RETENTION_DAYS") or "180").strip())
+    )
+except ValueError:
+    DEAL_FINANCIAL_RETENTION_DAYS = 180
+DEAL_BACKUP_DIR = (os.getenv("DEAL_BACKUP_DIR") or "backups").strip()
+DEAL_RECONCILIATION_DIR = (
+    os.getenv("DEAL_RECONCILIATION_DIR") or "reports"
+).strip()
+DEAL_OFFSITE_BACKUP_DIR = (os.getenv("DEAL_OFFSITE_BACKUP_DIR") or "").strip()
+DEAL_BACKUP_ENCRYPTION_KEY = (
+    os.getenv("DEAL_BACKUP_ENCRYPTION_KEY") or ""
+).strip()
+try:
+    DEAL_BACKUP_MAX_AGE_HOURS = max(
+        1, int((os.getenv("DEAL_BACKUP_MAX_AGE_HOURS") or "12").strip())
+    )
+except ValueError:
+    DEAL_BACKUP_MAX_AGE_HOURS = 12
 
 # Admin username shown after offer accepted / آیدی ادمین پس از تأیید پیشنهاد
 DEAL_NEXT_STEPS_ADMIN = (os.getenv("DEAL_NEXT_STEPS_ADMIN") or "").strip()

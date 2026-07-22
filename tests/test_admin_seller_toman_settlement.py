@@ -77,7 +77,11 @@ class TestAdminSellerTomanSettlement(unittest.IsolatedAsyncioTestCase):
             "seller_toman_close_enabled_at": 123,
             "seller_toman_settled_at": 0,
         }
-        settled_gate = {**gate, "seller_toman_settled_at": 456}
+        settled_gate = {
+            **gate,
+            "gate_status": "closed",
+            "seller_toman_settled_at": 456,
+        }
         query = SimpleNamespace(
             from_user=SimpleNamespace(id=999),
             data="adm|stomset|41",
@@ -89,6 +93,11 @@ class TestAdminSellerTomanSettlement(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(deal_gate, "ADMIN_IDS", [999]),
+            patch.object(
+                deal_gate,
+                "_admin_sensitive_confirmation",
+                new=AsyncMock(return_value=True),
+            ),
             patch.object(
                 deal_gate,
                 "deal_gate_get",
@@ -106,7 +115,7 @@ class TestAdminSellerTomanSettlement(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(
                 deal_gate,
-                "deal_gate_mark_seller_toman_settled",
+                "deal_gate_settle_and_close_atomic",
                 return_value=True,
             ) as mark_settled,
             patch.object(deal_gate, "_log") as log,
@@ -120,7 +129,7 @@ class TestAdminSellerTomanSettlement(unittest.IsolatedAsyncioTestCase):
                 update, context
             )
 
-        self.assertEqual(mark_settled.call_args.args, (41,))
+        self.assertEqual(mark_settled.call_args.args, (41, 77))
         self.assertGreater(mark_settled.call_args.kwargs["settled_at"], 0)
         self.assertFalse(mark_settled.call_args.kwargs["require_receipt"])
         log.assert_called_once_with(
@@ -135,6 +144,7 @@ class TestAdminSellerTomanSettlement(unittest.IsolatedAsyncioTestCase):
             {"advert_rowid": 77},
             closed_by="admin",
             answer_query=query,
+            persist_close=False,
         )
 
     async def test_admin_can_confirm_without_recorded_receipt_at_final_stage(self):
@@ -156,10 +166,19 @@ class TestAdminSellerTomanSettlement(unittest.IsolatedAsyncioTestCase):
             answer=AsyncMock(),
         )
         context = SimpleNamespace(bot=object())
-        settled_gate = {**gate, "seller_toman_settled_at": 456}
+        settled_gate = {
+            **gate,
+            "gate_status": "closed",
+            "seller_toman_settled_at": 456,
+        }
 
         with (
             patch.object(deal_gate, "ADMIN_IDS", [999]),
+            patch.object(
+                deal_gate,
+                "_admin_sensitive_confirmation",
+                new=AsyncMock(return_value=True),
+            ),
             patch.object(
                 deal_gate,
                 "deal_gate_get",
@@ -176,7 +195,7 @@ class TestAdminSellerTomanSettlement(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(
                 deal_gate,
-                "deal_gate_mark_seller_toman_settled",
+                "deal_gate_settle_and_close_atomic",
                 return_value=True,
             ) as mark_settled,
             patch.object(
@@ -200,7 +219,7 @@ class TestAdminSellerTomanSettlement(unittest.IsolatedAsyncioTestCase):
                 SimpleNamespace(callback_query=query), context
             )
 
-        mark_settled.assert_called_once()
+        self.assertEqual(mark_settled.call_args.args, (41, 77))
         self.assertFalse(mark_settled.call_args.kwargs["require_receipt"])
         finalize.assert_awaited_once_with(
             context,
@@ -209,6 +228,7 @@ class TestAdminSellerTomanSettlement(unittest.IsolatedAsyncioTestCase):
             {"advert_rowid": 77},
             closed_by="admin",
             answer_query=query,
+            persist_close=False,
         )
 
 
