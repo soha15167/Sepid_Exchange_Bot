@@ -2130,6 +2130,42 @@ def _receipt_fingerprint(raw: str, file_unique_id: str = "") -> str:
     return f"text:{hashlib.sha256(normalized.encode('utf-8')).hexdigest()}" if normalized else ""
 
 
+_DEAL_RECEIPT_FEE_MAX_RIAL = 1_000_000
+_DEAL_RECEIPT_FEE_MAX_BPS = 100  # 1%
+
+
+def _deal_bound_receipt_warnings(payload: dict) -> list[str]:
+    """Ignore only the expected buyer-outgoing/panel-incoming direction warning."""
+    warnings = list(payload.get("_recognition_warnings") or [])
+    if str(payload.get("_detected_direction") or "").strip().lower() == "out":
+        warnings = [
+            warning
+            for warning in warnings
+            if not str(warning).startswith("جهت روی رسید")
+        ]
+    return list(dict.fromkeys(str(item) for item in warnings if item))
+
+
+def _deal_bound_receipt_amount(
+    amount_rial: int, remaining_rial: int, *, detected_direction: str
+) -> tuple[int, bool]:
+    """Remove a small outgoing-bank fee from a deal-bound incoming amount."""
+    amount = int(amount_rial or 0)
+    remaining = int(remaining_rial or 0)
+    if (
+        str(detected_direction or "").strip().lower() != "out"
+        or amount <= remaining
+        or remaining <= 0
+    ):
+        return amount, False
+    excess = amount - remaining
+    within_absolute_cap = excess <= _DEAL_RECEIPT_FEE_MAX_RIAL
+    within_relative_cap = excess * 10_000 <= remaining * _DEAL_RECEIPT_FEE_MAX_BPS
+    if within_absolute_cap and within_relative_cap:
+        return remaining, True
+    return amount, False
+
+
 async def _download_deal_receipt(
     bot, file_id: str, *, entry_type: str
 ) -> str:
@@ -2215,6 +2251,14 @@ async def _auto_account_buyer_receipt(
             and (item.get("accounting_status") or "") == "submitted"
         )
         remaining_before = max(0, expected_rial - submitted_total)
+        detected_direction = str(payload.get("_detected_direction") or "").strip().lower()
+        amount_rial, fee_adjusted = _deal_bound_receipt_amount(
+            amount_rial,
+            remaining_before,
+            detected_direction=detected_direction,
+        )
+        if fee_adjusted:
+            payload["iran_amount"] = amount_rial
         currency = str(payload.get("_receipt_currency") or "").strip().lower()
         if not currency or currency == "unknown":
             currency = _receipt_text_currency(raw)
@@ -2234,7 +2278,7 @@ async def _auto_account_buyer_receipt(
             and (item.get("accounting_status") or "") in ("submitted", "processing")
             for index, item in enumerate(deal_gate_buyer_receipt_list(oid))
         )
-        warnings = list(payload.get("_recognition_warnings") or [])
+        warnings = _deal_bound_receipt_warnings(payload)
         if duplicate:
             deal_gate_update_buyer_receipt(
                 oid,
@@ -2256,8 +2300,6 @@ async def _auto_account_buyer_receipt(
             warnings.append("مبلغ فیش خوانده نشد")
         if not (payload.get("bank_name") or "").strip():
             warnings.append("بانک حساب مقصد خوانده نشد")
-        if payload.get("_recognition_blocking"):
-            warnings.extend(payload.get("_recognition_warnings") or [])
         warnings = list(dict.fromkeys(str(item) for item in warnings if item))
 
         metadata = {
@@ -2272,6 +2314,7 @@ async def _auto_account_buyer_receipt(
             "recognition_warnings": warnings,
             "receipt_currency": currency,
             "receipt_fingerprint": fingerprint,
+            "fee_adjusted_to_remaining": fee_adjusted,
         }
         if warnings:
             deal_gate_update_buyer_receipt(
