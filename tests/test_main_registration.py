@@ -65,7 +65,7 @@ class MainRegistrationTests(unittest.TestCase):
         self.assertTrue(
             {
                 "^main_services$",
-                r"^(deal\||adm\|(dg|rcptok|rcptno|rcptchk)\|)",
+                r"^(deal\||adm\|(dg|rcptok|rcptno|rcptchk|rcptedit|rcptfld|rcptedcancel)\|)",
                 r"^adm\|stomset\|",
                 r"^adm\|",
                 r"^offer_\d+$",
