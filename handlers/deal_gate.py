@@ -76,6 +76,7 @@ from database.db import (
     deal_gate_claim_buyer_receipt_submission,
     deal_gate_has_submitted_buyer_receipt,
     deal_gate_reject_buyer_receipt,
+    deal_gate_reopen_submitted_buyer_receipt,
     deal_gate_update_buyer_receipt,
     deal_gate_confirm_seller_receipt_buyer,
     deal_gate_seller_receipt_list,
@@ -1680,6 +1681,15 @@ def deal_admin_party_proxy_rows(
                     ),
                 ]
             )
+        elif status == "submitted":
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "🔄 بررسی سایت و بازخوانی فیش",
+                        callback_data=f"adm|rcptchk|{oid}|{receipt_index}",
+                    )
+                ]
+            )
         if sr != "yes":
             rows.append(
                 [
@@ -2538,6 +2548,74 @@ async def _handle_admin_receipt_review(
         _receipt_accounting_log(offer_id, "ثبت سایت پس از تایید ادمین ناموفق بود", from_role="system")
         await q.answer("ثبت سایت ناموفق بود؛ دوباره قابل تلاش است.", show_alert=True)
     await sync_deal_admin_notification(context.bot, offer_id, deal_complete=True)
+
+
+async def _handle_admin_receipt_recheck(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    offer_id: int,
+    receipt_index: int,
+) -> None:
+    """Verify the panel first; reopen and OCR only when its record is absent."""
+    q = update.callback_query
+    if not q or not await _require_full_deal_admin(q):
+        return
+    gate = deal_gate_get(offer_id)
+    items = deal_gate_buyer_receipt_list(offer_id)
+    if not gate or receipt_index < 0 or receipt_index >= len(items):
+        await q.answer("فیش پیدا نشد.", show_alert=True)
+        return
+    item = items[receipt_index]
+    if (item.get("accounting_status") or "") != "submitted":
+        await q.answer("این فیش در وضعیت ثبت‌شده نیست.", show_alert=True)
+        return
+    from utils.iran_panel_client import get_transactions
+    from utils.operational_readiness import _ledger_amount, _ledger_direction
+
+    ok, result = await asyncio.to_thread(
+        get_transactions, base_url=IRAN_PANEL_BASE_URL
+    )
+    if not ok or not isinstance(result, list):
+        await q.answer("ارتباط با سایت برقرار نشد؛ وضعیت فیش تغییر نکرد.", show_alert=True)
+        return
+    expected = int(item.get("amount_rial") or 0)
+    references = {
+        str(int(offer_id)),
+        str(int(gate.get("advert_rowid") or 0)),
+    }
+    found = False
+    for transaction in result:
+        if _ledger_direction(transaction) != "in":
+            continue
+        description = str(transaction.get("description") or "")
+        has_reference = any(
+            reference and re.search(rf"(?<!\d){re.escape(reference)}(?!\d)", description)
+            for reference in references
+        )
+        amount = _ledger_amount(transaction)
+        if has_reference and amount in {expected, expected // 10 if expected else 0}:
+            found = True
+            break
+    if found:
+        await q.answer("فیش هنوز در سایت وجود دارد؛ بازخوانی انجام نشد.", show_alert=True)
+        return
+    reopened = deal_gate_reopen_submitted_buyer_receipt(
+        offer_id, receipt_index, verified_absent_at=int(time.time())
+    )
+    if not reopened:
+        await q.answer("وضعیت فیش هم‌زمان تغییر کرد؛ دوباره تلاش کنید.", show_alert=True)
+        return
+    await q.answer("رکورد در سایت نبود؛ فیش دوباره خوانده می‌شود.", show_alert=True)
+    await _auto_account_buyer_receipt(
+        context,
+        gate=gate,
+        receipt_index=receipt_index,
+        entry_type=reopened.get("type") or "photo",
+        text=reopened.get("text") or "",
+        file_id=reopened.get("file_id") or "",
+        file_unique_id=reopened.get("file_unique_id") or "",
+    )
 
 
 def _receipt_accounting_log(offer_id: int, text: str, *, from_role: str) -> None:
@@ -6862,6 +6940,15 @@ async def deal_gate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _handle_admin_receipt_review(
             update, context, offer_id=callback_offer_id,
             receipt_index=receipt_index, approve=parts[1] == "rcptok",
+        )
+    elif parts[0] == "adm" and parts[1] == "rcptchk" and len(parts) >= 4:
+        try:
+            receipt_index = int(parts[3])
+        except (TypeError, ValueError):
+            await q.answer("دکمه نامعتبر است.", show_alert=True)
+            return
+        await _handle_admin_receipt_recheck(
+            update, context, offer_id=callback_offer_id, receipt_index=receipt_index
         )
 
 

@@ -3122,6 +3122,48 @@ def deal_gate_reject_buyer_receipt(offer_id: int, receipt_index: int) -> dict | 
         return dict(item)
 
 
+def deal_gate_reopen_submitted_buyer_receipt(
+    offer_id: int, receipt_index: int, *, verified_absent_at: int
+) -> dict | None:
+    """Reopen a submitted receipt only after an external panel absence check."""
+    import json
+
+    oid, idx = int(offer_id), int(receipt_index)
+    verified_at = int(verified_absent_at or 0)
+    if verified_at <= 0:
+        return None
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT buyer_receipt_log FROM offer_deal_gates WHERE offer_id = ?", (oid,)
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            items = json.loads(row["buyer_receipt_log"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(items, list) or idx < 0 or idx >= len(items):
+            return None
+        item = items[idx] if isinstance(items[idx], dict) else {}
+        if (item.get("accounting_status") or "") != "submitted":
+            return None
+        item.update(
+            accounting_status="pending",
+            panel_submitted_at=0,
+            panel_error="",
+            panel_absence_verified_at=verified_at,
+        )
+        items[idx] = item
+        conn.execute(
+            "UPDATE offer_deal_gates SET buyer_receipt_log = ? WHERE offer_id = ?",
+            (json.dumps(items, ensure_ascii=False), oid),
+        )
+        conn.commit()
+        return dict(item)
+
+
 def _deal_gate_seller_receipt_list_raw(gate: dict | None) -> list:
     import json
 

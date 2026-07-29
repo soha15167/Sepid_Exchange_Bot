@@ -837,7 +837,7 @@ def main():
     application.add_handler(MessageHandler(_iran_txn, iran_panel_sync_router), group=7)
     # Admin panel: run in later group to avoid hijacking normal flows
     application.add_handler(CallbackQueryHandler(iran_panel_tx_callback, pattern=r"^tx\|"))
-    application.add_handler(CallbackQueryHandler(deal_gate_callback, pattern=r"^(deal\||adm\|(dg|rcptok|rcptno)\|)"))
+    application.add_handler(CallbackQueryHandler(deal_gate_callback, pattern=r"^(deal\||adm\|(dg|rcptok|rcptno|rcptchk)\|)"))
     application.add_handler(MessageHandler(_private_text, admin_router), group=8)
 
     # تایید نهایی آگهی
