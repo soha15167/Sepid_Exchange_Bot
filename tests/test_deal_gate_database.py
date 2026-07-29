@@ -106,6 +106,37 @@ class DealGateDatabaseTests(unittest.TestCase):
         self.assertEqual(len(first), 1)
         self.assertEqual(second, first)
 
+    def test_buyer_receipt_file_is_idempotent_and_accounting_metadata_updates(self):
+        self._create_gate()
+        first = db.deal_gate_append_buyer_receipt(
+            101,
+            entry_type="photo",
+            file_id="telegram-file-a",
+            file_unique_id="same-photo",
+            source_message_id=1,
+        )
+        second = db.deal_gate_append_buyer_receipt(
+            101,
+            entry_type="photo",
+            file_id="telegram-file-b",
+            file_unique_id="same-photo",
+            source_message_id=2,
+        )
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 1)
+        updated = db.deal_gate_update_buyer_receipt(
+            101,
+            0,
+            accounting_status="submitted",
+            amount_rial=309_575_000,
+            expected_rial=309_575_000,
+            bank_name="سامان",
+        )
+        self.assertEqual(updated["accounting_status"], "submitted")
+        stored = db.deal_gate_buyer_receipt_list(101)[0]
+        self.assertEqual(stored["amount_rial"], 309_575_000)
+        self.assertEqual(stored["bank_name"], "سامان")
+
     def test_delivery_queue_deduplicates_and_retries(self):
         first = db.deal_delivery_enqueue(
             offer_id=101,

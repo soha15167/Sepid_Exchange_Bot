@@ -55,33 +55,56 @@ def _vision_prompt(mode: str) -> str:
     )
     if mode == "out":
         name_fields = """
-  "recipient_name": "withdrawer / account holder at TOP (صاحب حساب — NOT انتقال دهنده)",
-  "sender_name": "only «انتقال دهنده» if shown, else null",
-  "depositor_name": "same as recipient_name (panel: نام برداشت‌کننده)","""
+  "recipient_name": "destination/payee name only",
+  "sender_name": "source/payer name if explicitly shown",
+  "depositor_name": "same as recipient_name: destination account holder only","""
     else:
         name_fields = """
-  "depositor_name": "depositor / واریزکننده name","""
+  "sender_name": "source/payer/depositor name",
+  "recipient_name": "credited account owner if explicitly shown",
+  "depositor_name": "same as sender_name, never the credited account owner","""
 
-    return f"""You read Iranian bank app receipt screenshots (Baam/BMI, Blu, Saman logos, dark/light UI).
+    bank_rule = (
+        "bank_name is the debited SOURCE bank; dest_bank is the receiving bank; identify both independently from their receipt sections, logos, IBANs, or card BINs"
+        if mode == "out"
+        else "bank_name is the credited DESTINATION bank; dest_bank may be null"
+    )
+
+    return f"""You read receipts, transaction details, and account activity screenshots from ANY Iranian bank or payment app, in any layout or theme.
 Transaction: {kind_en}.
 
 Return ONLY valid JSON:
 {{
-  "iran_amount": integer Rials, no commas (e.g. 58800000 for «58,800,000 ریال» — do NOT add extra zeros),
+  "iran_amount": integer Rials, no commas (convert printed Toman to Rial by multiplying once by 10),
   "jdate": "YYYY/MM/DD from «زمان» line; {month_hint}",
-  "bank_name": "SOURCE bank from logo/app (Baam/bmi.ir → ملی, Blu app → بلو)",
-  "dest_bank": "DESTINATION bank from card logo or «به کارت» BIN (621986→سامان, 603799→ملی) or null",{name_fields}
-  "transfer_type": "e.g. کارت به کارت for Baam card transfer",
-  "description": null
+  "bank_name": "{bank_rule}",
+  "dest_bank": "destination bank from text, a recognizable logo, IBAN, or card BIN, or null",{name_fields}
+  "transfer_type": "exact Persian transaction type, or unknown",
+  "description": null,
+  "detected_direction": "in|out|unknown",
+  "status": "موفق|ناموفق|نامشخص",
+  "currency": "rial|toman|unknown",
+  "confidence": 0-100
 }}
 
 Rules:
+- If the receipt shows both «برداشت از حساب» and «واریز به حساب» within the
+  same bank, transfer_type is «حساب به حساب» (not a branded page title such as
+  «انتقال وجه ملت») and dest_bank equals bank_name.
 - iran_amount: «مبلغ» / «ریال» line ONLY — NOT tracking number.
 - Do NOT add trailing zero (58800000 not 588000000).
-- Baam (baam.bmi.ir) receipts: bank_name=ملی, transfer_type=کارت به کارت; dest from «به کارت» logo/BIN.
-- dest_bank must be bank name (سامان، ملت…) — never the word «کارت» alone.
+- {bank_rule}.
+- Recognize all transaction types: کارت به کارت، پایا، ساتنا، پل، حساب به حساب،
+  سپرده به سپرده، انتقال شبا، نقدی، خودپرداز، خرید، پرداخت اینترنتی، قبض، چک،
+  حقوق، سود، کارمزد، برگشت وجه، برداشت مستقیم, and other visible types.
+- Bank names must come from explicit text, a confidently recognized logo, IBAN bank code,
+  or card BIN. Never default to a common bank.
+- A recognizable destination logo is valid evidence even if its name is not printed.
+- Iranian IBAN code 016 identifies بانک کشاورزی.
+- dest_bank must be a bank name — never the word «کارت» alone.
 - jdate: month from Persian month NAME (خرداد → 03), not the day number.
-- For txout: recipient_name is the prominent top name; sender is انتقال دهنده only.
+- Determine direction and status from visible Persian labels; do not assume them from the requested command.
+- For account statements, extract only the selected or clearly highlighted transaction row.
 - Use null if unsure."""
 
 

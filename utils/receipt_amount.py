@@ -80,10 +80,15 @@ def _fix_amount_extra_zero(value: int) -> int:
 
 
 def normalize_transfer_amount(value: int, token: str = "") -> int:
+    """Validate a Rial amount without silently changing its decimal magnitude.
+
+    Ambiguous OCR values must be reviewed or corroborated, never divided or
+    multiplied automatically; doing so can accidentally convert Rial to Toman.
+    """
     tok = normalize_digits(token or "")
     for sep in "،٬﹐":
         tok = tok.replace(sep, ",")
-    v = _fix_amount_extra_zero(_fix_amount_missing_zero(int(value or 0)))
+    v = int(value or 0)
     if v >= _MIN_RECEIPT_RIAL and is_plausible_transfer_amount(v, tok or f"{v:,}"):
         return v
     return 0

@@ -126,10 +126,10 @@ def extract_names(text: str) -> dict[str, str]:
 
 def extract_status(text: str) -> str:
     low = (text or "").lower()
-    if any(x in low for x in ("موفق", "انجام شد", "successful", "تایید")):
-        return "موفق"
     if any(x in low for x in ("ناموفق", "رد", "failed", "لغو")):
         return "ناموفق"
+    if any(x in low for x in ("موفق", "انجام شد", "successful", "تایید")):
+        return "موفق"
     return ""
 
 
