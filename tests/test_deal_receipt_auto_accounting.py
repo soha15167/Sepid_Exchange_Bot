@@ -100,6 +100,17 @@ class BuyerReceiptAutoAccountingTests(unittest.IsolatedAsyncioTestCase):
             any("بیشتر" in warning for warning in self.items[0]["recognition_warnings"])
         )
 
+    async def test_outgoing_receipt_with_small_bank_fee_is_submitted_as_incoming(self):
+        post = await self._run(
+            "بانک مقصد: ملی\nمبلغ: ۱۰۰٬۵۰۰٬۰۰۰ ریال\n"
+            "تاریخ: ۱۴۰۵/۰۵/۰۱\nبرداشت از حساب",
+            expected_rial=100_000_000,
+        )
+        self.assertTrue(post.called)
+        self.assertEqual(self.items[0]["accounting_status"], "submitted")
+        self.assertEqual(self.items[0]["amount_rial"], 100_000_000)
+        self.assertTrue(self.items[0]["fee_adjusted_to_remaining"])
+
     async def test_ambiguous_partial_currency_waits_for_review(self):
         post = await self._run(
             "بانک مقصد: ملی\nمبلغ: ۲۰٬۰۰۰٬۰۰۰\nتاریخ: ۱۴۰۵/۰۵/۰۱",
@@ -107,6 +118,35 @@ class BuyerReceiptAutoAccountingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(post.called)
         self.assertEqual(self.items[0]["accounting_status"], "review")
+
+    def test_buyer_outgoing_direction_is_not_a_deal_accounting_warning(self):
+        warnings = self.deal_gate._deal_bound_receipt_warnings(
+            {
+                "_detected_direction": "out",
+                "_recognition_warnings": [
+                    "جهت روی رسید «خروجی» است ولی دستور «ورودی» انتخاب شده"
+                ],
+            }
+        )
+        self.assertEqual(warnings, [])
+
+    def test_small_outgoing_bank_fee_is_removed_from_incoming_amount(self):
+        amount, adjusted = self.deal_gate._deal_bound_receipt_amount(
+            100_500_000,
+            100_000_000,
+            detected_direction="out",
+        )
+        self.assertTrue(adjusted)
+        self.assertEqual(amount, 100_000_000)
+
+    def test_large_amount_mismatch_is_never_adjusted(self):
+        amount, adjusted = self.deal_gate._deal_bound_receipt_amount(
+            102_000_000,
+            100_000_000,
+            detected_direction="out",
+        )
+        self.assertFalse(adjusted)
+        self.assertEqual(amount, 102_000_000)
 
 
 if __name__ == "__main__":
