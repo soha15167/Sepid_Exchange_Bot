@@ -5651,7 +5651,9 @@ async def sync_deal_party_summaries(
         _deal_complete_party_message_html,
         _deal_complete_reply_markup,
     )
-    from utils.deal_outbound import deal_bot_send_message, party_for_uid
+    from database.db import fetch_main_menu_anchor
+    from utils.deal_outbound import deal_bot_log_text, deal_bot_send_message, party_for_uid
+    from utils.telegram_utils import set_main_menu_anchor
 
     sent = 0
     failed = 0
@@ -5663,16 +5665,55 @@ async def sync_deal_party_summaries(
     }
     recipients.discard(0)
     for uid in recipients:
+        party = party_for_uid(gate, uid)
+        text = heading + _deal_complete_party_message_html(advert, row, uid)
         try:
-            await deal_bot_send_message(
+            anchor = fetch_main_menu_anchor(uid)
+            if anchor:
+                chat_id, message_id = int(anchor[0]), int(anchor[1])
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=reply_markup,
+                        disable_web_page_preview=True,
+                    )
+                    deal_bot_log_text(
+                        oid,
+                        uid,
+                        party,
+                        "ویرایش اطلاعات معامله توسط ادمین",
+                        text,
+                        telegram_message_id=message_id,
+                    )
+                    sent += 1
+                    continue
+                except BadRequest as exc:
+                    if "message is not modified" in str(exc).lower():
+                        sent += 1
+                        continue
+                    logger.info(
+                        "deal_gate: party summary edit unavailable; replacing offer=%s party=%s",
+                        oid,
+                        party,
+                    )
+            replacement = await deal_bot_send_message(
                 context.bot,
                 offer_id=oid,
                 chat_id=uid,
-                party=party_for_uid(gate, uid),
+                party=party,
                 tag="بروزرسانی اطلاعات معامله توسط ادمین",
-                text=heading + _deal_complete_party_message_html(advert, row, uid),
+                text=text,
                 reply_markup=reply_markup,
                 disable_web_page_preview=True,
+            )
+            set_main_menu_anchor(
+                user_data_store,
+                uid,
+                int(replacement.chat_id),
+                int(replacement.message_id),
             )
             sent += 1
         except Exception:

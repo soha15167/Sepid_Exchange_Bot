@@ -2907,7 +2907,7 @@ async def admin_dashboard_callback(update: Update, context: ContextTypes.DEFAULT
                 await query.answer("معامله پیدا نشد", show_alert=True)
                 return
             status = (gate.get("gate_status") or "").strip().lower()
-            if status not in {"accounts", "completed"}:
+            if status != "completed":
                 await query.answer(
                     "این معامله هنوز توسط هر دو طرف تأیید نشده است",
                     show_alert=True,
