@@ -167,6 +167,24 @@ class DealGateDatabaseTests(unittest.TestCase):
         self.assertEqual(result["accounting_status"], "submitted")
         self.assertEqual(result["panel_submitted_at"], 123)
 
+    def test_submitted_receipt_reopens_only_after_verified_panel_absence(self):
+        self._create_gate()
+        db.deal_gate_append_buyer_receipt(101, entry_type="photo", file_id="receipt")
+        db.deal_gate_update_buyer_receipt(
+            101, 0, accounting_status="submitted", panel_submitted_at=123
+        )
+        self.assertIsNone(
+            db.deal_gate_reopen_submitted_buyer_receipt(
+                101, 0, verified_absent_at=0
+            )
+        )
+        reopened = db.deal_gate_reopen_submitted_buyer_receipt(
+            101, 0, verified_absent_at=456
+        )
+        self.assertEqual(reopened["accounting_status"], "pending")
+        self.assertEqual(reopened["panel_submitted_at"], 0)
+        self.assertEqual(reopened["panel_absence_verified_at"], 456)
+
     def test_same_receipt_cannot_be_claimed_for_two_deals(self):
         self._create_gate()
         db.deal_gate_append_buyer_receipt(
