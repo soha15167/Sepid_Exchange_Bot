@@ -2540,7 +2540,17 @@ async def _handle_admin_receipt_review(
         return
     item = deal_gate_claim_buyer_receipt_submission(offer_id, receipt_index)
     if not item:
-        await q.answer("این فیش قبلاً بررسی شده یا آماده ثبت نیست.", show_alert=True)
+        current_items = deal_gate_buyer_receipt_list(offer_id)
+        current = (
+            current_items[receipt_index]
+            if 0 <= receipt_index < len(current_items)
+            else {}
+        )
+        if (current.get("accounting_status") or "") == "submitted":
+            await q.answer("این فیش قبلاً در سایت ثبت شده است.", show_alert=True)
+            await _close_deal_receipt_previews(context.bot, current, q)
+        else:
+            await q.answer("این فیش قبلاً بررسی شده یا آماده ثبت نیست.", show_alert=True)
         return
     payload = {
         "iran_amount": int(item.get("amount_rial") or 0),

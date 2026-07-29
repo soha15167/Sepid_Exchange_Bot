@@ -166,6 +166,7 @@ class BuyerReceiptAutoAccountingTests(unittest.IsolatedAsyncioTestCase):
             patch.object(self.deal_gate, "_require_full_deal_admin", new=AsyncMock(return_value=True)),
             patch.object(self.deal_gate, "deal_gate_get", return_value=self.gate),
             patch.object(self.deal_gate, "deal_gate_claim_buyer_receipt_submission", side_effect=[dict(self.items[0]), None]),
+            patch.object(self.deal_gate, "deal_gate_buyer_receipt_list", return_value=self.items),
             patch.object(self.deal_gate, "deal_gate_update_buyer_receipt", side_effect=self._update),
             patch.object(self.deal_gate, "_buyer_dealer_name", return_value="nongb"),
             patch.object(self.deal_gate, "sync_deal_admin_notification", new=AsyncMock()),
@@ -238,6 +239,29 @@ class BuyerReceiptAutoAccountingTests(unittest.IsolatedAsyncioTestCase):
             bot, {"preview_message_ids": '{"1": 77}'}, None
         )
         bot.delete_message.assert_awaited_once_with(chat_id=1, message_id=77)
+
+    async def test_stale_submitted_preview_is_deleted_when_clicked(self):
+        message = SimpleNamespace(
+            chat_id=1, message_id=88, delete=AsyncMock()
+        )
+        query = SimpleNamespace(
+            answer=AsyncMock(), from_user=SimpleNamespace(id=1), message=message
+        )
+        submitted = {"accounting_status": "submitted"}
+        with (
+            patch.object(self.deal_gate, "_require_full_deal_admin", new=AsyncMock(return_value=True)),
+            patch.object(self.deal_gate, "deal_gate_get", return_value=self.gate),
+            patch.object(self.deal_gate, "deal_gate_claim_buyer_receipt_submission", return_value=None),
+            patch.object(self.deal_gate, "deal_gate_buyer_receipt_list", return_value=[submitted]),
+        ):
+            await self.deal_gate._handle_admin_receipt_review(
+                SimpleNamespace(callback_query=query),
+                SimpleNamespace(bot=SimpleNamespace(delete_message=AsyncMock())),
+                offer_id=258,
+                receipt_index=0,
+                approve=True,
+            )
+        message.delete.assert_awaited_once()
 
 
 if __name__ == "__main__":
