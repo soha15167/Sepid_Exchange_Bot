@@ -2952,6 +2952,11 @@ def deal_gate_update_buyer_receipt(
         if not isinstance(items, list) or idx < 0 or idx >= len(items):
             return None
         item = items[idx] if isinstance(items[idx], dict) else {}
+        # A successful panel submission is a terminal financial state. Neither
+        # an admin reprocess nor stale application code may turn it into a new
+        # preview or make it eligible for a second submission.
+        if (item.get("accounting_status") or "") == "submitted":
+            return dict(item)
         item.update(clean)
         items[idx] = item
         conn.execute(
@@ -2960,6 +2965,54 @@ def deal_gate_update_buyer_receipt(
         )
         conn.commit()
         return dict(item)
+
+
+def deal_gate_has_submitted_buyer_receipt(
+    *,
+    file_unique_id: str = "",
+    receipt_fingerprint: str = "",
+    exclude_offer_id: int = 0,
+    exclude_receipt_index: int = -1,
+    include_submitting: bool = False,
+) -> bool:
+    """Check whether the same receipt is already posted (or being posted)."""
+    import json
+
+    unique_id = (file_unique_id or "").strip()
+    fingerprint = (receipt_fingerprint or "").strip()
+    if not unique_id and not fingerprint:
+        return False
+    terminal = {"submitted"}
+    if include_submitting:
+        terminal.add("submitting")
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT offer_id, buyer_receipt_log FROM offer_deal_gates "
+            "WHERE COALESCE(buyer_receipt_log, '') <> ''"
+        ).fetchall()
+    for offer_id, raw in rows:
+        try:
+            items = json.loads(raw or "[]")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(items, list):
+            continue
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            if int(offer_id) == int(exclude_offer_id or 0) and index == int(
+                exclude_receipt_index
+            ):
+                continue
+            if (item.get("accounting_status") or "") not in terminal:
+                continue
+            if unique_id and (item.get("file_unique_id") or "").strip() == unique_id:
+                return True
+            if fingerprint and (
+                item.get("receipt_fingerprint") or ""
+            ).strip() == fingerprint:
+                return True
+    return False
 
 
 def deal_gate_claim_buyer_receipt_submission(
@@ -2993,6 +3046,36 @@ def deal_gate_claim_buyer_receipt_submission(
             item.get("bank_name") or ""
         ).strip():
             return None
+        unique_id = (item.get("file_unique_id") or "").strip()
+        fingerprint = (item.get("receipt_fingerprint") or "").strip()
+        rows = conn.execute(
+            "SELECT offer_id, buyer_receipt_log FROM offer_deal_gates "
+            "WHERE COALESCE(buyer_receipt_log, '') <> ''"
+        ).fetchall()
+        for other_offer_id, raw in rows:
+            try:
+                other_items = json.loads(raw or "[]")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(other_items, list):
+                continue
+            for other_index, other in enumerate(other_items):
+                if not isinstance(other, dict):
+                    continue
+                if int(other_offer_id) == oid and other_index == idx:
+                    continue
+                if (other.get("accounting_status") or "") not in {
+                    "submitted", "submitting"
+                }:
+                    continue
+                same_file = unique_id and (
+                    other.get("file_unique_id") or ""
+                ).strip() == unique_id
+                same_fingerprint = fingerprint and (
+                    other.get("receipt_fingerprint") or ""
+                ).strip() == fingerprint
+                if same_file or same_fingerprint:
+                    return None
         item["accounting_status"] = "submitting"
         item["panel_error"] = ""
         items[idx] = item
