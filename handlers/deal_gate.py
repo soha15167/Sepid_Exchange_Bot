@@ -2019,12 +2019,14 @@ def _deal_gate_allows_party_receipts(gate: dict | None) -> bool:
 
 
 def _receipt_consistency_warnings(
-    gate: dict, text: str, *, receipt_kind: str
+    gate: dict, text: str, *, receipt_kind: str, allow_empty: bool = False
 ) -> list[str]:
     """Conservative admin warnings only; never approve or reject money."""
     raw = (text or "").strip()
     warnings: list[str] = []
     if not raw:
+        if allow_empty:
+            return warnings
         warnings.append("تصویر فیش توضیح متنی ندارد؛ مبلغ و گیرنده دستی بررسی شود")
         return warnings
     digit_text = re.sub(r"\D", "", raw.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")))
@@ -2046,10 +2048,15 @@ def _receipt_consistency_warnings(
 
 
 def _log_receipt_consistency(
-    offer_id: int, gate: dict, text: str, *, receipt_kind: str
+    offer_id: int,
+    gate: dict,
+    text: str,
+    *,
+    receipt_kind: str,
+    allow_empty: bool = False,
 ) -> list[str]:
     warnings = _receipt_consistency_warnings(
-        gate, text, receipt_kind=receipt_kind
+        gate, text, receipt_kind=receipt_kind, allow_empty=allow_empty
     )
     for warning in warnings:
         _log(int(offer_id), f"هشدار بررسی فیش: {warning}", from_role="system")
@@ -3840,7 +3847,7 @@ async def _deal_admin_stom_try_photo(
     cap = (update.message.caption or "").strip()
     seller_id = int(gate.get("seller_telegram_id") or 0)
     receipt_warnings = _log_receipt_consistency(
-        oid, gate, cap, receipt_kind="seller_toman"
+        oid, gate, cap, receipt_kind="seller_toman", allow_empty=True
     )
     row = get_advert_offer_joined(oid)
     seq = int((row or {}).get("seq_in_advert") or oid)
@@ -6216,7 +6223,9 @@ async def _deal_receipt_try_photo(
             source_message_id=update.message.message_id,
         )
         gate = deal_gate_get(oid) or gate
-        _log_receipt_consistency(oid, gate, cap, receipt_kind="seller_euro")
+        _log_receipt_consistency(
+            oid, gate, cap, receipt_kind="seller_euro", allow_empty=True
+        )
         idx = len(items) - 1
         _log(oid, f"فیش یورو {entry_type} فروشنده", from_role="seller")
         await _notify_buyer_euro_receipt_confirm(
@@ -6243,7 +6252,9 @@ async def _deal_receipt_try_photo(
         source_message_id=update.message.message_id,
     )
     gate = deal_gate_get(oid) or gate
-    _log_receipt_consistency(oid, gate, cap, receipt_kind="buyer_toman")
+    _log_receipt_consistency(
+        oid, gate, cap, receipt_kind="buyer_toman", allow_empty=True
+    )
     _log(oid, f"فیش واریز {entry_type} خریدار", from_role="buyer")
     await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
     await _party_receipt_ack(
