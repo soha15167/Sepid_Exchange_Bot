@@ -2356,6 +2356,32 @@ def _buyer_toman_receipt_admin_line_html(
         )
     else:
         blk = f"{_RTL}📎 <b>فیش واریز تومان:</b> <b>{len(items)}</b> مورد ✅\n"
+    submitted_items = [
+        item for item in items if (item.get("accounting_status") or "") == "submitted"
+    ]
+    review_items = [
+        item
+        for item in items
+        if (item.get("accounting_status") or "") in ("review", "panel_failed")
+    ]
+    if submitted_items:
+        submitted_rial = sum(int(item.get("amount_rial") or 0) for item in submitted_items)
+        expected_rial = max(
+            (int(item.get("expected_rial") or 0) for item in items), default=0
+        )
+        blk += (
+            f"{_RTL}🌐 <b>ثبت ورودی سایت:</b> {len(submitted_items)} فیش · "
+            f"<code>{submitted_rial:,}</code> ریال ✅\n"
+        )
+        if expected_rial:
+            remaining = max(0, expected_rial - submitted_rial)
+            blk += (
+                f"{_RTL}🧮 <b>تطبیق مبلغ:</b> "
+                f"<code>{submitted_rial:,}</code> / <code>{expected_rial:,}</code> ریال"
+                f" · مانده <code>{remaining:,}</code>\n"
+            )
+    if review_items:
+        blk += f"{_RTL}⚠️ <b>نیازمند بررسی ثبت سایت:</b> {len(review_items)} فیش\n"
     if int(gate.get("buyer_toman_settled_at") or 0) > 0:
         blk += f"{_RTL}💵 <b>تومان نشست:</b> ✅ تأیید ادمین\n"
     elif items or card_sent:
@@ -2374,6 +2400,8 @@ def _buyer_toman_receipt_admin_line_html(
             lines.append(f"{_RTL}  · <code>{html_module.escape(t)}</code>")
         elif (r.get("type") or "") == "photo" and not slides_mode:
             lines.append(photo_lbl)
+        elif (r.get("type") or "") == "document":
+            lines.append(f"{_RTL}  · 📄 فایل PDF فیش")
     return "\n".join(lines) + "\n"
 
 

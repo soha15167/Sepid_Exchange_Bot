@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from telegram.ext import CallbackQueryHandler, CommandHandler
+from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler
 
 import main as bot_main
 
@@ -73,6 +73,16 @@ class MainRegistrationTests(unittest.TestCase):
             }.issubset(callback_patterns),
             f"missing critical callback patterns: {sorted(callback_patterns)}",
         )
+
+        tx_group7 = [
+            handler
+            for handler, group in application.handlers
+            if group == 7
+            and isinstance(handler, MessageHandler)
+            and handler.callback is bot_main.iran_panel_sync_router
+        ]
+        self.assertEqual(len(tx_group7), 1)
+        self.assertIn("filters.TEXT", str(tx_group7[0].filters))
 
 
 if __name__ == "__main__":

@@ -456,7 +456,16 @@ def _normalize_bank_input(val: str) -> str:
     v = (val or "").strip()
     if not v or v == "-":
         return ""
-    v = v.replace("بانک", "").strip()
+    try:
+        from banking_recognition.banks.database import detect_bank_from_text
+
+        detected = detect_bank_from_text(v)
+        if detected:
+            return detected
+    except Exception:
+        pass
+    v = re.sub(r"^بانک\s*", "", v).strip()
+    v = re.sub(r"\s+ایران$", "", v).strip()
     aliases = {
         "melli": "ملی",
         "meli": "ملی",
@@ -469,6 +478,18 @@ def _normalize_bank_input(val: str) -> str:
         "بلو": "بلو",
         "baam": "ملی",
         "bmi": "ملی",
+        "saderat": "صادرات",
+        "صادرات": "صادرات",
+        "maskan": "مسکن",
+        "مسکن": "مسکن",
+        "tejarat": "تجارت",
+        "تجارت": "تجارت",
+        "parsian": "پارسیان",
+        "پارسیان": "پارسیان",
+        "keshavarzi": "کشاورزی",
+        "کشاورزی": "کشاورزی",
+        "pasargad": "پاسارگاد",
+        "پاسارگاد": "پاسارگاد",
     }
     low = v.lower()
     for key, name in aliases.items():
@@ -688,7 +709,16 @@ def _extract_compact_rial_near_rial(t: str, raw: str, scored: list[tuple[int, in
 
 
 def _dest_bank_from_sheba(raw: str) -> str:
-    t = re.sub(r"\s+", "", _normalize_receipt_text(raw or "").upper())
+    normalized = _normalize_receipt_text(raw or "").upper()
+    # Receipts commonly print IBANs as ``IR - 21 0560 ...``.  Removing only
+    # whitespace leaves the dash behind and prevents the bank-code lookup.
+    # Capture exactly the 24 IBAN digits while allowing OCR/layout separators,
+    # then build the canonical compact representation used below.
+    sheba = re.search(r"IR(?:[\s\-\u2013\u2014_:]*\d){24}", normalized)
+    if sheba:
+        t = "IR" + re.sub(r"\D", "", sheba.group(0))
+    else:
+        t = re.sub(r"[\s\-\u2013\u2014_:]+", "", normalized)
     m = re.search(r"IR(\d{2})(\d{3})(\d+)", t)
     if m:
         bank_code = m.group(2)
@@ -887,6 +917,14 @@ def _extract_jdate_from_persian_words(raw: str) -> str:
 
 def _guess_bank_from_receipt(raw: str) -> str:
     t = raw or ""
+    try:
+        from banking_recognition.banks.database import detect_bank_from_text
+
+        detected = detect_bank_from_text(t)
+        if detected:
+            return detected
+    except Exception:
+        pass
     if re.search(r"baam\.bmi|bmi\.ir|\bbaam\b", t, re.I):
         return "ملی"
     if re.search(r"بانک\s*ملی", t, re.I):
@@ -934,22 +972,79 @@ def _guess_dest_bank_from_receipt(raw: str) -> str:
     return _dest_bank_from_sheba(raw)
 
 
+def _guess_incoming_bank_from_receipt(raw: str) -> str:
+    """بانک حساب بستانکارشده؛ در ورودی، بانک فرستنده ملاک پنل نیست."""
+    _source_card, destination_card = _guess_banks_from_cards(raw or "")
+    if destination_card:
+        return destination_card
+    destination = _guess_dest_bank_from_receipt(raw)
+    if destination:
+        return destination
+    return _guess_bank_from_receipt(raw)
+
+
 def _guess_transfer_type_from_receipt(raw: str) -> str:
     t = raw or ""
     if re.search(r"کارت\s*به\s*کارت|کارتبهکارت", t, re.I):
         return "کارت به کارت"
-    m = re.search(r"بلو\s*به\s*(\S+)", t, re.I)
-    if m:
-        dest = m.group(1).strip()
-        if dest and dest not in ("کارت", "card"):
-            return f"بلو به {dest}"
-    if re.search(r"پایا|بین\s*بانک", t, re.I):
-        return "بین بانکی (پایا)"
-    if re.search(r"\bپل\b|پل\s*پایا", t, re.I):
-        return "پل"
-    if re.search(r"ساتنا", t, re.I):
+    if re.search(r"ساتنا|\bRTGS\b", t, re.I):
         return "ساتنا"
+    if re.search(r"(?<!\w)پایا(?!\w)|\bACH\b", t, re.I):
+        return "پایا"
+    if re.search(r"سامانه\s*پل|انتقال\s*پل|\bپل\b", t, re.I):
+        return "پل"
+    kinds = (
+        (r"سپرده\s*به\s*سپرده", "سپرده به سپرده"),
+        (r"حساب\s*به\s*حساب|انتقال\s*داخلی", "حساب به حساب"),
+        (r"انتقال\s*(?:با\s*)?شبا|حواله\s*شبا", "انتقال شبا"),
+        (r"واریز\s*نقدی", "واریز نقدی"),
+        (r"برداشت\s*نقدی", "برداشت نقدی"),
+        (r"خودپرداز|\bATM\b", "خودپرداز"),
+        (r"برگشت\s*وجه|برگشت\s*تراکنش", "برگشت وجه"),
+        (r"خرید\s*اینترنتی|درگاه\s*پرداخت", "پرداخت اینترنتی"),
+        (r"پایانه\s*فروش|خرید|\bPOS\b", "خرید"),
+        (r"پرداخت\s*قبض|قبض", "پرداخت قبض"),
+        (r"برداشت\s*مستقیم", "برداشت مستقیم"),
+        (r"واریز\s*چک|چک", "چک"),
+        (r"واریز\s*حقوق|حقوق", "حقوق"),
+        (r"سود\s*سپرده|سود", "سود"),
+        (r"کارمزد", "کارمزد"),
+        (r"انتقال\s*وجه|بین\s*بانک", "انتقال وجه"),
+    )
+    for pattern, label in kinds:
+        if re.search(pattern, t, re.I):
+            return label
     return ""
+
+
+def _normalize_transfer_type(value: str) -> str:
+    v = _coerce_vision_str(value)
+    if not v or v.lower() in ("unknown", "نامشخص", "other"):
+        return ""
+    if re.search(
+        r"انتقال\s*وجه\s*(?:بانک\s*)?ملت|حساب\s*به\s*حساب|انتقال\s*داخلی",
+        v,
+        re.I,
+    ):
+        return "حساب به حساب"
+    aliases = {
+        "card_to_card": "کارت به کارت",
+        "paya": "پایا",
+        "satna": "ساتنا",
+        "pol": "پل",
+        "internal": "حساب به حساب",
+        "internal_account": "حساب به حساب",
+        "cash_deposit": "واریز نقدی",
+        "cash_withdrawal": "برداشت نقدی",
+        "atm": "خودپرداز",
+        "pos_purchase": "خرید",
+        "online_purchase": "پرداخت اینترنتی",
+        "bill_payment": "پرداخت قبض",
+        "direct_debit": "برداشت مستقیم",
+        "refund": "برگشت وجه",
+        "fee": "کارمزد",
+    }
+    return aliases.get(v.lower(), v)
 
 
 def _extract_top_account_holder_name(raw: str) -> str:
@@ -996,6 +1091,34 @@ def _extract_recipient_name_from_receipt(raw: str) -> str:
         if re.search(r"ریال|مبلغ|حساب|شبا|پیگیری", name, re.I):
             continue
         return name
+    return ""
+
+
+def _extract_destination_holder_from_receipt(raw: str) -> str:
+    """نام صاحب حساب مقصد؛ هرگز متن بخش حساب مبدأ را برنگردان."""
+    text = _normalize_receipt_text(raw or "")
+    destination = re.search(
+        r"واریز\s*به\s*حساب|حساب\s*مقصد|صاحب\s*حساب\s*مقصد|گیرنده",
+        text,
+        re.I,
+    )
+    scopes = [text[destination.start() :]] if destination else []
+    scopes.append(text)
+    for scope in scopes:
+        matches = re.findall(r"به\s*نام\s*[:：]?\s*([^\n]{3,80})", scope, re.I)
+        for candidate in (matches[:1] if destination else matches[-1:]):
+            name = _clean_receipt_party_name(candidate)
+            if name:
+                return name
+    for pattern in (
+        r"نام\s*صاحب\s*حساب\s*مقصد\s*[:：]?\s*([^\n]{3,80})",
+        r"نام\s*گیرنده\s*[:：]?\s*([^\n]{3,80})",
+    ):
+        match = re.search(pattern, text, re.I)
+        if match:
+            name = _clean_receipt_party_name(match.group(1))
+            if name:
+                return name
     return ""
 
 
@@ -1120,6 +1243,79 @@ def _coerce_vision_str(val) -> str:
     return "" if s.lower() in ("null", "none", "-") else s
 
 
+_ACCOUNT_DESCRIPTION_RE = re.compile(
+    r"برداشت\s*از\s*حساب|واریز\s*به\s*حساب|کوتاه\s*مدت|بلند\s*مدت|"
+    r"سپرده|قرض\s*الحسنه|پس\s*انداز|اشخاص\s*حقیقی|انفرادی|مشترک|"
+    r"حساب\s*(?:جاری|بانکی)|شماره\s*حساب",
+    re.I,
+)
+
+
+def _clean_receipt_party_name(value: object) -> str:
+    """Keep a printed person's name; reject account/product descriptions."""
+    name = _coerce_vision_str(value)
+    name = re.sub(r"^(?:به\s*نام|نام)\s*[:：]?\s*", "", name).strip(" :：-–")
+    if not name or len(name) > 80 or _ACCOUNT_DESCRIPTION_RE.search(name):
+        return ""
+    if re.search(r"\d{4,}|ریال|مبلغ|کارمزد|پیگیری|تراکنش", name, re.I):
+        return ""
+    words = re.findall(r"[\u0600-\u06FFA-Za-z]+", name)
+    return name if len(words) >= 2 else ""
+
+
+def _deal_description_from_caption(caption: str) -> str:
+    """Return a stable Iran-panel description from a Telegram deal caption."""
+    normalized = normalize_digits(caption or "")
+    match = re.search(r"(?:^|\s)آگهی\s*[:：#-]?\s*(\d{1,9})(?=\D|$)", normalized)
+    if not match:
+        return ""
+    return f"آگهی {int(match.group(1))}"
+
+
+def _deal_buyer_name_from_caption(caption: str) -> str:
+    """نام نمایشی خریدار معامله از شمارهٔ آگهی/پیشنهاد در کپشن فیش."""
+    normalized = normalize_digits(caption or "")
+    advert_match = re.search(
+        r"(?:^|\s)آگهی\s*[:：#-]?\s*(\d{1,9})(?=\D|$)", normalized
+    )
+    offer_match = re.search(
+        r"(?:^|\s)پیشنهاد\s*[:：#-]?\s*(\d{1,6})(?=\D|$)", normalized
+    )
+    if not advert_match or not offer_match:
+        return ""
+    try:
+        from database.db import (
+            deal_gate_get,
+            get_euro_advert_by_rowid,
+            get_offer_by_advert_and_seq,
+            get_user,
+        )
+
+        advert_id = int(advert_match.group(1))
+        offer = get_offer_by_advert_and_seq(advert_id, int(offer_match.group(1)))
+        if not offer:
+            return ""
+        gate = deal_gate_get(int(offer.get("id") or 0)) or {}
+        buyer_id = int(gate.get("buyer_telegram_id") or 0)
+        if not buyer_id:
+            advert = get_euro_advert_by_rowid(advert_id) or {}
+            owner_id = int(advert.get("user_id") or 0)
+            proposer_id = int(offer.get("proposer_telegram_id") or 0)
+            operation = str(advert.get("operation") or "").strip()
+            buyer_id = owner_id if operation == "خرید" else proposer_id
+        user = get_user(buyer_id) if buyer_id else None
+        if not user:
+            return ""
+        return (
+            str(user.get("display_name") or "").strip()
+            or str(user.get("username") or "").strip().lstrip("@")
+            or str(user.get("full_name") or "").strip()
+        )[:80]
+    except Exception:
+        logger.exception("iran_panel: buyer lookup from receipt caption failed")
+        return ""
+
+
 def _coerce_vision_amount(val) -> int:
     try:
         if isinstance(val, str):
@@ -1130,6 +1326,32 @@ def _coerce_vision_amount(val) -> int:
         return _normalize_receipt_amount(v)
     except (TypeError, ValueError):
         return 0
+
+
+def _receipt_text_currency(raw: str) -> str:
+    """Explicit currency next to the transaction amount; never infer by digits."""
+    normalized = _normalize_receipt_text(raw or "")
+    for line in normalized.splitlines():
+        if not re.search(r"مبلغ|amount", line, re.I):
+            continue
+        if "تومان" in line:
+            return "toman"
+        if "ریال" in line:
+            return "rial"
+    if "تومان" in normalized and "ریال" not in normalized:
+        return "toman"
+    if "ریال" in normalized and "تومان" not in normalized:
+        return "rial"
+    return "unknown"
+
+
+def _receipt_amount_rial_from_text(raw: str, labeled: int = 0) -> int:
+    value = _resolve_receipt_amount(raw, labeled)
+    if value <= 0:
+        return 0
+    if _receipt_text_currency(raw) == "toman":
+        value *= 10
+    return _normalize_receipt_amount(value)
 
 
 def _payload_from_vision(vision: dict, mode: str) -> dict:
@@ -1147,12 +1369,12 @@ def _payload_from_vision(vision: dict, mode: str) -> dict:
     if jd:
         payload["jdate"] = jd
 
-    bank = _coerce_vision_str(vision.get("bank_name"))
+    bank = _normalize_bank_input(_coerce_vision_str(vision.get("bank_name")))
     if bank:
         payload["bank_name"] = bank
 
     if mode == "out":
-        dest = _coerce_vision_str(vision.get("dest_bank"))
+        dest = _normalize_bank_input(_coerce_vision_str(vision.get("dest_bank")))
         ttype_raw = _coerce_vision_str(vision.get("transfer_type"))
         if not dest and ttype_raw:
             m = re.search(r"بلو\s*به\s*(\S+)", ttype_raw, re.I)
@@ -1165,51 +1387,110 @@ def _payload_from_vision(vision: dict, mode: str) -> dict:
         ):
             payload["bank_name"] = "بلو"
 
-    recipient = _coerce_vision_str(vision.get("recipient_name"))
-    sender = _coerce_vision_str(vision.get("sender_name"))
-    name = _coerce_vision_str(vision.get("depositor_name"))
+    recipient = _clean_receipt_party_name(vision.get("recipient_name"))
+    sender = _clean_receipt_party_name(vision.get("sender_name"))
+    name = _clean_receipt_party_name(vision.get("depositor_name"))
     if mode == "out":
+        # فیلد نام در خروجی پنل، صاحب حساب مقصد/دریافت‌کننده است.
         pick = recipient or name
-        if pick and sender and pick == sender and recipient:
-            pick = recipient
         if pick:
             payload["depositor_name"] = pick
-    elif name:
-        payload["depositor_name"] = name
+    else:
+        # در ورودی، واریزکننده همان فرستنده است؛ صاحب حساب مقصد نباید جای او بیاید.
+        pick = sender or name
+        if pick:
+            payload["depositor_name"] = pick
+    if sender:
+        payload["_source_account_holder"] = sender
+    if recipient:
+        payload["_destination_account_holder"] = recipient
 
-    ttype = _coerce_vision_str(vision.get("transfer_type"))
+    ttype = _normalize_transfer_type(vision.get("transfer_type"))
     if ttype:
         payload["transfer_type"] = ttype
+    if (
+        mode == "out"
+        and ttype in ("حساب به حساب", "سپرده به سپرده")
+        and not (payload.get("dest_bank") or "").strip()
+        and (payload.get("bank_name") or "").strip()
+    ):
+        payload["dest_bank"] = payload["bank_name"]
 
     desc = _coerce_vision_str(vision.get("description"))
     if desc:
         payload["description"] = desc
 
+    for key in (
+        "_recognition_source",
+        "_recognition_score",
+        "_detected_direction",
+        "_receipt_status",
+        "_receipt_currency",
+        "_amount_disagreement",
+        "_amount_corroborated",
+    ):
+        if vision.get(key) not in (None, ""):
+            payload[key] = vision[key]
+    aliases = {
+        "_recognition_score": "confidence",
+        "_detected_direction": "detected_direction",
+        "_receipt_status": "status",
+        "_receipt_currency": "currency",
+    }
+    for internal, public in aliases.items():
+        if internal not in payload and vision.get(public) not in (None, ""):
+            payload[internal] = vision[public]
+
     return payload
 
 
-def _vision_dict_from_banking(data: dict) -> dict:
+def _vision_dict_from_banking(data: dict, mode: str) -> dict:
     """نگاشت خروجی banking_recognition به فرمت vision پنل."""
     amt = data.get("amount")
     try:
         iran_amount = int(amt) if amt is not None else None
     except (TypeError, ValueError):
         iran_amount = None
-    receiver = (data.get("receiver_name") or "").strip()
-    sender = (data.get("sender_name") or "").strip()
-    owner = (data.get("owner_name") or "").strip()
+    receiver = _clean_receipt_party_name(data.get("receiver_name"))
+    sender = _clean_receipt_party_name(data.get("sender_name"))
+    owner = _clean_receipt_party_name(data.get("owner_name"))
+    meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+    source_bank = _normalize_bank_input(str(meta.get("source_bank") or ""))
+    destination_bank = _normalize_bank_input(str(meta.get("destination_bank") or ""))
+    if mode == "out" and not destination_bank:
+        try:
+            from banking_recognition.banks.database import detect_bank_from_sheba
+
+            destination_bank = detect_bank_from_sheba(str(data.get("sheba") or ""))
+        except Exception:
+            destination_bank = ""
+    panel_bank = (
+        (destination_bank or data.get("bank_name") or "")
+        if mode == "in"
+        else (source_bank or data.get("bank_name") or "")
+    )
     return {
         "iran_amount": iran_amount,
         "jdate": (data.get("date") or "").strip(),
-        "bank_name": (data.get("bank_name") or "").strip(),
-        "dest_bank": "",
+        "bank_name": _normalize_bank_input(str(panel_bank)),
+        "dest_bank": _normalize_bank_input(destination_bank) if mode == "out" else "",
         "recipient_name": receiver,
         "sender_name": sender,
-        "depositor_name": owner or sender or receiver,
-        "transfer_type": "کارت به کارت"
-        if "کارت" in (data.get("raw_text") or "")
-        else "",
+        "depositor_name": (receiver or owner) if mode == "out" else (sender or owner),
+        "transfer_type": _normalize_transfer_type(data.get("transfer_type") or "")
+        or (
+            "کارت به کارت"
+            if "کارت" in (data.get("raw_text") or "")
+            else ""
+        ),
         "description": (data.get("tracking_number") or "").strip(),
+        "_recognition_source": (data.get("source") or "gemini").strip(),
+        "_recognition_score": float(data.get("confidence") or 0),
+        "_detected_direction": str(meta.get("detected_direction") or "").strip(),
+        "_receipt_status": (data.get("status") or "").strip(),
+        "_receipt_currency": str(meta.get("currency") or "").strip(),
+        "_amount_disagreement": meta.get("amount_disagreement"),
+        "_amount_corroborated": bool(meta.get("amount_corroborated")),
     }
 
 
@@ -1226,7 +1507,9 @@ async def _read_receipt_with_banking_gemini(
         return None, "", ""
 
     try:
-        data = await asyncio.wait_for(process_image_for_receipt(path), timeout=90.0)
+        data = await asyncio.wait_for(
+            process_image_for_receipt(path, mode=mode), timeout=90.0
+        )
     except asyncio.TimeoutError:
         logger.warning("iran_panel: banking_recognition (gemini-first) timeout")
         return None, "", ""
@@ -1249,7 +1532,7 @@ async def _read_receipt_with_banking_gemini(
         )
         return None, raw, ""
 
-    payload = _payload_from_vision(_vision_dict_from_banking(data), mode)
+    payload = _payload_from_vision(_vision_dict_from_banking(data, mode), mode)
     if raw:
         payload = _enrich_payload_from_ocr_text(payload, raw, mode)
     payload = _salvage_amount_on_payload(payload, path)
@@ -1289,17 +1572,29 @@ def _enrich_payload_from_ocr_text(payload: dict, raw: str, mode: str) -> dict:
         cur_dest = (out.get("dest_bank") or "").strip()
         if ocr_dest and (not cur_dest or cur_dest in ("کارت", "card")):
             out["dest_bank"] = ocr_dest
-        holder = _extract_top_account_holder_name(raw) or _extract_recipient_name_from_receipt(
-            raw
-        )
-        if holder:
-            out["depositor_name"] = holder
+        # OCR may supplement a missing destination name, but must never
+        # overwrite Gemini with the source account/product description.
+        if not _clean_receipt_party_name(out.get("depositor_name")):
+            holder = _extract_destination_holder_from_receipt(raw)
+            if holder:
+                out["depositor_name"] = holder
         if re.search(r"کارت\s*به\s*کارت", raw, re.I):
             out["transfer_type"] = "کارت به کارت"
+        elif re.search(r"برداشت\s*از\s*حساب", raw, re.I) and re.search(
+            r"واریز\s*به\s*حساب", raw, re.I
+        ):
+            out["transfer_type"] = "حساب به حساب"
+            if not (out.get("dest_bank") or "").strip() and (
+                out.get("bank_name") or ""
+            ).strip():
+                out["dest_bank"] = out["bank_name"]
         elif not (out.get("transfer_type") or "").strip():
             guessed = _guess_transfer_type_from_receipt(raw)
             if guessed:
                 out["transfer_type"] = guessed
+    out["bank_name"] = _normalize_bank_input(out.get("bank_name") or "")
+    if mode == "out":
+        out["dest_bank"] = _normalize_bank_input(out.get("dest_bank") or "")
     return _reconcile_receipt_amount(out, raw)
 
 
@@ -1507,22 +1802,19 @@ async def _read_receipt_image(path: str, mode: str) -> tuple[dict | None, str, s
 
 
 def _parse_payload_in(raw: str) -> tuple[dict, str]:
-    bank = _extract_field(raw, ["بانک", "bank"]) or _guess_bank_from_receipt(raw) or "ملی"
+    bank = _extract_field(raw, ["بانک مقصد", "destination bank"]) or _guess_incoming_bank_from_receipt(raw)
     labeled = _parse_amount_rial(
         _extract_field(raw, ["مبلغ", "amount", "مبلغ (ریال)", "مبلغ حواله"])
     )
-    amount = _normalize_receipt_amount(
-        _resolve_receipt_amount(raw, labeled)
-    )
+    amount = _receipt_amount_rial_from_text(raw, labeled)
     name = (
         _extract_field(raw, ["نام", "واریزکننده", "نام واریزکننده", "depositor", "name"])
         or _extract_depositor_from_receipt(raw)
         or _extract_recipient_name_from_receipt(raw)
     )
-    ttype = (
+    ttype = _normalize_transfer_type(
         _extract_field(raw, ["نوع", "نوع حواله", "transfer", "transfer_type"])
         or _guess_transfer_type_from_receipt(raw)
-        or "کارت به کارت"
     )
     jdate = (
         _normalize_jdate(_extract_field(raw, ["تاریخ موثر", "تاریخ", "تاریخ (شمسی)", "jdate"]))
@@ -1535,10 +1827,10 @@ def _parse_payload_in(raw: str) -> tuple[dict, str]:
     payload = {
         "type": "ایران",
         "iran_type": "ورودی",
-        "bank_name": bank,
+        "bank_name": _normalize_bank_input(bank),
         "iran_amount": amount,
         "depositor_name": name or "",
-        "transfer_type": ttype or "کارت به کارت",
+        "transfer_type": ttype or "",
         "deposit_fee": 0,
         "tax": 0,
         "description": desc or "",
@@ -1551,7 +1843,6 @@ def _parse_payload_out(raw: str) -> tuple[dict, str]:
     bank = (
         _extract_field(raw, ["بانک", "بانک منبع", "bank"])
         or _guess_bank_from_receipt(raw)
-        or "ملی"
     )
     dest = (
         _extract_field(raw, ["مقصد", "بانک مقصد", "dest", "destBank"])
@@ -1560,20 +1851,24 @@ def _parse_payload_out(raw: str) -> tuple[dict, str]:
     labeled = _parse_amount_rial(
         _extract_field(raw, ["مبلغ", "amount", "مبلغ (ریال)", "مبلغ حواله"])
     )
-    amount = _normalize_receipt_amount(
-        _resolve_receipt_amount(raw, labeled)
-    )
+    amount = _receipt_amount_rial_from_text(raw, labeled)
     name = (
-        _extract_field(raw, ["نام", "برداشت‌کننده", "نام برداشت‌کننده", "name"])
-        or _extract_top_account_holder_name(raw)
-        or _extract_recipient_name_from_receipt(raw)
-        or _extract_depositor_from_receipt(raw)
+        _extract_field(
+            raw,
+            ["نام صاحب حساب مقصد", "نام گیرنده", "برداشت‌کننده", "نام برداشت‌کننده"],
+        )
+        or _extract_destination_holder_from_receipt(raw)
     )
-    ttype = (
+    ttype = _normalize_transfer_type(
         _extract_field(raw, ["نوع", "نوع حواله", "transfer", "transfer_type"])
         or _guess_transfer_type_from_receipt(raw)
-        or "کارت به کارت"
     )
+    if (
+        not dest
+        and ttype in ("حساب به حساب", "سپرده به سپرده")
+        and bank
+    ):
+        dest = bank
     jdate = (
         _extract_jdate_from_persian_words(raw)
         or _normalize_jdate(
@@ -1588,11 +1883,11 @@ def _parse_payload_out(raw: str) -> tuple[dict, str]:
     payload = {
         "type": "ایران",
         "iran_type": "خروجی",
-        "bank_name": bank,
-        "dest_bank": dest,
+        "bank_name": _normalize_bank_input(bank),
+        "dest_bank": _normalize_bank_input(dest),
         "iran_amount": amount,
         "depositor_name": name or "",  # panel uses depositor_name for both pages
-        "transfer_type": ttype or "کارت به کارت",
+        "transfer_type": ttype or "",
         # do NOT send fee/tax: panel auto-calculates in خروجی
         "description": desc or "",
         "jdate": jdate or "",
@@ -1624,27 +1919,125 @@ def _draft_optional_empty(payload: dict, mode: str) -> list[str]:
     return optional
 
 
+def _receipt_direction_from_text(raw: str) -> str:
+    """فقط از عبارت‌های صریح جهت را تشخیص می‌دهد؛ «واریز» به‌تنهایی کافی نیست."""
+    text = _normalize_receipt_text(raw or "").lower()
+    incoming = (
+        "بستانکار",
+        "افزایش موجودی",
+        "واریز به حساب شما",
+        "مبلغ واریزی به حساب",
+        "نوع تراکنش: واریز",
+        "نوع تراکنش واریز",
+        "دریافت وجه",
+        "واریز حقوق",
+        "سود سپرده",
+        "برگشت وجه",
+        "incoming",
+        "credited",
+    )
+    outgoing = (
+        "بدهکار",
+        "کاهش موجودی",
+        "برداشت از حساب",
+        "مبلغ کسر شده",
+        "نوع تراکنش: برداشت",
+        "نوع تراکنش برداشت",
+        "پرداخت قبض",
+        "برداشت مستقیم",
+        "پایانه فروش",
+        "کارمزد برداشت",
+        "outgoing",
+        "debited",
+    )
+    has_in = any(term in text for term in incoming)
+    has_out = any(term in text for term in outgoing)
+    if has_in != has_out:
+        return "in" if has_in else "out"
+    return ""
+
+
+def _receipt_failed(raw: str, status: str = "") -> bool:
+    text = f"{status} {_normalize_receipt_text(raw or '')}".lower()
+    return any(
+        term in text
+        for term in (
+            "ناموفق",
+            "تراکنش رد شد",
+            "لغو شد",
+            "پرداخت لغو",
+            "failed",
+            "declined",
+            "cancelled",
+            "canceled",
+        )
+    )
+
+
+def _assess_receipt_payload(
+    payload: dict, raw: str, mode: str, source: str = ""
+) -> dict:
+    """هشدارهای رسید را فقط در پیش‌نویس ادمین نگه می‌دارد؛ به کاربر پیام نمی‌دهد."""
+    out = dict(payload)
+    detected = str(out.get("_detected_direction") or "").strip().lower()
+    if detected not in ("in", "out"):
+        detected = _receipt_direction_from_text(raw)
+    status = str(out.get("_receipt_status") or "").strip()
+    warnings: list[str] = []
+    disagreement = out.get("_amount_disagreement")
+    if isinstance(disagreement, dict):
+        try:
+            gemini_amount = int(disagreement.get("gemini") or 0)
+            google_amount = int(disagreement.get("google_vision") or 0)
+        except (TypeError, ValueError):
+            gemini_amount = google_amount = 0
+        if gemini_amount and google_amount:
+            warnings.append(
+                "اختلاف مبلغ: Gemini "
+                f"{gemini_amount:,} ریال، Google OCR {google_amount:,} ریال"
+            )
+    if detected and detected != mode:
+        expected = "ورودی" if mode == "in" else "خروجی"
+        actual = "ورودی" if detected == "in" else "خروجی"
+        warnings.append(f"جهت روی رسید «{actual}» است ولی دستور «{expected}» انتخاب شده")
+    if _receipt_failed(raw, status):
+        warnings.append("وضعیت رسید ناموفق/لغوشده تشخیص داده شد")
+    try:
+        score = float(out.get("_recognition_score") or 0)
+    except (TypeError, ValueError):
+        score = 0.0
+    if source in ("gemini", "vision", "vision_partial", "ocr+gemini") and score and score < 70:
+        warnings.append(f"اطمینان خواندن تصویر پایین است ({score:.0f}٪)")
+    out["_recognition_source"] = source or out.get("_recognition_source") or "text"
+    out["_detected_direction"] = detected
+    out["_recognition_warnings"] = warnings
+    out["_recognition_blocking"] = bool(warnings)
+    out.setdefault("_recognition_reviewed", False)
+    return out
+
+
 def _panel_payload_for_submit(payload: dict, mode: str) -> dict:
     """بدنهٔ POST پنل — خروجی بدون کارمزد/مالیات (سایت خودش حساب می‌کند)."""
     if mode == "out":
         return {
             "type": "ایران",
             "iran_type": "خروجی",
-            "bank_name": (payload.get("bank_name") or "").strip(),
-            "dest_bank": (payload.get("dest_bank") or "").strip(),
+            "bank_name": _normalize_bank_input(payload.get("bank_name") or ""),
+            # Iran panel API persists this field as destination_bank.
+            "destination_bank": _normalize_bank_input(payload.get("dest_bank") or ""),
             "iran_amount": int(payload.get("iran_amount") or 0),
             "depositor_name": (payload.get("depositor_name") or "").strip(),
-            "transfer_type": (payload.get("transfer_type") or "کارت به کارت").strip(),
+            "transfer_type": (payload.get("transfer_type") or "").strip(),
             "description": (payload.get("description") or "").strip(),
             "jdate": (payload.get("jdate") or "").strip(),
         }
     return {
         "type": "ایران",
         "iran_type": "ورودی",
-        "bank_name": (payload.get("bank_name") or "").strip(),
+        "bank_name": _normalize_bank_input(payload.get("bank_name") or ""),
         "iran_amount": int(payload.get("iran_amount") or 0),
         "depositor_name": (payload.get("depositor_name") or "").strip(),
-        "transfer_type": (payload.get("transfer_type") or "کارت به کارت").strip(),
+        "transfer_type": (payload.get("transfer_type") or "").strip(),
         "deposit_fee": int(payload.get("deposit_fee") or 0),
         "tax": int(payload.get("tax") or 0),
         "description": (payload.get("description") or "").strip(),
@@ -1656,7 +2049,7 @@ def _field_label(field: str, mode: str = "in") -> str:
     labels = {
         "iran_amount": "مبلغ (ریال)",
         "bank_name": "بانک مبدأ" if mode == "out" else "بانک",
-        "depositor_name": "نام برداشت‌کننده" if mode == "out" else "نام واریزکننده",
+        "depositor_name": "نام صاحب حساب مقصد" if mode == "out" else "نام واریزکننده",
         "dest_bank": "بانک مقصد",
         "transfer_type": "نوع حواله",
         "jdate": "تاریخ (شمسی)",
@@ -1715,6 +2108,10 @@ async def _show_draft(
 ) -> None:
     missing = _draft_missing_fields(payload, mode)
     optional_empty = _draft_optional_empty(payload, mode)
+    warnings = payload.get("_recognition_warnings") or []
+    needs_review = bool(payload.get("_recognition_blocking")) and not bool(
+        payload.get("_recognition_reviewed")
+    )
     body = _render_draft_html(mode, payload)
     if edit_menu:
         body += f"\n{_RTL}✏️ <b>کدام فیلد را ویرایش می‌کنید؟</b>"
@@ -1725,6 +2122,14 @@ async def _show_draft(
                 f"\n{_RTL}⚠️ برای ثبت، این موارد را اصلاح کنید: "
                 f"<b>{'، '.join(_field_label(x, mode) for x in missing)}</b>"
             )
+        if warnings:
+            body += f"\n{_RTL}⚠️ <b>کنترل رسید:</b>"
+            for warning in warnings:
+                body += f"\n{_RTL}• {html_module.escape(str(warning))}"
+            if needs_review:
+                body += f"\n{_RTL}<i>پس از مقایسه با خود تصویر، تأیید ادمین لازم است.</i>"
+            else:
+                body += f"\n{_RTL}✅ <i>توسط ادمین بررسی شد.</i>"
         elif optional_empty:
             body += (
                 f"\n{_RTL}ℹ️ در صورت نیاز ویرایش کنید: "
@@ -1732,7 +2137,7 @@ async def _show_draft(
             )
         if mode == "out" and not missing:
             body += f"\n{_RTL}<i>کارمزد و مالیات در سایت خودکار محاسبه می‌شود.</i>"
-        markup = _draft_keyboard(can_submit=not missing)
+        markup = _draft_keyboard(can_submit=not missing, needs_review=needs_review)
     dm = context.user_data.get(_DRAFT_MID_KEY)
     if dm and not edit_menu:
         try:
@@ -1814,7 +2219,7 @@ def _render_draft_html(mode: str, payload: dict) -> str:
             f"{_RTL}🏦 <b>بانک (منبع):</b> <code>{_s('bank_name') or '—'}</code>\n"
             f"{_RTL}🏁 <b>بانک مقصد:</b> <code>{_s('dest_bank') or '—'}</code>\n"
             f"{_RTL}💰 <b>مبلغ (ریال):</b> <code>{amt_disp}</code>\n"
-            f"{_RTL}👤 <b>نام برداشت‌کننده (صاحب حساب):</b> "
+            f"{_RTL}👤 <b>نام برداشت‌کننده (صاحب حساب مقصد):</b> "
             f"<code>{_s('depositor_name') or '—'}</code>\n"
             f"{_RTL}🔁 <b>نوع حواله:</b> <code>{_s('transfer_type') or '—'}</code>\n"
             f"{_RTL}🗓 <b>تاریخ (شمسی):</b> <code>{_s('jdate') or '—'}</code>\n"
@@ -1831,9 +2236,17 @@ def _render_draft_html(mode: str, payload: dict) -> str:
     )
 
 
-def _draft_keyboard(*, can_submit: bool) -> InlineKeyboardMarkup:
+def _draft_keyboard(*, can_submit: bool, needs_review: bool = False) -> InlineKeyboardMarkup:
     rows = []
-    if can_submit:
+    if needs_review:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "👁 بررسی کردم؛ ادامه", callback_data="tx|reviewed"
+                )
+            ]
+        )
+    elif can_submit:
         rows.append([InlineKeyboardButton("✅ ثبت", callback_data="tx|submit")])
     rows.append([InlineKeyboardButton("✏️ ویرایش فیلدها", callback_data="tx|fill")])
     rows.append([InlineKeyboardButton("❌ انصراف", callback_data="tx|cancel")])
@@ -1910,7 +2323,7 @@ async def txout_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "• بانک (منبع)\n"
         "• بانک مقصد\n"
         "• مبلغ (ریال)\n"
-        "• نام برداشت‌کننده (صاحب حساب — نام بالای رسید)\n"
+        "• نام برداشت‌کننده (صاحب حساب مقصد)\n"
         "• نوع حواله\n"
         "• تاریخ (شمسی)\n"
         "• توضیحات (اگر بود)\n\n"
@@ -1996,12 +2409,17 @@ async def iran_panel_sync_router(update: Update, context: ContextTypes.DEFAULT_T
     if m.text and (m.text or "").strip().startswith("/"):
         return
     raw = (m.caption or m.text or "").strip()
+    media_caption = raw if has_media else ""
     if not has_media and not _text_looks_like_iran_tx_paste(raw):
         return
 
     # If admin sent a receipt image or tx-like text, try AI then OCR.
     vision_payload: dict | None = None
-    if not raw and has_media:
+    source = "text"
+    # A forwarded receipt often carries the original deal caption.  A caption
+    # must never turn a photo into a text-only transaction: always read media
+    # and use its caption only as supplemental text.
+    if has_media:
         status_msg = None
         path = None
         source = ""
@@ -2038,7 +2456,11 @@ async def iran_panel_sync_router(update: Update, context: ContextTypes.DEFAULT_T
                 _banking_gemini_available(),
                 receipt_vision_available(),
             )
-            vision_payload, raw, source = await _read_receipt_image(path, mode)
+            vision_payload, image_raw, source = await _read_receipt_image(path, mode)
+            image_raw = image_raw or ""
+            raw = "\n".join(
+                part for part in (image_raw.strip(), media_caption.strip()) if part
+            )
             logger.info(
                 "iran_panel: read source=%s amount=%s jdate=%s preview=%r",
                 source,
@@ -2069,12 +2491,18 @@ async def iran_panel_sync_router(update: Update, context: ContextTypes.DEFAULT_T
                     parse_mode=ParseMode.HTML,
                 )
                 return
-            if vision_payload is None and not raw:
-                await m.reply_text(
-                    _receipt_read_fail_hint_html(),
-                    parse_mode=ParseMode.HTML,
-                )
-                return
+            if vision_payload is None and not image_raw.strip():
+                # A structured caption may still be a valid manual fallback.
+                # Ordinary forwarded deal captions are not sufficient because
+                # they contain no receipt fields and would create an empty draft.
+                if _text_looks_like_iran_tx_paste(media_caption):
+                    raw = media_caption
+                else:
+                    await m.reply_text(
+                        _receipt_read_fail_hint_html(),
+                        parse_mode=ParseMode.HTML,
+                    )
+                    return
         except Exception as e:
             logger.exception("iran_panel receipt read failed")
             err_short = type(e).__name__
@@ -2110,6 +2538,16 @@ async def iran_panel_sync_router(update: Update, context: ContextTypes.DEFAULT_T
     else:
         payload, _err = _parse_payload_out(raw)
 
+    deal_description = _deal_description_from_caption(media_caption)
+    if deal_description:
+        payload["description"] = deal_description
+    if mode == "in":
+        buyer_name = _deal_buyer_name_from_caption(media_caption)
+        if buyer_name:
+            payload["depositor_name"] = buyer_name
+
+    payload = _assess_receipt_payload(payload, raw, mode, source)
+
     if (m.photo or m.document) and int(payload.get("iran_amount") or 0) < _MIN_RECEIPT_RIAL:
         logger.warning("iran_panel: amount still missing after read")
 
@@ -2120,32 +2558,6 @@ async def iran_panel_sync_router(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data[_AWAIT_FIELD_KEY] = ""
 
     _track_tx_message(context, m.message_id)
-    if (m.photo or m.document) and _draft_missing_fields(payload, mode):
-        missing = _draft_missing_fields(payload, mode)
-        lines = [f"{_field_label(f, mode)}: …" for f in missing[:4]]
-        if payload.get("iran_amount"):
-            lines.insert(0, f"مبلغ: {int(payload['iran_amount'])}")
-        if payload.get("jdate"):
-            lines.append(f"تاریخ: {payload['jdate']}")
-        hint_ai = ""
-        if not _receipt_ai_available():
-            hint_ai = (
-                "برای خواندن بهتر فیش، <code>GEMINI_API_KEY</code> (یا OpenAI) در .env بگذارید.\n"
-            )
-        elif int(payload.get("iran_amount") or 0) < _MIN_RECEIPT_RIAL:
-            hint_ai = (
-                "مبلغ/تاریخ خوانده نشد — متن بفرستید: "
-                "<code>مبلغ: 570000000\nتاریخ: 1405/03/07</code>\n"
-                "یا در .env مدل قوی‌تر: <code>RECEIPT_VISION_MODEL=gpt-4o</code>\n"
-            )
-        await m.reply_text(
-            f"{_RTL}⚠️ <b>برخی فیلدها خالی ماند</b> — «ویرایش فیلدها» یا متن:\n"
-            f"{hint_ai}"
-            f"<code>{chr(10).join(lines) or 'مبلغ: 287625000'}</code>",
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-        _track_tx_message(context, m.message_id)
     await _show_draft(context.bot, m.chat_id, context, mode, payload)
     raise ApplicationHandlerStop
 
@@ -2192,6 +2604,14 @@ async def iran_panel_tx_callback(update: Update, context: ContextTypes.DEFAULT_T
                 show_alert=True,
             )
             raise ApplicationHandlerStop
+        if payload.get("_recognition_blocking") and not payload.get(
+            "_recognition_reviewed"
+        ):
+            await q.answer(
+                "ابتدا هشدار رسید را با تصویر مقایسه و تأیید کنید.",
+                show_alert=True,
+            )
+            raise ApplicationHandlerStop
         ok, msg = post_transaction(
             base_url=IRAN_PANEL_BASE_URL,
             payload=_panel_payload_for_submit(payload, mode),
@@ -2205,6 +2625,16 @@ async def iran_panel_tx_callback(update: Update, context: ContextTypes.DEFAULT_T
         await _cleanup_tx_flow(context.bot, chat_id, context)
         try:
             await q.answer("✅ در سایت ایران ثبت شد.", show_alert=True)
+        except Exception:
+            pass
+        raise ApplicationHandlerStop
+
+    if action == "reviewed":
+        payload["_recognition_reviewed"] = True
+        context.user_data[_DRAFT_KEY] = payload
+        await _show_draft(context.bot, chat_id, context, mode, payload)
+        try:
+            await q.answer("بررسی ادمین ثبت شد")
         except Exception:
             pass
         raise ApplicationHandlerStop
@@ -2332,4 +2762,3 @@ async def iran_panel_fill_router(update: Update, context: ContextTypes.DEFAULT_T
         context.bot, update.effective_chat.id, context, mode, payload
     )
     raise ApplicationHandlerStop
-

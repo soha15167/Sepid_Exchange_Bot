@@ -2863,6 +2863,7 @@ def deal_gate_append_buyer_receipt(
     entry_type: str,
     text: str = "",
     file_id: str = "",
+    file_unique_id: str = "",
     source_message_id: int = 0,
 ) -> list[dict]:
     """یک فیش واریز خریدار — برمی‌گرداند لیست کامل."""
@@ -2877,13 +2878,20 @@ def deal_gate_append_buyer_receipt(
         for item in items:
             if int(item.get("source_message_id") or 0) == source_mid:
                 return items
+    unique_id = (file_unique_id or "").strip()[:256]
+    if unique_id:
+        for item in items:
+            if (item.get("file_unique_id") or "").strip() == unique_id:
+                return items
     items.append(
         {
             "type": (entry_type or "text").strip().lower(),
             "text": (text or "")[:2000],
             "file_id": (file_id or "").strip()[:256],
+            "file_unique_id": unique_id,
             "at": int(time.time()),
             "source_message_id": source_mid,
+            "accounting_status": "pending",
         }
     )
     oid = int(offer_id)
@@ -2895,6 +2903,62 @@ def deal_gate_append_buyer_receipt(
         buyer_receipt_log=json.dumps(items, ensure_ascii=False),
     )
     return items
+
+
+def deal_gate_update_buyer_receipt(
+    offer_id: int, receipt_index: int, **fields
+) -> dict | None:
+    """Update OCR/accounting metadata on one buyer receipt atomically."""
+    import json
+
+    try:
+        oid = int(offer_id)
+        idx = int(receipt_index)
+    except (TypeError, ValueError):
+        return None
+    allowed = {
+        "accounting_status",
+        "amount_rial",
+        "bank_name",
+        "transfer_type",
+        "jdate",
+        "expected_rial",
+        "cumulative_rial",
+        "remaining_rial",
+        "recognition_source",
+        "recognition_warnings",
+        "receipt_currency",
+        "receipt_fingerprint",
+        "panel_error",
+        "panel_submitted_at",
+    }
+    clean = {key: value for key, value in fields.items() if key in allowed}
+    if not clean:
+        return None
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT buyer_receipt_log FROM offer_deal_gates WHERE offer_id = ?",
+            (oid,),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            items = json.loads(row["buyer_receipt_log"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            items = []
+        if not isinstance(items, list) or idx < 0 or idx >= len(items):
+            return None
+        item = items[idx] if isinstance(items[idx], dict) else {}
+        item.update(clean)
+        items[idx] = item
+        conn.execute(
+            "UPDATE offer_deal_gates SET buyer_receipt_log = ? WHERE offer_id = ?",
+            (json.dumps(items, ensure_ascii=False), oid),
+        )
+        conn.commit()
+        return dict(item)
 
 
 def _deal_gate_seller_receipt_list_raw(gate: dict | None) -> list:

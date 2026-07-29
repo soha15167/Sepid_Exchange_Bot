@@ -30,6 +30,7 @@ File sections (search: "Section" or "بخش"):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from io import BytesIO
 import html as html_module
 import json
@@ -50,7 +51,12 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import ApplicationHandlerStop, ContextTypes
 
-from config.settings import ADMIN_IDS, BANK_CARDS, DEAL_SUPPORT_ADMIN_IDS
+from config.settings import (
+    ADMIN_IDS,
+    BANK_CARDS,
+    DEAL_SUPPORT_ADMIN_IDS,
+    IRAN_PANEL_BASE_URL,
+)
 from database.db import (
     bot_outbound_log_insert,
     bot_outbound_log_list,
@@ -67,6 +73,7 @@ from database.db import (
     deal_gate_append_buyer_receipt,
     deal_gate_append_seller_receipt,
     deal_gate_buyer_receipt_list,
+    deal_gate_update_buyer_receipt,
     deal_gate_confirm_seller_receipt_buyer,
     deal_gate_seller_receipt_list,
     deal_gate_seller_toman_admin_list,
@@ -2061,6 +2068,273 @@ def _log_receipt_consistency(
     for warning in warnings:
         _log(int(offer_id), f"هشدار بررسی فیش: {warning}", from_role="system")
     return warnings
+
+
+def _buyer_receipt_file_unique_id(message) -> str:
+    if message.photo:
+        return str(message.photo[-1].file_unique_id or "")
+    if message.document:
+        return str(message.document.file_unique_id or "")
+    return ""
+
+
+def _buyer_receipt_index(
+    items: list[dict], *, source_message_id: int, file_unique_id: str = ""
+) -> int:
+    source_mid = int(source_message_id or 0)
+    unique_id = (file_unique_id or "").strip()
+    for index, item in enumerate(items):
+        if source_mid and int(item.get("source_message_id") or 0) == source_mid:
+            return index
+    if unique_id:
+        for index, item in enumerate(items):
+            if (item.get("file_unique_id") or "").strip() == unique_id:
+                return index
+    return len(items) - 1
+
+
+def _buyer_expected_rial(gate: dict) -> int:
+    """Highlighted buyer final amount from the deal, converted Toman → Rial."""
+    oid = int(gate.get("offer_id") or 0)
+    row = get_advert_offer_joined(oid) if oid else None
+    advert = get_euro_advert_by_rowid(int(gate.get("advert_rowid") or 0))
+    if not row or not advert:
+        return 0
+    try:
+        from handlers.offers import buyer_deposit_toman_amount
+
+        return int(buyer_deposit_toman_amount(advert, row) or 0) * 10
+    except Exception:
+        logger.exception("deal_receipt_accounting: expected amount failed offer=%s", oid)
+        return 0
+
+
+def _buyer_dealer_name(gate: dict) -> str:
+    buyer_id = int(gate.get("buyer_telegram_id") or 0)
+    user = get_user(buyer_id) if buyer_id else None
+    if not user:
+        return str(buyer_id) if buyer_id else ""
+    return (
+        str(user.get("display_name") or "").strip()
+        or str(user.get("username") or "").strip().lstrip("@")
+        or str(user.get("full_name") or "").strip()
+        or str(buyer_id)
+    )[:80]
+
+
+def _receipt_fingerprint(raw: str, file_unique_id: str = "") -> str:
+    unique_id = (file_unique_id or "").strip()
+    if unique_id:
+        return f"tg:{unique_id}"
+    normalized = re.sub(r"\s+", " ", (raw or "").strip().lower())
+    return f"text:{hashlib.sha256(normalized.encode('utf-8')).hexdigest()}" if normalized else ""
+
+
+async def _download_deal_receipt(
+    bot, file_id: str, *, entry_type: str
+) -> str:
+    suffix = ".pdf" if entry_type == "document" else ".jpg"
+    fd, path = tempfile.mkstemp(prefix="deal_receipt_", suffix=suffix)
+    os.close(fd)
+    try:
+        telegram_file = await bot.get_file(file_id)
+        await telegram_file.download_to_drive(custom_path=path)
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+            return path
+    except Exception:
+        logger.exception("deal_receipt_accounting: download failed")
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return ""
+
+
+async def _auto_account_buyer_receipt(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    gate: dict,
+    receipt_index: int,
+    entry_type: str,
+    text: str = "",
+    file_id: str = "",
+    file_unique_id: str = "",
+) -> None:
+    """Read and submit one buyer receipt as a deal-bound Iran-panel txin."""
+    oid = int(gate.get("offer_id") or 0)
+    aid = int(gate.get("advert_rowid") or 0)
+    items = deal_gate_buyer_receipt_list(oid)
+    if receipt_index < 0 or receipt_index >= len(items):
+        return
+    current_status = (items[receipt_index].get("accounting_status") or "").strip()
+    if current_status in ("submitted", "processing", "duplicate"):
+        return
+    deal_gate_update_buyer_receipt(
+        oid, receipt_index, accounting_status="processing", panel_error=""
+    )
+
+    expected_rial = _buyer_expected_rial(gate)
+    path = ""
+    payload: dict = {}
+    raw = (text or "").strip()
+    source = "text"
+    try:
+        from handlers.iran_panel_sync import (
+            _assess_receipt_payload,
+            _normalize_bank_input,
+            _panel_payload_for_submit,
+            _parse_payload_in,
+            _read_receipt_image,
+            _receipt_text_currency,
+        )
+
+        if file_id:
+            path = await _download_deal_receipt(
+                context.bot, file_id, entry_type=entry_type
+            )
+            if not path:
+                raise RuntimeError("receipt_download_failed")
+            vision_payload, image_raw, source = await _read_receipt_image(path, "in")
+            raw = "\n".join(
+                part for part in ((image_raw or "").strip(), raw) if part
+            )
+            payload = vision_payload or _parse_payload_in(raw)[0]
+        else:
+            payload = _parse_payload_in(raw)[0]
+
+        payload["depositor_name"] = _buyer_dealer_name(gate)
+        payload["description"] = f"آگهی {aid}"
+        payload["bank_name"] = _normalize_bank_input(payload.get("bank_name") or "")
+        payload = _assess_receipt_payload(payload, raw, "in", source)
+
+        amount_rial = int(payload.get("iran_amount") or 0)
+        submitted_total = sum(
+            int(item.get("amount_rial") or 0)
+            for index, item in enumerate(deal_gate_buyer_receipt_list(oid))
+            if index != receipt_index
+            and (item.get("accounting_status") or "") == "submitted"
+        )
+        remaining_before = max(0, expected_rial - submitted_total)
+        currency = str(payload.get("_receipt_currency") or "").strip().lower()
+        if not currency or currency == "unknown":
+            currency = _receipt_text_currency(raw)
+        if currency == "unknown" and amount_rial > 0:
+            if amount_rial == remaining_before:
+                currency = "rial"
+            elif amount_rial * 10 == remaining_before:
+                amount_rial *= 10
+                payload["iran_amount"] = amount_rial
+                currency = "toman_inferred_from_exact_remaining"
+
+        fingerprint = _receipt_fingerprint(raw, file_unique_id)
+        duplicate = any(
+            index != receipt_index
+            and fingerprint
+            and (item.get("receipt_fingerprint") or "") == fingerprint
+            and (item.get("accounting_status") or "") in ("submitted", "processing")
+            for index, item in enumerate(deal_gate_buyer_receipt_list(oid))
+        )
+        warnings = list(payload.get("_recognition_warnings") or [])
+        if duplicate:
+            deal_gate_update_buyer_receipt(
+                oid,
+                receipt_index,
+                accounting_status="duplicate",
+                receipt_fingerprint=fingerprint,
+                expected_rial=expected_rial,
+                recognition_warnings=["فیش تکراری"],
+            )
+            return
+        if currency == "unknown":
+            warnings.append("واحد مبلغ مشخص نیست و با ماندهٔ معامله تطبیق قطعی ندارد")
+        if expected_rial <= 0:
+            warnings.append("مبلغ نهایی خریدار از معامله محاسبه نشد")
+        cumulative = submitted_total + amount_rial
+        if expected_rial > 0 and cumulative > expected_rial:
+            warnings.append("جمع فیش‌ها از مبلغ نهایی خریدار بیشتر می‌شود")
+        if amount_rial <= 0:
+            warnings.append("مبلغ فیش خوانده نشد")
+        if not (payload.get("bank_name") or "").strip():
+            warnings.append("بانک حساب مقصد خوانده نشد")
+        if payload.get("_recognition_blocking"):
+            warnings.extend(payload.get("_recognition_warnings") or [])
+        warnings = list(dict.fromkeys(str(item) for item in warnings if item))
+
+        metadata = {
+            "amount_rial": amount_rial,
+            "bank_name": payload.get("bank_name") or "",
+            "transfer_type": payload.get("transfer_type") or "",
+            "jdate": payload.get("jdate") or "",
+            "expected_rial": expected_rial,
+            "cumulative_rial": cumulative,
+            "remaining_rial": max(0, expected_rial - cumulative),
+            "recognition_source": source,
+            "recognition_warnings": warnings,
+            "receipt_currency": currency,
+            "receipt_fingerprint": fingerprint,
+        }
+        if warnings:
+            deal_gate_update_buyer_receipt(
+                oid, receipt_index, accounting_status="review", **metadata
+            )
+            _log(
+                oid,
+                "ثبت خودکار ورودی نیازمند بررسی ادمین: " + "؛ ".join(warnings),
+                from_role="system",
+            )
+            return
+
+        panel_payload = _panel_payload_for_submit(payload, "in")
+        from utils.iran_panel_client import post_transaction
+
+        ok, panel_message = await asyncio.to_thread(
+            post_transaction,
+            base_url=IRAN_PANEL_BASE_URL,
+            payload=panel_payload,
+        )
+        if not ok:
+            deal_gate_update_buyer_receipt(
+                oid,
+                receipt_index,
+                accounting_status="panel_failed",
+                panel_error=str(panel_message)[:300],
+                **metadata,
+            )
+            _log(oid, f"ثبت خودکار ورودی سایت ناموفق: {panel_message}", from_role="system")
+            return
+        deal_gate_update_buyer_receipt(
+            oid,
+            receipt_index,
+            accounting_status="submitted",
+            panel_submitted_at=int(time.time()),
+            panel_error="",
+            **metadata,
+        )
+        _log(
+            oid,
+            f"ثبت خودکار ورودی سایت: {amount_rial:,} ریال · آگهی {aid}",
+            from_role="system",
+        )
+    except Exception as exc:
+        logger.exception("deal_receipt_accounting failed offer=%s", oid)
+        deal_gate_update_buyer_receipt(
+            oid,
+            receipt_index,
+            accounting_status="review",
+            expected_rial=expected_rial,
+            panel_error=type(exc).__name__,
+            recognition_warnings=["خواندن خودکار فیش ناموفق بود"],
+        )
+    finally:
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        try:
+            await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
+        except Exception:
+            logger.exception("deal_receipt_accounting: admin sync failed offer=%s", oid)
 
 
 async def _expire_stale_deal_button(query, message: str) -> None:
@@ -6154,11 +6428,14 @@ async def _deal_receipt_try_message(
             advert_rowid=int(gate.get("advert_rowid") or 0),
         )
         return True
-    deal_gate_append_buyer_receipt(
+    buyer_items = deal_gate_append_buyer_receipt(
         oid,
         entry_type="text",
         text=text,
         source_message_id=update.message.message_id,
+    )
+    buyer_index = _buyer_receipt_index(
+        buyer_items, source_message_id=update.message.message_id
     )
     gate = deal_gate_get(oid) or gate
     _log_receipt_consistency(oid, gate, text, receipt_kind="buyer_toman")
@@ -6168,6 +6445,13 @@ async def _deal_receipt_try_message(
         update,
         party="buyer",
         advert_rowid=int(gate.get("advert_rowid") or 0),
+    )
+    await _auto_account_buyer_receipt(
+        context,
+        gate=gate,
+        receipt_index=buyer_index,
+        entry_type="text",
+        text=text,
     )
     return True
 
@@ -6244,12 +6528,19 @@ async def _deal_receipt_try_photo(
             advert_rowid=int(gate.get("advert_rowid") or 0),
         )
         return True
-    deal_gate_append_buyer_receipt(
+    file_unique_id = _buyer_receipt_file_unique_id(update.message)
+    buyer_items = deal_gate_append_buyer_receipt(
         oid,
         entry_type=entry_type,
         text=cap,
         file_id=fid,
+        file_unique_id=file_unique_id,
         source_message_id=update.message.message_id,
+    )
+    buyer_index = _buyer_receipt_index(
+        buyer_items,
+        source_message_id=update.message.message_id,
+        file_unique_id=file_unique_id,
     )
     gate = deal_gate_get(oid) or gate
     _log_receipt_consistency(
@@ -6261,6 +6552,15 @@ async def _deal_receipt_try_photo(
         update,
         party="buyer",
         advert_rowid=int(gate.get("advert_rowid") or 0),
+    )
+    await _auto_account_buyer_receipt(
+        context,
+        gate=gate,
+        receipt_index=buyer_index,
+        entry_type=entry_type,
+        text=cap,
+        file_id=fid,
+        file_unique_id=file_unique_id,
     )
     return True
 

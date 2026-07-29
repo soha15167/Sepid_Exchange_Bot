@@ -802,7 +802,9 @@ def main():
     # ورود مرحله‌ای اطلاعات یورو / معاوضه
     _private_text = filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND
     _iran_fill_text = filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND
-    _iran_txn = filters.ChatType.PRIVATE & ~filters.COMMAND
+    # Receipt media is handled once in group 5. Group 7 is text-only so an
+    # early image-read failure cannot process and notify for the same file twice.
+    _iran_txn = filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND
     _iran_receipt_media = (
         filters.ChatType.PRIVATE
         & (filters.PHOTO | filters.Document.IMAGE)
