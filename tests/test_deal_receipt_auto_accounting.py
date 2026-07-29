@@ -231,7 +231,10 @@ class BuyerReceiptAutoAccountingTests(unittest.IsolatedAsyncioTestCase):
             for row in sent["reply_markup"].inline_keyboard
             for button in row
         ]
-        self.assertEqual(callback_data, ["adm|rcptok|258|0", "adm|rcptno|258|0"])
+        self.assertEqual(
+            callback_data,
+            ["adm|rcptedit|258|0", "adm|rcptok|258|0", "adm|rcptno|258|0"],
+        )
 
     async def test_completed_preview_messages_are_deleted(self):
         bot = SimpleNamespace(delete_message=AsyncMock())

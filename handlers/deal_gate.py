@@ -137,6 +137,7 @@ _ACC_PENDING_KEY = "deal_acc_pending"
 _DEAL_ACC_OFFER_KEY = "deal_gate_accounts_offer_id"
 _DEAL_ACC_REQUIRE_PICK_KEY = "deal_gate_accounts_require_pick"
 _DEAL_RCPT_KEY = "deal_rcpt_pending"
+_DEAL_RCPT_EDIT_KEY = "deal_rcpt_admin_edit_pending"
 _DEAL_ADMIN_STOM_KEY = "deal_admin_stom_pending"
 _DEAL_ADMIN_PXY_KEY = "deal_admin_pxy_pending"
 _ACCOUNT_PHOTO_MARKER = "📷 عکس حساب"
@@ -245,6 +246,7 @@ def is_deal_receipt_flow_active(context: ContextTypes.DEFAULT_TYPE) -> bool:
         ud.get(_DEAL_ADMIN_PXY_KEY)
         or ud.get(_DEAL_ADMIN_STOM_KEY)
         or ud.get(_DEAL_RCPT_KEY)
+        or ud.get(_DEAL_RCPT_EDIT_KEY)
     )
 
 # =============================================================================
@@ -1804,6 +1806,14 @@ def deal_admin_payment_only_rows(
                     ),
                 ]
             )
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "✏️ ویرایش فیلدها",
+                        callback_data=f"adm|rcptedit|{oid}|{receipt_index}",
+                    )
+                ]
+            )
     toman_settled = int(gate.get("buyer_toman_settled_at") or 0) > 0
     if card_sent and not toman_settled:
         rows.append(
@@ -2359,6 +2369,8 @@ async def _auto_account_buyer_receipt(
         metadata = {
             "amount_rial": amount_rial,
             "recognized_amount_rial": recognized_amount_rial,
+            "depositor_name": payload.get("depositor_name") or "",
+            "description": payload.get("description") or "",
             "bank_name": payload.get("bank_name") or "",
             "transfer_type": payload.get("transfer_type") or "",
             "jdate": payload.get("jdate") or "",
@@ -2436,8 +2448,8 @@ async def _send_deal_receipt_review_preview(
         "bank_name": receipt.get("bank_name") or "",
         "transfer_type": receipt.get("transfer_type") or "",
         "jdate": receipt.get("jdate") or "",
-        "depositor_name": _buyer_dealer_name(gate),
-        "description": f"آگهی {aid}",
+        "depositor_name": receipt.get("depositor_name") or _buyer_dealer_name(gate),
+        "description": receipt.get("description") or f"آگهی {aid}",
     }
     from handlers.iran_panel_sync import _render_draft_html
 
@@ -2450,6 +2462,12 @@ async def _send_deal_receipt_review_preview(
         )
     keyboard = InlineKeyboardMarkup(
         [
+            [
+                InlineKeyboardButton(
+                    "✏️ ویرایش فیلدها",
+                    callback_data=f"adm|rcptedit|{oid}|{int(receipt_index)}",
+                )
+            ],
             [
                 InlineKeyboardButton(
                     "✅ بررسی کردم؛ ثبت در سایت",
@@ -2557,8 +2575,8 @@ async def _handle_admin_receipt_review(
         "bank_name": item.get("bank_name") or "",
         "transfer_type": item.get("transfer_type") or "",
         "jdate": item.get("jdate") or "",
-        "depositor_name": _buyer_dealer_name(gate),
-        "description": f"آگهی {int(gate.get('advert_rowid') or 0)}",
+        "depositor_name": item.get("depositor_name") or _buyer_dealer_name(gate),
+        "description": item.get("description") or f"آگهی {int(gate.get('advert_rowid') or 0)}",
     }
     from handlers.iran_panel_sync import _panel_payload_for_submit
     from utils.iran_panel_client import post_transaction
@@ -2650,6 +2668,126 @@ async def _handle_admin_receipt_recheck(
         file_id=reopened.get("file_id") or "",
         file_unique_id=reopened.get("file_unique_id") or "",
     )
+
+
+def _deal_receipt_edit_fields_keyboard(
+    offer_id: int, receipt_index: int
+) -> InlineKeyboardMarkup:
+    oid, idx = int(offer_id), int(receipt_index)
+    fields = [
+        ("مبلغ", "amt"), ("بانک", "bank"),
+        ("نام", "name"), ("نوع حواله", "type"),
+        ("تاریخ", "date"), ("توضیحات", "desc"),
+    ]
+    rows = []
+    for start in range(0, len(fields), 2):
+        rows.append([
+            InlineKeyboardButton(
+                f"✏️ {label}",
+                callback_data=f"adm|rcptfld|{oid}|{idx}|{field}",
+            )
+            for label, field in fields[start:start + 2]
+        ])
+    rows.append([
+        InlineKeyboardButton(
+            "❌ انصراف", callback_data=f"adm|rcptedcancel|{oid}|{idx}"
+        )
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _handle_admin_receipt_edit_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    offer_id: int,
+    receipt_index: int,
+    field: str = "",
+    cancel: bool = False,
+) -> None:
+    q = update.callback_query
+    if not q or not await _require_full_deal_admin(q):
+        return
+    items = deal_gate_buyer_receipt_list(offer_id)
+    if receipt_index < 0 or receipt_index >= len(items) or (
+        items[receipt_index].get("accounting_status") or ""
+    ) not in {"ready_for_review", "panel_failed"}:
+        await q.answer("این پیش‌نمایش دیگر قابل ویرایش نیست.", show_alert=True)
+        return
+    if cancel:
+        context.user_data.pop(_DEAL_RCPT_EDIT_KEY, None)
+        await q.answer("ویرایش لغو شد.")
+        return
+    if not field:
+        await q.answer()
+        if q.message:
+            await q.message.edit_reply_markup(
+                reply_markup=_deal_receipt_edit_fields_keyboard(offer_id, receipt_index)
+            )
+        return
+    if field not in {"amt", "bank", "name", "type", "date", "desc"}:
+        await q.answer("فیلد نامعتبر است.", show_alert=True)
+        return
+    context.user_data[_DEAL_RCPT_EDIT_KEY] = {
+        "offer_id": int(offer_id), "receipt_index": int(receipt_index), "field": field
+    }
+    await q.answer()
+    await context.bot.send_message(
+        chat_id=int(q.from_user.id),
+        text="مقدار جدید را بفرستید. مبلغ باید به ریال باشد.",
+    )
+
+
+async def _deal_admin_receipt_edit_try_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    pending = context.user_data.get(_DEAL_RCPT_EDIT_KEY)
+    if not isinstance(pending, dict) or not update.message or not update.effective_user:
+        return False
+    if not _is_full_deal_admin(int(update.effective_user.id)):
+        context.user_data.pop(_DEAL_RCPT_EDIT_KEY, None)
+        return False
+    oid = int(pending.get("offer_id") or 0)
+    idx = int(pending.get("receipt_index") or -1)
+    field = str(pending.get("field") or "")
+    items = deal_gate_buyer_receipt_list(oid)
+    gate = deal_gate_get(oid)
+    if not gate or idx < 0 or idx >= len(items) or (
+        items[idx].get("accounting_status") or ""
+    ) not in {"ready_for_review", "panel_failed"}:
+        context.user_data.pop(_DEAL_RCPT_EDIT_KEY, None)
+        await update.message.reply_text("این پیش‌نمایش دیگر قابل ویرایش نیست.")
+        return True
+    value = (update.message.text or "").strip()
+    if not value:
+        await update.message.reply_text("مقدار خالی قابل ثبت نیست.")
+        return True
+    fields: dict = {}
+    if field == "amt":
+        normalized = value.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
+        digits = re.sub(r"[^0-9]", "", normalized)
+        amount = int(digits or 0)
+        if amount <= 0:
+            await update.message.reply_text("مبلغ معتبر به ریال بفرستید.")
+            return True
+        fields.update(amount_rial=amount, recognized_amount_rial=amount)
+    elif field == "bank":
+        from handlers.iran_panel_sync import _normalize_bank_input
+        fields["bank_name"] = _normalize_bank_input(value)
+    else:
+        fields[{"name": "depositor_name", "type": "transfer_type", "date": "jdate", "desc": "description"}[field]] = value[:200]
+    old = items[idx]
+    updated = deal_gate_update_buyer_receipt(oid, idx, **fields)
+    context.user_data.pop(_DEAL_RCPT_EDIT_KEY, None)
+    if not updated:
+        await update.message.reply_text("ویرایش ذخیره نشد؛ دوباره تلاش کنید.")
+        return True
+    await _close_deal_receipt_previews(context.bot, old)
+    await _send_deal_receipt_review_preview(
+        context.bot, gate=gate, receipt_index=idx, receipt=updated
+    )
+    await update.message.reply_text("✅ فیلد ویرایش شد و پیش‌نمایش جدید ساخته شد.")
+    return True
 
 
 def _receipt_accounting_log(offer_id: int, text: str, *, from_role: str) -> None:
@@ -6891,6 +7029,8 @@ async def _deal_receipt_try_photo(
 async def deal_gate_group0_text_router(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
+    if await _deal_admin_receipt_edit_try_message(update, context):
+        raise ApplicationHandlerStop
     if await _deal_admin_stom_try_message(update, context):
         raise ApplicationHandlerStop
     if await _deal_admin_proxy_receipt_try_message(update, context):
@@ -6983,6 +7123,26 @@ async def deal_gate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
         await _handle_admin_receipt_recheck(
             update, context, offer_id=callback_offer_id, receipt_index=receipt_index
+        )
+    elif parts[0] == "adm" and parts[1] in {"rcptedit", "rcptedcancel"} and len(parts) >= 4:
+        try:
+            receipt_index = int(parts[3])
+        except (TypeError, ValueError):
+            await q.answer("دکمه نامعتبر است.", show_alert=True)
+            return
+        await _handle_admin_receipt_edit_callback(
+            update, context, offer_id=callback_offer_id,
+            receipt_index=receipt_index, cancel=parts[1] == "rcptedcancel",
+        )
+    elif parts[0] == "adm" and parts[1] == "rcptfld" and len(parts) >= 5:
+        try:
+            receipt_index = int(parts[3])
+        except (TypeError, ValueError):
+            await q.answer("دکمه نامعتبر است.", show_alert=True)
+            return
+        await _handle_admin_receipt_edit_callback(
+            update, context, offer_id=callback_offer_id,
+            receipt_index=receipt_index, field=parts[4],
         )
 
 

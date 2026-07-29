@@ -2920,6 +2920,8 @@ def deal_gate_update_buyer_receipt(
         "accounting_status",
         "amount_rial",
         "recognized_amount_rial",
+        "depositor_name",
+        "description",
         "bank_name",
         "transfer_type",
         "jdate",
