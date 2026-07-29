@@ -2893,6 +2893,39 @@ async def admin_dashboard_callback(update: Update, context: ContextTypes.DEFAULT
             await query.answer("پیام کامل معامله برای ادمین نمایش داده شد", show_alert=True)
             return
 
+        if len(parts) > 3 and parts[2] == "usersync":
+            try:
+                oid = int(parts[3])
+            except (TypeError, ValueError):
+                await query.answer("شناسه نامعتبر", show_alert=True)
+                return
+            from database.db import deal_gate_get
+            from handlers.deal_gate import sync_deal_party_summaries
+
+            gate = deal_gate_get(oid)
+            if not gate:
+                await query.answer("معامله پیدا نشد", show_alert=True)
+                return
+            status = (gate.get("gate_status") or "").strip().lower()
+            if status not in {"accounts", "completed"}:
+                await query.answer(
+                    "این معامله هنوز توسط هر دو طرف تأیید نشده است",
+                    show_alert=True,
+                )
+                return
+            sent, failed = await sync_deal_party_summaries(context, oid)
+            if failed or sent != 2:
+                await query.answer(
+                    f"بروزرسانی برای {sent} کاربر ارسال شد؛ {failed} خطا",
+                    show_alert=True,
+                )
+            else:
+                await query.answer(
+                    "اطلاعات به‌روز معامله برای خریدار و فروشنده ارسال شد",
+                    show_alert=True,
+                )
+            return
+
         if len(parts) > 3 and parts[2] in ("bacc", "sacc"):
             try:
                 oid = int(parts[3])

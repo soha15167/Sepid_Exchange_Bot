@@ -5606,7 +5606,11 @@ def _deal_gate_admin_completed_keyboard(offer_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(
                 "🔄 بروزرسانی پیام ادمین",
                 callback_data=f"adm|dgs|resync|{oid}",
-            )
+            ),
+            InlineKeyboardButton(
+                "👥 بروزرسانی کاربران",
+                callback_data=f"adm|dgs|usersync|{oid}",
+            ),
         ]
     )
     rows.append(
@@ -5627,6 +5631,54 @@ def _deal_gate_admin_completed_keyboard(offer_id: int) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("🔙 لیست معاملات", callback_data="adm|dgs")])
     rows.append([InlineKeyboardButton("🔙 پنل مدیریت", callback_data="adm|panel")])
     return InlineKeyboardMarkup(rows)
+
+
+async def sync_deal_party_summaries(
+    context: ContextTypes.DEFAULT_TYPE,
+    offer_id: int,
+) -> tuple[int, int]:
+    """Send the current accepted-deal summary to its exact buyer and seller."""
+    oid = int(offer_id)
+    gate = deal_gate_get(oid)
+    row = get_advert_offer_joined(oid)
+    if not gate or not row:
+        return 0, 0
+    advert = get_euro_advert_by_rowid(int(row["advert_rowid"]))
+    if not advert:
+        return 0, 0
+
+    from handlers.offers import (
+        _deal_complete_party_message_html,
+        _deal_complete_reply_markup,
+    )
+    from utils.deal_outbound import deal_bot_send_message, party_for_uid
+
+    sent = 0
+    failed = 0
+    heading = f"{_RTL}🔄 <b>اطلاعات به‌روزشده معامله</b>\n\n"
+    reply_markup = _deal_complete_reply_markup(advert)
+    recipients = {
+        int(gate.get("buyer_telegram_id") or 0),
+        int(gate.get("seller_telegram_id") or 0),
+    }
+    recipients.discard(0)
+    for uid in recipients:
+        try:
+            await deal_bot_send_message(
+                context.bot,
+                offer_id=oid,
+                chat_id=uid,
+                party=party_for_uid(gate, uid),
+                tag="بروزرسانی اطلاعات معامله توسط ادمین",
+                text=heading + _deal_complete_party_message_html(advert, row, uid),
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+            sent += 1
+        except Exception:
+            failed += 1
+            logger.exception("deal_gate: party summary resync failed offer=%s", oid)
+    return sent, failed
 
 
 def build_admin_deal_list_html(gates: list[dict]) -> str:

@@ -9,6 +9,30 @@ from unittest.mock import AsyncMock, Mock, patch
 
 
 class AdminFullDealMessageTests(unittest.IsolatedAsyncioTestCase):
+    def test_completed_keyboard_has_separate_admin_and_user_update_buttons(self):
+        from handlers import deal_gate
+
+        with patch.object(
+            deal_gate,
+            "deal_gate_get",
+            return_value={"offer_id": 264, "gate_status": "completed"},
+        ):
+            keyboard = deal_gate._deal_gate_admin_completed_keyboard(264)
+
+        callbacks = [
+            button.callback_data
+            for row in keyboard.inline_keyboard
+            for button in row
+        ]
+        self.assertIn("adm|dgs|resync|264", callbacks)
+        self.assertIn("adm|dgs|usersync|264", callbacks)
+        update_row = next(
+            row
+            for row in keyboard.inline_keyboard
+            if any(button.callback_data == "adm|dgs|resync|264" for button in row)
+        )
+        self.assertEqual(len(update_row), 2)
+
     async def test_problem_dashboard_is_opened_only_on_admin_request(self):
         from handlers import admin
 
@@ -134,6 +158,84 @@ class AdminFullDealMessageTests(unittest.IsolatedAsyncioTestCase):
             264,
             deal_complete=True,
         )
+
+    async def test_user_resync_callback_sends_current_summary_to_both_parties(self):
+        from handlers import admin
+
+        query = SimpleNamespace(
+            data="adm|dgs|usersync|264",
+            from_user=SimpleNamespace(id=7001),
+            message=SimpleNamespace(chat_id=7001, message_id=9003),
+            answer=AsyncMock(),
+        )
+        context = SimpleNamespace(bot=object(), user_data={})
+
+        with (
+            patch.object(admin, "_is_admin", return_value=True),
+            patch(
+                "database.db.deal_gate_get",
+                return_value={"offer_id": 264, "gate_status": "completed"},
+            ),
+            patch(
+                "handlers.deal_gate.sync_deal_party_summaries",
+                new=AsyncMock(return_value=(2, 0)),
+            ) as sync,
+        ):
+            await admin.admin_dashboard_callback(
+                SimpleNamespace(callback_query=query),
+                context,
+            )
+
+        sync.assert_awaited_once_with(context, 264)
+        self.assertIn("خریدار و فروشنده", query.answer.await_args_list[-1].args[0])
+
+
+class DealPartySummarySyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_summary_uses_exact_gate_parties_and_current_joined_offer(self):
+        from handlers import deal_gate
+
+        gate = {
+            "offer_id": 264,
+            "buyer_telegram_id": 111,
+            "seller_telegram_id": 222,
+        }
+        row = {
+            "id": 264,
+            "advert_rowid": 3505,
+            "seq_in_advert": 2,
+            "rate_toman": 210000,
+            "proposed_euro_amount": 500,
+            "owner_id": 111,
+        }
+        advert = {"rowid": 3505, "operation": "فروش", "euro_amount": 500}
+        send = AsyncMock(return_value=SimpleNamespace(message_id=1))
+
+        with (
+            patch.object(deal_gate, "deal_gate_get", return_value=gate),
+            patch.object(deal_gate, "get_advert_offer_joined", return_value=row),
+            patch.object(deal_gate, "get_euro_advert_by_rowid", return_value=advert),
+            patch(
+                "handlers.offers._deal_complete_party_message_html",
+                side_effect=lambda _advert, current_row, uid: (
+                    f"current={current_row['rate_toman']} user={uid}"
+                ),
+            ),
+            patch(
+                "handlers.offers._deal_complete_reply_markup",
+                return_value=None,
+            ),
+            patch("utils.deal_outbound.deal_bot_send_message", new=send),
+            patch("utils.deal_outbound.party_for_uid", side_effect=lambda _g, uid: str(uid)),
+        ):
+            result = await deal_gate.sync_deal_party_summaries(
+                SimpleNamespace(bot=object()),
+                264,
+            )
+
+        self.assertEqual(result, (2, 0))
+        self.assertEqual({call.kwargs["chat_id"] for call in send.await_args_list}, {111, 222})
+        for call in send.await_args_list:
+            self.assertIn("current=210000", call.kwargs["text"])
 
 
 class AdminTerminalStatusTests(unittest.IsolatedAsyncioTestCase):
