@@ -2302,14 +2302,9 @@ async def _auto_account_buyer_receipt(
             and (item.get("accounting_status") or "") == "submitted"
         )
         remaining_before = max(0, expected_rial - submitted_total)
-        detected_direction = str(payload.get("_detected_direction") or "").strip().lower()
-        amount_rial, fee_adjusted = _deal_bound_receipt_amount(
-            amount_rial,
-            remaining_before,
-            detected_direction=detected_direction,
-        )
-        if fee_adjusted:
-            payload["iran_amount"] = amount_rial
+        # The website entry must use the amount confirmed in the receipt
+        # preview. Deal reconciliation may warn, but must never replace it.
+        fee_adjusted = False
         currency = str(payload.get("_receipt_currency") or "").strip().lower()
         if not currency or currency == "unknown":
             currency = _receipt_text_currency(raw)
@@ -2436,7 +2431,6 @@ async def _send_deal_receipt_review_preview(
     recognized_amount = int(
         receipt.get("recognized_amount_rial") or receipt.get("amount_rial") or 0
     )
-    submit_amount = int(receipt.get("amount_rial") or 0)
     payload = {
         "iran_amount": recognized_amount,
         "bank_name": receipt.get("bank_name") or "",
@@ -2448,12 +2442,6 @@ async def _send_deal_receipt_review_preview(
     from handlers.iran_panel_sync import _render_draft_html
 
     text = _render_draft_html("in", payload)
-    if submit_amount != recognized_amount:
-        text += (
-            f"\n{_RTL}ℹ️ <b>مبلغ پیشنهادی ثبت سایت پس از تطبیق معامله:</b> "
-            f"<code>{submit_amount:,}</code> ریال\n"
-            f"{_RTL}<i>مبلغ بالای پیش‌نویس، مبلغ واقعی خوانده‌شده از فیش است.</i>\n"
-        )
     warnings = receipt.get("recognition_warnings") or []
     if warnings:
         text += (
@@ -2476,21 +2464,55 @@ async def _send_deal_receipt_review_preview(
             ],
         ]
     )
+    preview_message_ids: dict[str, int] = {}
     for admin_id in sorted({int(value) for value in ADMIN_IDS if int(value) > 0}):
         try:
-            await bot.send_message(
+            sent = await bot.send_message(
                 chat_id=admin_id,
                 text=text,
                 parse_mode=ParseMode.HTML,
                 reply_markup=keyboard,
                 disable_web_page_preview=True,
             )
+            preview_message_ids[str(admin_id)] = int(sent.message_id)
         except Exception:
             logger.exception(
                 "deal_receipt_accounting: preview send failed offer=%s admin=%s",
                 oid,
                 admin_id,
             )
+    if preview_message_ids:
+        deal_gate_update_buyer_receipt(
+            oid,
+            receipt_index,
+            preview_message_ids=json.dumps(preview_message_ids),
+        )
+
+
+async def _close_deal_receipt_previews(bot, item: dict, query=None) -> None:
+    """Delete every stored standalone preview after approval or rejection."""
+    raw = item.get("preview_message_ids") or "{}"
+    try:
+        stored = raw if isinstance(raw, dict) else json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        stored = {}
+    deleted: set[tuple[int, int]] = set()
+    if isinstance(stored, dict):
+        for chat_id, message_id in stored.items():
+            try:
+                key = (int(chat_id), int(message_id))
+                await bot.delete_message(chat_id=key[0], message_id=key[1])
+                deleted.add(key)
+            except Exception:
+                logger.exception("deal_receipt_accounting: preview delete failed")
+    query_message = getattr(query, "message", None) if query else None
+    if query_message:
+        key = (int(query_message.chat_id), int(query_message.message_id))
+        if key not in deleted:
+            try:
+                await query_message.delete()
+            except Exception:
+                logger.exception("deal_receipt_accounting: clicked preview delete failed")
 
 
 async def _handle_admin_receipt_review(
@@ -2513,6 +2535,7 @@ async def _handle_admin_receipt_review(
         )
         if item:
             _receipt_accounting_log(offer_id, "ادمین فیش ورودی را رد کرد؛ ثبت سایت انجام نشد", from_role="admin")
+            await _close_deal_receipt_previews(context.bot, item, q)
         await sync_deal_admin_notification(context.bot, offer_id, deal_complete=True)
         return
     item = deal_gate_claim_buyer_receipt_submission(offer_id, receipt_index)
@@ -2540,6 +2563,7 @@ async def _handle_admin_receipt_review(
         )
         _receipt_accounting_log(offer_id, "ادمین فیش ورودی را تایید و در سایت ثبت کرد", from_role="admin")
         await q.answer("فیش در سایت ثبت شد.", show_alert=True)
+        await _close_deal_receipt_previews(context.bot, item, q)
     else:
         deal_gate_update_buyer_receipt(
             offer_id, receipt_index, accounting_status="panel_failed",

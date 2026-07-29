@@ -2386,7 +2386,6 @@ def _buyer_toman_receipt_admin_line_html(
         amount = int(
             latest.get("recognized_amount_rial") or latest.get("amount_rial") or 0
         )
-        submit_amount = int(latest.get("amount_rial") or 0)
         bank = html_module.escape(str(latest.get("bank_name") or "نامشخص"))
         transfer = html_module.escape(str(latest.get("transfer_type") or "نامشخص"))
         jdate = html_module.escape(str(latest.get("jdate") or "نامشخص"))
@@ -2394,11 +2393,6 @@ def _buyer_toman_receipt_admin_line_html(
             blk += (
                 f"{_RTL}🔎 <b>پیش‌نمایش:</b> <code>{amount:,}</code> ریال · "
                 f"بانک {bank} · {transfer} · {jdate}\n"
-            )
-        if submit_amount > 0 and submit_amount != amount:
-            blk += (
-                f"{_RTL}ℹ️ <b>مبلغ پیشنهادی ثبت سایت:</b> "
-                f"<code>{submit_amount:,}</code> ریال\n"
             )
         warnings = latest.get("recognition_warnings") or []
         if warnings:

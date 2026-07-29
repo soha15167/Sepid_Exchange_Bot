@@ -2933,6 +2933,7 @@ def deal_gate_update_buyer_receipt(
         "panel_error",
         "panel_submitted_at",
         "fee_adjusted_to_remaining",
+        "preview_message_ids",
     }
     clean = {key: value for key, value in fields.items() if key in allowed}
     if not clean:
