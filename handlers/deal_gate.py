@@ -5684,7 +5684,7 @@ async def sync_deal_party_summaries(
                         oid,
                         uid,
                         party,
-                        "ویرایش اطلاعات معامله توسط ادمین",
+                        "پیام تکمیل معامله + منوی اصلی",
                         text,
                         telegram_message_id=message_id,
                     )
