@@ -208,7 +208,7 @@ class DealPartySummarySyncTests(unittest.IsolatedAsyncioTestCase):
             "owner_id": 111,
         }
         advert = {"rowid": 3505, "operation": "فروش", "euro_amount": 500}
-        send = AsyncMock(return_value=SimpleNamespace(message_id=1))
+        bot = SimpleNamespace(edit_message_text=AsyncMock())
 
         with (
             patch.object(deal_gate, "deal_gate_get", return_value=gate),
@@ -224,18 +224,32 @@ class DealPartySummarySyncTests(unittest.IsolatedAsyncioTestCase):
                 "handlers.offers._deal_complete_reply_markup",
                 return_value=None,
             ),
-            patch("utils.deal_outbound.deal_bot_send_message", new=send),
+            patch(
+                "database.db.fetch_main_menu_anchor",
+                side_effect=lambda uid: (uid, uid + 1000),
+            ),
+            patch("utils.deal_outbound.deal_bot_log_text") as log_text,
+            patch("utils.deal_outbound.deal_bot_send_message", new=AsyncMock()) as send,
             patch("utils.deal_outbound.party_for_uid", side_effect=lambda _g, uid: str(uid)),
         ):
             result = await deal_gate.sync_deal_party_summaries(
-                SimpleNamespace(bot=object()),
+                SimpleNamespace(bot=bot),
                 264,
             )
 
         self.assertEqual(result, (2, 0))
-        self.assertEqual({call.kwargs["chat_id"] for call in send.await_args_list}, {111, 222})
-        for call in send.await_args_list:
+        send.assert_not_awaited()
+        self.assertEqual(
+            {call.kwargs["chat_id"] for call in bot.edit_message_text.await_args_list},
+            {111, 222},
+        )
+        self.assertEqual(
+            {call.kwargs["message_id"] for call in bot.edit_message_text.await_args_list},
+            {1111, 1222},
+        )
+        for call in bot.edit_message_text.await_args_list:
             self.assertIn("current=210000", call.kwargs["text"])
+        self.assertEqual(log_text.call_count, 2)
 
 
 class AdminTerminalStatusTests(unittest.IsolatedAsyncioTestCase):
