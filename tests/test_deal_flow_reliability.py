@@ -309,6 +309,25 @@ class InvariantRepairTests(unittest.TestCase):
 
 
 class ProblemDashboardTests(unittest.TestCase):
+    def test_captionless_receipt_photo_does_not_warn(self):
+        from handlers import deal_gate
+
+        warnings = deal_gate._receipt_consistency_warnings(
+            {"seller_accounts_text": "IR120000000000001234567890"},
+            "",
+            receipt_kind="seller_toman",
+            allow_empty=True,
+        )
+        self.assertEqual(warnings, [])
+
+    def test_empty_text_receipt_still_warns(self):
+        from handlers import deal_gate
+
+        warnings = deal_gate._receipt_consistency_warnings(
+            {}, "", receipt_kind="seller_toman"
+        )
+        self.assertTrue(warnings)
+
     def test_receipt_warning_never_auto_approves_a_mismatched_account(self):
         from handlers import deal_gate
 
