@@ -63,29 +63,25 @@ class BuyerReceiptAutoAccountingTests(unittest.IsolatedAsyncioTestCase):
             )
         return post
 
-    async def test_rial_text_receipt_is_submitted_with_deal_identity(self):
+    async def test_rial_text_receipt_waits_for_admin_review(self):
         text = """بلو
 انتقال سجاد نجفی کوپس بین بانکی (پل)
 سپرده: IR - ۲۱ ۰۵۶۰ ۶۱۱۸ ۲۸۰۰ ۵۱۴۷ ۹۶۸۲ ۰۱
 مبلغ: ۳۰۹٬۵۷۵٬۰۰۰ ریال
 تاریخ: ۲۰:۱۲"""
         post = await self._run(text, expected_rial=309_575_000)
-        self.assertEqual(self.items[0]["accounting_status"], "submitted")
+        self.assertEqual(self.items[0]["accounting_status"], "ready_for_review")
         self.assertEqual(self.items[0]["amount_rial"], 309_575_000)
         self.assertEqual(self.items[0]["bank_name"], "سامان")
-        payload = post.call_args.kwargs["payload"]
-        self.assertEqual(payload["iran_amount"], 309_575_000)
-        self.assertEqual(payload["bank_name"], "سامان")
-        self.assertEqual(payload["depositor_name"], "nongb")
-        self.assertEqual(payload["description"], "آگهی 3453")
-        self.assertEqual(payload["transfer_type"], "پل")
+        self.assertFalse(post.called)
 
-    async def test_explicit_toman_partial_receipt_is_converted_and_submitted(self):
+    async def test_explicit_toman_partial_receipt_is_converted_for_review(self):
         post = await self._run(
             "بانک مقصد: ملی\nمبلغ: ۲۰٬۰۰۰٬۰۰۰ تومان\nتاریخ: ۱۴۰۵/۰۵/۰۱",
             expected_rial=500_000_000,
         )
-        self.assertTrue(post.called)
+        self.assertFalse(post.called)
+        self.assertEqual(self.items[0]["accounting_status"], "ready_for_review")
         self.assertEqual(self.items[0]["amount_rial"], 200_000_000)
         self.assertEqual(self.items[0]["remaining_rial"], 300_000_000)
 
@@ -95,19 +91,19 @@ class BuyerReceiptAutoAccountingTests(unittest.IsolatedAsyncioTestCase):
             expected_rial=500_000_000,
         )
         self.assertFalse(post.called)
-        self.assertEqual(self.items[0]["accounting_status"], "review")
+        self.assertEqual(self.items[0]["accounting_status"], "ready_for_review")
         self.assertTrue(
             any("بیشتر" in warning for warning in self.items[0]["recognition_warnings"])
         )
 
-    async def test_outgoing_receipt_with_small_bank_fee_is_submitted_as_incoming(self):
+    async def test_outgoing_receipt_with_small_bank_fee_is_prepared_as_incoming(self):
         post = await self._run(
             "بانک مقصد: ملی\nمبلغ: ۱۰۰٬۵۰۰٬۰۰۰ ریال\n"
             "تاریخ: ۱۴۰۵/۰۵/۰۱\nبرداشت از حساب",
             expected_rial=100_000_000,
         )
-        self.assertTrue(post.called)
-        self.assertEqual(self.items[0]["accounting_status"], "submitted")
+        self.assertFalse(post.called)
+        self.assertEqual(self.items[0]["accounting_status"], "ready_for_review")
         self.assertEqual(self.items[0]["amount_rial"], 100_000_000)
         self.assertTrue(self.items[0]["fee_adjusted_to_remaining"])
 
@@ -117,7 +113,7 @@ class BuyerReceiptAutoAccountingTests(unittest.IsolatedAsyncioTestCase):
             expected_rial=500_000_000,
         )
         self.assertFalse(post.called)
-        self.assertEqual(self.items[0]["accounting_status"], "review")
+        self.assertEqual(self.items[0]["accounting_status"], "ready_for_review")
 
     def test_buyer_outgoing_direction_is_not_a_deal_accounting_warning(self):
         warnings = self.deal_gate._deal_bound_receipt_warnings(
@@ -147,6 +143,56 @@ class BuyerReceiptAutoAccountingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(adjusted)
         self.assertEqual(amount, 102_000_000)
+
+    async def test_admin_approval_posts_once_and_marks_submitted(self):
+        self.items[0].update(
+            accounting_status="ready_for_review", amount_rial=100_000_000,
+            bank_name="ملی", transfer_type="پایا", jdate="1405/05/01",
+        )
+        query = SimpleNamespace(answer=AsyncMock(), from_user=SimpleNamespace(id=1))
+        update = SimpleNamespace(callback_query=query)
+        context = SimpleNamespace(bot=SimpleNamespace())
+        post = Mock(return_value=(True, "ok"))
+        with (
+            patch.object(self.deal_gate, "_require_full_deal_admin", new=AsyncMock(return_value=True)),
+            patch.object(self.deal_gate, "deal_gate_get", return_value=self.gate),
+            patch.object(self.deal_gate, "deal_gate_claim_buyer_receipt_submission", side_effect=[dict(self.items[0]), None]),
+            patch.object(self.deal_gate, "deal_gate_update_buyer_receipt", side_effect=self._update),
+            patch.object(self.deal_gate, "_buyer_dealer_name", return_value="nongb"),
+            patch.object(self.deal_gate, "sync_deal_admin_notification", new=AsyncMock()),
+            patch("utils.iran_panel_client.post_transaction", post),
+        ):
+            await self.deal_gate._handle_admin_receipt_review(
+                update, context, offer_id=258, receipt_index=0, approve=True
+            )
+            await self.deal_gate._handle_admin_receipt_review(
+                update, context, offer_id=258, receipt_index=0, approve=True
+            )
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(self.items[0]["accounting_status"], "submitted")
+
+    async def test_admin_rejection_never_posts(self):
+        self.items[0]["accounting_status"] = "ready_for_review"
+        query = SimpleNamespace(answer=AsyncMock(), from_user=SimpleNamespace(id=1))
+        with (
+            patch.object(self.deal_gate, "_require_full_deal_admin", new=AsyncMock(return_value=True)),
+            patch.object(self.deal_gate, "deal_gate_get", return_value=self.gate),
+            patch.object(
+                self.deal_gate,
+                "deal_gate_reject_buyer_receipt",
+                side_effect=lambda _oid, index: self._update(
+                    _oid, index, accounting_status="rejected", panel_error=""
+                ),
+            ),
+            patch.object(self.deal_gate, "sync_deal_admin_notification", new=AsyncMock()),
+            patch("utils.iran_panel_client.post_transaction") as post,
+        ):
+            await self.deal_gate._handle_admin_receipt_review(
+                SimpleNamespace(callback_query=query), SimpleNamespace(bot=SimpleNamespace()),
+                offer_id=258, receipt_index=0, approve=False,
+            )
+        self.assertFalse(post.called)
+        self.assertEqual(self.items[0]["accounting_status"], "rejected")
 
 
 if __name__ == "__main__":

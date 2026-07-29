@@ -2362,7 +2362,7 @@ def _buyer_toman_receipt_admin_line_html(
     review_items = [
         item
         for item in items
-        if (item.get("accounting_status") or "") in ("review", "panel_failed")
+        if (item.get("accounting_status") or "") in ("review", "ready_for_review", "panel_failed")
     ]
     if submitted_items:
         submitted_rial = sum(int(item.get("amount_rial") or 0) for item in submitted_items)
@@ -2382,6 +2382,21 @@ def _buyer_toman_receipt_admin_line_html(
             )
     if review_items:
         blk += f"{_RTL}⚠️ <b>نیازمند بررسی ثبت سایت:</b> {len(review_items)} فیش\n"
+        latest = review_items[-1]
+        amount = int(latest.get("amount_rial") or 0)
+        bank = html_module.escape(str(latest.get("bank_name") or "نامشخص"))
+        transfer = html_module.escape(str(latest.get("transfer_type") or "نامشخص"))
+        jdate = html_module.escape(str(latest.get("jdate") or "نامشخص"))
+        if amount > 0:
+            blk += (
+                f"{_RTL}🔎 <b>پیش‌نمایش:</b> <code>{amount:,}</code> ریال · "
+                f"بانک {bank} · {transfer} · {jdate}\n"
+            )
+        warnings = latest.get("recognition_warnings") or []
+        if warnings:
+            blk += f"{_RTL}⚠️ <b>هشدار OCR:</b> {html_module.escape('؛ '.join(map(str, warnings)))}\n"
+        if (latest.get("accounting_status") or "") in {"ready_for_review", "panel_failed"}:
+            blk += f"{_RTL}⏳ <b>در سایت ثبت نشده؛ منتظر تایید ادمین است.</b>\n"
     if int(gate.get("buyer_toman_settled_at") or 0) > 0:
         blk += f"{_RTL}💵 <b>تومان نشست:</b> ✅ تأیید ادمین\n"
     elif items or card_sent:

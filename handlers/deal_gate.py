@@ -73,6 +73,8 @@ from database.db import (
     deal_gate_append_buyer_receipt,
     deal_gate_append_seller_receipt,
     deal_gate_buyer_receipt_list,
+    deal_gate_claim_buyer_receipt_submission,
+    deal_gate_reject_buyer_receipt,
     deal_gate_update_buyer_receipt,
     deal_gate_confirm_seller_receipt_buyer,
     deal_gate_seller_receipt_list,
@@ -1769,6 +1771,28 @@ def deal_admin_payment_only_rows(
     rows: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton(pay_label, callback_data=f"adm|pay|{oid}")],
     ]
+    try:
+        receipt_data = gate.get("buyer_receipt_log") or "[]"
+        receipts = receipt_data if isinstance(receipt_data, list) else json.loads(receipt_data)
+        if not isinstance(receipts, list):
+            receipts = []
+    except (json.JSONDecodeError, TypeError):
+        receipts = []
+    for receipt_index, receipt in list(enumerate(receipts))[-2:]:
+        status = (receipt.get("accounting_status") or "").strip()
+        if status in {"ready_for_review", "panel_failed"}:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "✅ تایید و ثبت فیش در سایت",
+                        callback_data=f"adm|rcptok|{oid}|{receipt_index}",
+                    ),
+                    InlineKeyboardButton(
+                        "❌ رد فیش",
+                        callback_data=f"adm|rcptno|{oid}|{receipt_index}",
+                    ),
+                ]
+            )
     toman_settled = int(gate.get("buyer_toman_settled_at") or 0) > 0
     if card_sent and not toman_settled:
         rows.append(
@@ -2196,14 +2220,16 @@ async def _auto_account_buyer_receipt(
     file_id: str = "",
     file_unique_id: str = "",
 ) -> None:
-    """Read and submit one buyer receipt as a deal-bound Iran-panel txin."""
+    """Read one buyer receipt and prepare an admin-reviewed Iran-panel txin."""
     oid = int(gate.get("offer_id") or 0)
     aid = int(gate.get("advert_rowid") or 0)
     items = deal_gate_buyer_receipt_list(oid)
     if receipt_index < 0 or receipt_index >= len(items):
         return
     current_status = (items[receipt_index].get("accounting_status") or "").strip()
-    if current_status in ("submitted", "processing", "duplicate"):
+    if current_status in (
+        "submitted", "submitting", "processing", "ready_for_review", "rejected", "duplicate"
+    ):
         return
     deal_gate_update_buyer_receipt(
         oid, receipt_index, accounting_status="processing", panel_error=""
@@ -2275,7 +2301,8 @@ async def _auto_account_buyer_receipt(
             index != receipt_index
             and fingerprint
             and (item.get("receipt_fingerprint") or "") == fingerprint
-            and (item.get("accounting_status") or "") in ("submitted", "processing")
+            and (item.get("accounting_status") or "")
+            in ("submitted", "submitting", "processing", "ready_for_review")
             for index, item in enumerate(deal_gate_buyer_receipt_list(oid))
         )
         warnings = _deal_bound_receipt_warnings(payload)
@@ -2316,46 +2343,27 @@ async def _auto_account_buyer_receipt(
             "receipt_fingerprint": fingerprint,
             "fee_adjusted_to_remaining": fee_adjusted,
         }
-        if warnings:
+        if amount_rial <= 0 or not (payload.get("bank_name") or "").strip():
             deal_gate_update_buyer_receipt(
                 oid, receipt_index, accounting_status="review", **metadata
             )
-            _log(
+            _receipt_accounting_log(
                 oid,
                 "ثبت خودکار ورودی نیازمند بررسی ادمین: " + "؛ ".join(warnings),
                 from_role="system",
             )
             return
 
-        panel_payload = _panel_payload_for_submit(payload, "in")
-        from utils.iran_panel_client import post_transaction
-
-        ok, panel_message = await asyncio.to_thread(
-            post_transaction,
-            base_url=IRAN_PANEL_BASE_URL,
-            payload=panel_payload,
-        )
-        if not ok:
-            deal_gate_update_buyer_receipt(
-                oid,
-                receipt_index,
-                accounting_status="panel_failed",
-                panel_error=str(panel_message)[:300],
-                **metadata,
-            )
-            _log(oid, f"ثبت خودکار ورودی سایت ناموفق: {panel_message}", from_role="system")
-            return
         deal_gate_update_buyer_receipt(
             oid,
             receipt_index,
-            accounting_status="submitted",
-            panel_submitted_at=int(time.time()),
+            accounting_status="ready_for_review",
             panel_error="",
             **metadata,
         )
-        _log(
+        _receipt_accounting_log(
             oid,
-            f"ثبت خودکار ورودی سایت: {amount_rial:,} ریال · آگهی {aid}",
+            "فیش خوانده شد و منتظر تایید ادمین برای ثبت در سایت است",
             from_role="system",
         )
     except Exception as exc:
@@ -2378,6 +2386,71 @@ async def _auto_account_buyer_receipt(
             await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
         except Exception:
             logger.exception("deal_receipt_accounting: admin sync failed offer=%s", oid)
+
+
+async def _handle_admin_receipt_review(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, offer_id: int,
+    receipt_index: int, approve: bool,
+) -> None:
+    q = update.callback_query
+    if not q or not await _require_full_deal_admin(q):
+        return
+    gate = deal_gate_get(offer_id)
+    if not gate:
+        await q.answer("معامله پیدا نشد.", show_alert=True)
+        return
+    if not approve:
+        item = deal_gate_reject_buyer_receipt(offer_id, receipt_index)
+        await q.answer(
+            "فیش رد شد؛ چیزی در سایت ثبت نشد."
+            if item else "این فیش قبلاً بررسی شده است.",
+            show_alert=True,
+        )
+        if item:
+            _receipt_accounting_log(offer_id, "ادمین فیش ورودی را رد کرد؛ ثبت سایت انجام نشد", from_role="admin")
+        await sync_deal_admin_notification(context.bot, offer_id, deal_complete=True)
+        return
+    item = deal_gate_claim_buyer_receipt_submission(offer_id, receipt_index)
+    if not item:
+        await q.answer("این فیش قبلاً بررسی شده یا آماده ثبت نیست.", show_alert=True)
+        return
+    payload = {
+        "iran_amount": int(item.get("amount_rial") or 0),
+        "bank_name": item.get("bank_name") or "",
+        "transfer_type": item.get("transfer_type") or "",
+        "jdate": item.get("jdate") or "",
+        "depositor_name": _buyer_dealer_name(gate),
+        "description": f"آگهی {int(gate.get('advert_rowid') or 0)}",
+    }
+    from handlers.iran_panel_sync import _panel_payload_for_submit
+    from utils.iran_panel_client import post_transaction
+    panel_payload = _panel_payload_for_submit(payload, "in")
+    ok, panel_message = await asyncio.to_thread(
+        post_transaction, base_url=IRAN_PANEL_BASE_URL, payload=panel_payload
+    )
+    if ok:
+        deal_gate_update_buyer_receipt(
+            offer_id, receipt_index, accounting_status="submitted",
+            panel_submitted_at=int(time.time()), panel_error="",
+        )
+        _receipt_accounting_log(offer_id, "ادمین فیش ورودی را تایید و در سایت ثبت کرد", from_role="admin")
+        await q.answer("فیش در سایت ثبت شد.", show_alert=True)
+    else:
+        deal_gate_update_buyer_receipt(
+            offer_id, receipt_index, accounting_status="panel_failed",
+            panel_error=str(panel_message)[:300],
+        )
+        _receipt_accounting_log(offer_id, "ثبت سایت پس از تایید ادمین ناموفق بود", from_role="system")
+        await q.answer("ثبت سایت ناموفق بود؛ دوباره قابل تلاش است.", show_alert=True)
+    await sync_deal_admin_notification(context.bot, offer_id, deal_complete=True)
+
+
+def _receipt_accounting_log(offer_id: int, text: str, *, from_role: str) -> None:
+    """Keep audit-log failures from changing receipt accounting state."""
+    try:
+        _log(offer_id, text, from_role=from_role)
+    except Exception:
+        logger.exception("deal_receipt_accounting: audit log failed offer=%s", offer_id)
 
 
 async def _expire_stale_deal_button(query, message: str) -> None:
@@ -6685,6 +6758,16 @@ async def deal_gate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _handle_party_response(update, context, parts[1], callback_offer_id)
     elif parts[0] == "adm" and parts[1] == "dg" and len(parts) >= 4:
         await _handle_admin_decision(update, context, parts[2], callback_offer_id)
+    elif parts[0] == "adm" and parts[1] in {"rcptok", "rcptno"} and len(parts) >= 4:
+        try:
+            receipt_index = int(parts[3])
+        except (TypeError, ValueError):
+            await q.answer("دکمه نامعتبر است.", show_alert=True)
+            return
+        await _handle_admin_receipt_review(
+            update, context, offer_id=callback_offer_id,
+            receipt_index=receipt_index, approve=parts[1] == "rcptok",
+        )
 
 
 async def _handle_party_response(
