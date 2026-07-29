@@ -2919,6 +2919,7 @@ def deal_gate_update_buyer_receipt(
     allowed = {
         "accounting_status",
         "amount_rial",
+        "recognized_amount_rial",
         "bank_name",
         "transfer_type",
         "jdate",
