@@ -111,11 +111,14 @@ class AdminHourlyReminderTests(unittest.IsolatedAsyncioTestCase):
                 for row in call.kwargs["reply_markup"].inline_keyboard
                 for button in row
             ]
-            self.assertTrue(
+            self.assertFalse(
                 any(button.callback_data == "adm|stomset|252" for button in buttons)
             )
             self.assertTrue(
-                any(button.callback_data == "adm|dgs|252" for button in buttons)
+                any(
+                    button.callback_data == "adm|dgs|resync|252"
+                    for button in buttons
+                )
             )
         self.assertEqual(log.call_count, 2)
         self.assertTrue(all(call.args[2] == "admin" for call in log.call_args_list))
@@ -124,6 +127,38 @@ class AdminHourlyReminderTests(unittest.IsolatedAsyncioTestCase):
             [9001, 9002],
         )
         bot.delete_message.assert_not_awaited()
+
+    def test_reminder_offers_receipt_upload_only_when_euro_is_confirmed(self):
+        with patch(
+            "handlers.offers._seller_euro_fully_confirmed_gate",
+            return_value=True,
+        ):
+            keyboard = deal_gate._admin_toman_reminder_keyboard(252, _gate())
+
+        callbacks = {
+            button.callback_data
+            for row in keyboard.inline_keyboard
+            for button in row
+        }
+        self.assertEqual(
+            callbacks,
+            {"adm|stom|252|go", "adm|dgs|resync|252"},
+        )
+        self.assertNotIn("adm|stomset|252", callbacks)
+
+    def test_early_stage_reminder_only_links_to_deal(self):
+        with patch(
+            "handlers.offers._seller_euro_fully_confirmed_gate",
+            return_value=False,
+        ):
+            keyboard = deal_gate._admin_toman_reminder_keyboard(252, _gate())
+
+        callbacks = [
+            button.callback_data
+            for row in keyboard.inline_keyboard
+            for button in row
+        ]
+        self.assertEqual(callbacks, ["adm|dgs|resync|252"])
 
     async def test_new_reminder_deletes_previous_tracked_reminder(self):
         old_row = {
@@ -202,6 +237,31 @@ class AdminHourlyReminderTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AdminReminderSchedulerTests(unittest.TestCase):
+    def test_quiet_operations_schedule_all_maintenance_jobs(self):
+        queue = Mock()
+        bot_main._setup_deal_operations_jobs(SimpleNamespace(job_queue=queue))
+        self.assertEqual(queue.run_repeating.call_count, 4)
+        names = {call.kwargs["name"] for call in queue.run_repeating.call_args_list}
+        self.assertEqual(
+            names,
+            {
+                "deal_verified_backup",
+                "deal_privacy_retention",
+                "deal_backup_restore_drill",
+                "deal_daily_reconciliation",
+            },
+        )
+
+    def test_critical_delivery_retry_checks_every_minute(self):
+        queue = Mock()
+        app = SimpleNamespace(job_queue=queue)
+        bot_main._setup_deal_delivery_retry_job(app)
+        queue.run_repeating.assert_called_once()
+        kwargs = queue.run_repeating.call_args.kwargs
+        self.assertEqual(kwargs["interval"], 60)
+        self.assertEqual(kwargs["first"], 20)
+        self.assertEqual(kwargs["name"], "deal_delivery_retry_sweep")
+
     def test_scheduler_checks_every_five_minutes(self):
         queue = Mock()
         app = SimpleNamespace(job_queue=queue)

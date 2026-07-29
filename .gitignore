@@ -9,6 +9,7 @@
 *.sqlite
 *.sqlite3
 /backups/
+/reports/
 
 # Python
 __pycache__/

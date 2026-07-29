@@ -1,0 +1,15 @@
+[Unit]
+Description=Sepid read-only operational health check
+After=telegram-bot.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/root/telegram_bot_project2
+EnvironmentFile=/root/telegram_bot_project2/.env
+ExecStart=/root/telegram_bot_project2/venv/bin/python3 scripts/ops_check.py status
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full

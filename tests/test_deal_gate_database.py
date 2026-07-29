@@ -5,7 +5,9 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 from database import db
 
@@ -30,6 +32,23 @@ class DealGateDatabaseTests(unittest.TestCase):
             seller_telegram_id=20,
             gate_status="pending",
         )
+
+    def _create_relational_deal(self):
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                """
+                INSERT INTO euro_adverts (id, user_id, status)
+                VALUES (3196, 20, 'فعال')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO advert_offers (
+                    id, advert_rowid, proposer_telegram_id, rate_toman,
+                    created_at, status
+                ) VALUES (101, 3196, 10, 210000, '2026-07-22', 'accepted')
+                """
+            )
 
     def test_gate_state_transition_and_receipt_lifecycle(self):
         self._create_gate()
@@ -69,6 +88,155 @@ class DealGateDatabaseTests(unittest.TestCase):
 
         db.deal_gate_delete(101)
         self.assertIsNone(db.deal_gate_get(101))
+
+    def test_receipt_source_message_is_idempotent(self):
+        self._create_gate()
+        first = db.deal_gate_append_buyer_receipt(
+            101,
+            entry_type="photo",
+            file_id="receipt",
+            source_message_id=9001,
+        )
+        second = db.deal_gate_append_buyer_receipt(
+            101,
+            entry_type="photo",
+            file_id="receipt",
+            source_message_id=9001,
+        )
+        self.assertEqual(len(first), 1)
+        self.assertEqual(second, first)
+
+    def test_delivery_queue_deduplicates_and_retries(self):
+        first = db.deal_delivery_enqueue(
+            offer_id=101,
+            recipient_telegram_id=20,
+            party="seller",
+            tag="receipt",
+            payload_type="text",
+            payload={"body_html": "hello"},
+            dedupe_key="deal:101:seller:receipt:1",
+        )
+        second = db.deal_delivery_enqueue(
+            offer_id=101,
+            recipient_telegram_id=20,
+            party="seller",
+            tag="receipt",
+            payload_type="text",
+            payload={"body_html": "hello"},
+            dedupe_key="deal:101:seller:receipt:1",
+        )
+        self.assertEqual(first["id"], second["id"])
+        self.assertTrue(db.deal_delivery_claim(first["id"]))
+        self.assertFalse(db.deal_delivery_claim(first["id"]))
+        db.deal_delivery_mark_failed(first["id"], "offline")
+        with sqlite3.connect(self.path) as conn:
+            status, attempts = conn.execute(
+                "SELECT status, attempts FROM deal_delivery_queue WHERE id = ?",
+                (first["id"],),
+            ).fetchone()
+        self.assertEqual(status, "failed")
+        self.assertEqual(attempts, 1)
+
+    def test_restart_recovers_only_abandoned_delivery_claims(self):
+        queued = db.deal_delivery_enqueue(
+            offer_id=101,
+            recipient_telegram_id=20,
+            party="seller",
+            tag="restart",
+            payload_type="text",
+            payload={"body_html": "hello"},
+            dedupe_key="deal:101:restart",
+        )
+        self.assertTrue(db.deal_delivery_claim(queued["id"]))
+        self.assertEqual(db.deal_delivery_due(now=10_000), [])
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                """
+                UPDATE deal_delivery_queue
+                SET status = 'sending', updated_at = 9000
+                WHERE id = ?
+                """,
+                (queued["id"],),
+            )
+        due = db.deal_delivery_due(now=10_000)
+        self.assertEqual([row["id"] for row in due], [queued["id"]])
+        with patch("database.db.time.time", return_value=10_000):
+            self.assertTrue(db.deal_delivery_claim(queued["id"]))
+            self.assertFalse(db.deal_delivery_claim(queued["id"]))
+
+    def test_problem_queue_detects_old_stage_without_notifying_users(self):
+        self._create_gate()
+        db.deal_gate_upsert(
+            offer_id=101,
+            advert_rowid=3196,
+            buyer_telegram_id=10,
+            seller_telegram_id=20,
+            gate_status="pending",
+        )
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                "UPDATE offer_deal_gates SET started_at = 1000 WHERE offer_id = 101"
+            )
+        rows = db.deal_gate_list_problems(now=10_000)
+        self.assertEqual([row["offer_id"] for row in rows], [101])
+        self.assertIn("stuck_pending", rows[0]["problem_issues"])
+
+    def test_successful_seller_receipt_delivery_unlocks_close_once(self):
+        self._create_gate()
+        db.deal_gate_upsert(
+            offer_id=101,
+            advert_rowid=3196,
+            buyer_telegram_id=10,
+            seller_telegram_id=20,
+            gate_status="completed",
+        )
+        queued = db.deal_delivery_enqueue(
+            offer_id=101,
+            recipient_telegram_id=20,
+            party="seller",
+            tag="receipt",
+            payload_type="photo",
+            payload={},
+            dedupe_key="seller_toman:101:1",
+        )
+        self.assertTrue(
+            db.deal_gate_record_seller_toman_delivery(
+                101,
+                entry_type="photo",
+                file_id="receipt-file",
+                delivery_key="seller_toman:101:1",
+                queue_delivery_id=queued["id"],
+                telegram_message_id=77,
+            )
+        )
+        self.assertTrue(
+            db.deal_gate_record_seller_toman_delivery(
+                101,
+                entry_type="photo",
+                file_id="receipt-file",
+                delivery_key="seller_toman:101:1",
+            )
+        )
+        gate = db.deal_gate_get(101)
+        self.assertGreater(int(gate["seller_toman_close_enabled_at"]), 0)
+        self.assertEqual(len(db.deal_gate_seller_toman_admin_list(101)), 1)
+        with sqlite3.connect(self.path) as conn:
+            status = conn.execute(
+                "SELECT status FROM deal_delivery_queue WHERE id = ?",
+                (queued["id"],),
+            ).fetchone()[0]
+        self.assertEqual(status, "sent")
+
+    def test_reactivation_archives_gate_before_removal(self):
+        self._create_gate()
+        self.assertTrue(db.deal_gate_archive_and_reactivate(101, 3196))
+        self.assertIsNone(db.deal_gate_get(101))
+        with sqlite3.connect(self.path) as conn:
+            archived = conn.execute(
+                "SELECT reason, snapshot_json FROM offer_deal_gate_archive WHERE offer_id = 101"
+            ).fetchone()
+        self.assertEqual(archived[0], "admin_reactivated")
+        self.assertIn('"offer_id": 101', archived[1])
 
     def test_unknown_dynamic_field_is_ignored(self):
         self._create_gate()
@@ -133,6 +301,105 @@ class DealGateDatabaseTests(unittest.TestCase):
         self.assertEqual(
             int(db.deal_gate_get(101)["seller_toman_settled_at"]),
             123456,
+        )
+
+    def test_settlement_and_all_close_statuses_commit_atomically(self):
+        self._create_relational_deal()
+        self._create_gate()
+        db.deal_gate_upsert(
+            offer_id=101,
+            advert_rowid=3196,
+            buyer_telegram_id=10,
+            seller_telegram_id=20,
+            gate_status="completed",
+        )
+        db.deal_gate_append_seller_toman_admin(
+            101, entry_type="text", text="delivered receipt"
+        )
+        db.deal_gate_enable_seller_toman_close(101)
+
+        self.assertTrue(
+            db.deal_gate_settle_and_close_atomic(
+                101, 3196, settled_at=123456, require_receipt=True
+            )
+        )
+        self.assertFalse(
+            db.deal_gate_settle_and_close_atomic(
+                101, 3196, settled_at=123457, require_receipt=True
+            )
+        )
+        gate = db.deal_gate_get(101)
+        self.assertEqual(gate["gate_status"], "closed")
+        self.assertEqual(int(gate["seller_toman_settled_at"]), 123456)
+        with sqlite3.connect(self.path) as conn:
+            offer_status = conn.execute(
+                "SELECT status FROM advert_offers WHERE id = 101"
+            ).fetchone()[0]
+            advert_status = conn.execute(
+                "SELECT status FROM euro_adverts WHERE rowid = 3196"
+            ).fetchone()[0]
+        self.assertEqual(offer_status, "gate_closed")
+        self.assertEqual(advert_status, "بسته")
+
+    def test_concurrent_settlement_has_exactly_one_winner(self):
+        self._create_relational_deal()
+        self._create_gate()
+        db.deal_gate_upsert(
+            offer_id=101,
+            advert_rowid=3196,
+            buyer_telegram_id=10,
+            seller_telegram_id=20,
+            gate_status="completed",
+        )
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(
+                pool.map(
+                    lambda stamp: db.deal_gate_settle_and_close_atomic(
+                        101,
+                        3196,
+                        settled_at=stamp,
+                        require_receipt=False,
+                    ),
+                    (123456, 123457),
+                )
+            )
+        self.assertEqual(sorted(results), [False, True])
+
+    def test_privacy_retention_redacts_financial_artifacts_only_after_cutoff(self):
+        self._create_gate()
+        db.deal_gate_upsert(
+            offer_id=101,
+            advert_rowid=3196,
+            buyer_telegram_id=10,
+            seller_telegram_id=20,
+            gate_status="closed",
+            buyer_accounts_text="buyer iban",
+            seller_accounts_text="seller iban",
+            buyer_receipt_log='[{"file_id":"buyer"}]',
+            seller_receipt_log='[{"file_id":"seller"}]',
+            seller_toman_admin_log='[{"file_id":"admin"}]',
+            seller_toman_settled_at=1000,
+        )
+        self.assertEqual(
+            db.deal_privacy_redact_expired(
+                now=1000 + 179 * 86400, retention_days=180
+            ),
+            0,
+        )
+        self.assertEqual(
+            db.deal_privacy_redact_expired(
+                now=1000 + 181 * 86400, retention_days=180
+            ),
+            1,
+        )
+        gate = db.deal_gate_get(101)
+        self.assertEqual(gate["buyer_accounts_text"], "[redacted]")
+        self.assertEqual(gate["seller_receipt_log"], "[]")
+        self.assertEqual(
+            db.deal_privacy_redact_expired(
+                now=1000 + 182 * 86400, retention_days=180
+            ),
+            0,
         )
 
     def test_admin_toman_receipt_reminder_query_tracks_only_unfinished_delivery(self):

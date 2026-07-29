@@ -19,7 +19,9 @@ CRITICAL_TABLES = {
     "advert_offers",
     "offer_negotiation_lines",
     "offer_bot_outbound_log",
+    "deal_delivery_queue",
     "offer_deal_gates",
+    "offer_deal_gate_archive",
     "admin_audit_log",
 }
 

@@ -323,6 +323,51 @@ def ensure_schema() -> None:
             "CREATE INDEX IF NOT EXISTS idx_bot_outbound_offer ON offer_bot_outbound_log(offer_id)"
         )
 
+        # Durable, deduplicated delivery queue for critical deal messages.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS deal_delivery_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                offer_id INTEGER NOT NULL,
+                recipient_telegram_id INTEGER NOT NULL,
+                party TEXT NOT NULL,
+                tag TEXT NOT NULL,
+                payload_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                dedupe_key TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                telegram_message_id INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_deal_delivery_due "
+            "ON deal_delivery_queue(status, next_attempt_at)"
+        )
+
+        # Reopened deals are archived instead of disappearing without an audit trail.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS offer_deal_gate_archive (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                offer_id INTEGER NOT NULL,
+                advert_rowid INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                archived_at INTEGER NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_deal_gate_archive_offer "
+            "ON offer_deal_gate_archive(offer_id, archived_at)"
+        )
+
         # --- offer_deal_gates | Deal gate after offer acceptance ---
         # EN: gate_status, receipt JSON columns, admin_notify_mids — see docs/DEAL_GATE.md
         # FA: وضعیت gate، لاگ فیش‌ها، شناسه پیام ادمین — ر.ک. docs/DEAL_GATE.md
@@ -373,6 +418,7 @@ def ensure_schema() -> None:
             "seller_toman_settled_at",
             "seller_toman_close_enabled_at",
             "admin_escalation_mids",
+            "privacy_redacted_at",
         ):
             try:
                 cur.execute(
@@ -449,7 +495,7 @@ def negotiation_transcript_list(offer_id: int) -> list[dict]:
         cur = conn.cursor()
         rows = cur.execute(
             """
-            SELECT from_role, body
+            SELECT from_role, body, created_at
             FROM offer_negotiation_lines
             WHERE offer_id = ?
             ORDER BY id ASC
@@ -461,7 +507,13 @@ def negotiation_transcript_list(offer_id: int) -> list[dict]:
         fr = str(r["from_role"] or "").strip().lower()
         if fr not in ("owner", "proposer", "system", "admin", "buyer", "seller"):
             fr = "other"
-        out.append({"from": fr, "text": r["body"]})
+        out.append(
+            {
+                "from": fr,
+                "text": r["body"],
+                "created_at": int(r["created_at"] or 0),
+            }
+        )
     return out
 
 
@@ -533,7 +585,7 @@ def bot_outbound_log_insert(
     if pr not in ("buyer", "seller", "user", "admin"):
         pr = "user"
     mt = (msg_type or "text").strip().lower()
-    if mt not in ("text", "photo"):
+    if mt not in ("text", "photo", "document"):
         mt = "text"
     tg = (tag or "پیام").strip()[:120]
     with sqlite3.connect(DB_PATH) as conn:
@@ -2811,6 +2863,7 @@ def deal_gate_append_buyer_receipt(
     entry_type: str,
     text: str = "",
     file_id: str = "",
+    source_message_id: int = 0,
 ) -> list[dict]:
     """یک فیش واریز خریدار — برمی‌گرداند لیست کامل."""
     import json
@@ -2819,12 +2872,18 @@ def deal_gate_append_buyer_receipt(
     if not gate:
         return []
     items = _deal_gate_receipt_list_raw(gate)
+    source_mid = int(source_message_id or 0)
+    if source_mid > 0:
+        for item in items:
+            if int(item.get("source_message_id") or 0) == source_mid:
+                return items
     items.append(
         {
             "type": (entry_type or "text").strip().lower(),
             "text": (text or "")[:2000],
             "file_id": (file_id or "").strip()[:256],
             "at": int(time.time()),
+            "source_message_id": source_mid,
         }
     )
     oid = int(offer_id)
@@ -2860,6 +2919,7 @@ def deal_gate_append_seller_receipt(
     entry_type: str,
     text: str = "",
     file_id: str = "",
+    source_message_id: int = 0,
 ) -> list[dict]:
     """یک فیش واریز یورو فروشنده — برمی‌گرداند لیست کامل."""
     import json
@@ -2868,6 +2928,11 @@ def deal_gate_append_seller_receipt(
     if not gate:
         return []
     items = _deal_gate_seller_receipt_list_raw(gate)
+    source_mid = int(source_message_id or 0)
+    if source_mid > 0:
+        for item in items:
+            if int(item.get("source_message_id") or 0) == source_mid:
+                return items
     items.append(
         {
             "type": (entry_type or "text").strip().lower(),
@@ -2875,6 +2940,7 @@ def deal_gate_append_seller_receipt(
             "file_id": (file_id or "").strip()[:256],
             "at": int(time.time()),
             "buyer_confirmed_at": 0,
+            "source_message_id": source_mid,
         }
     )
     oid = int(offer_id)
@@ -3031,6 +3097,477 @@ def deal_gate_mark_seller_toman_settled(
         conn.close()
 
 
+def deal_gate_record_seller_toman_delivery(
+    offer_id: int,
+    *,
+    entry_type: str,
+    text: str = "",
+    file_id: str = "",
+    delivery_key: str,
+    delivered_at: int | None = None,
+    queue_delivery_id: int | None = None,
+    telegram_message_id: int = 0,
+) -> bool:
+    """Atomically record one successfully delivered seller receipt and unlock close."""
+    import json
+
+    oid = int(offer_id)
+    key = (delivery_key or "").strip()[:200]
+    if not key:
+        return False
+    now = int(delivered_at or time.time())
+    conn = sqlite3.connect(DB_PATH, timeout=15.0, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM offer_deal_gates WHERE offer_id = ?", (oid,)
+        ).fetchone()
+        if not row or (row["gate_status"] or "").strip().lower() != "completed":
+            conn.rollback()
+            return False
+        try:
+            items = json.loads(row["seller_toman_admin_log"] or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            items = []
+        if not isinstance(items, list):
+            items = []
+        if not any((item.get("delivery_key") or "") == key for item in items):
+            items.append(
+                {
+                    "type": (entry_type or "text").strip().lower(),
+                    "text": (text or "")[:2000],
+                    "file_id": (file_id or "").strip()[:256],
+                    "at": now,
+                    "delivered_at": now,
+                    "delivery_key": key,
+                }
+            )
+        conn.execute(
+            """
+            UPDATE offer_deal_gates
+            SET seller_toman_admin_log = ?,
+                seller_toman_close_enabled_at = CASE
+                    WHEN COALESCE(seller_toman_close_enabled_at, 0) > 0
+                    THEN seller_toman_close_enabled_at ELSE ? END
+            WHERE offer_id = ?
+            """,
+            (json.dumps(items, ensure_ascii=False), now, oid),
+        )
+        if queue_delivery_id is not None:
+            conn.execute(
+                """
+                UPDATE deal_delivery_queue
+                SET status = 'sent', telegram_message_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (int(telegram_message_id or 0), now, int(queue_delivery_id)),
+            )
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def deal_gate_close_atomic(offer_id: int, advert_rowid: int) -> bool:
+    """Keep offer, advert, and gate close statuses in one SQLite commit."""
+    oid, aid = int(offer_id), int(advert_rowid)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0, isolation_level=None)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        gate = conn.execute(
+            "SELECT gate_status, advert_rowid FROM offer_deal_gates WHERE offer_id = ?",
+            (oid,),
+        ).fetchone()
+        if not gate or int(gate[1]) != aid:
+            conn.rollback()
+            return False
+        offer_changed = conn.execute(
+            "UPDATE advert_offers SET status = 'gate_closed' WHERE id = ?", (oid,)
+        )
+        advert_changed = conn.execute(
+            "UPDATE euro_adverts SET status = 'بسته' WHERE rowid = ?", (aid,)
+        )
+        if offer_changed.rowcount != 1 or advert_changed.rowcount != 1:
+            conn.rollback()
+            return False
+        conn.execute(
+            "UPDATE offer_deal_gates SET gate_status = 'closed' WHERE offer_id = ?",
+            (oid,),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def deal_gate_settle_and_close_atomic(
+    offer_id: int,
+    advert_rowid: int,
+    *,
+    settled_at: int | None = None,
+    require_receipt: bool = True,
+) -> bool:
+    """Atomically claim seller settlement and close every related DB record."""
+    oid, aid = int(offer_id), int(advert_rowid)
+    now = int(settled_at or time.time())
+    conn = sqlite3.connect(DB_PATH, timeout=15.0, isolation_level=None)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        receipt_guard = (
+            """
+              AND COALESCE(seller_toman_close_enabled_at, 0) > 0
+              AND trim(COALESCE(seller_toman_admin_log, '')) NOT IN ('', '[]')
+            """
+            if require_receipt
+            else ""
+        )
+        changed = conn.execute(
+            f"""
+            UPDATE offer_deal_gates
+            SET seller_toman_settled_at = ?, gate_status = 'closed'
+            WHERE offer_id = ? AND advert_rowid = ?
+              AND lower(trim(COALESCE(gate_status, ''))) = 'completed'
+              AND COALESCE(seller_toman_settled_at, 0) = 0
+              {receipt_guard}
+            """,
+            (now, oid, aid),
+        )
+        if changed.rowcount != 1:
+            conn.rollback()
+            return False
+        offer_changed = conn.execute(
+            "UPDATE advert_offers SET status = 'gate_closed' WHERE id = ?", (oid,)
+        )
+        advert_changed = conn.execute(
+            "UPDATE euro_adverts SET status = 'بسته' WHERE rowid = ?", (aid,)
+        )
+        if offer_changed.rowcount != 1 or advert_changed.rowcount != 1:
+            conn.rollback()
+            return False
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def deal_gate_archive_and_reactivate(
+    offer_id: int,
+    advert_rowid: int,
+    *,
+    reason: str = "admin_reactivated",
+) -> bool:
+    """Archive the full gate and atomically reactivate its advert."""
+    import json
+
+    oid, aid = int(offer_id), int(advert_rowid)
+    now = int(time.time())
+    conn = sqlite3.connect(DB_PATH, timeout=15.0, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM offer_deal_gates WHERE offer_id = ?", (oid,)
+        ).fetchone()
+        if not row or int(row["advert_rowid"]) != aid:
+            conn.rollback()
+            return False
+        conn.execute(
+            """
+            INSERT INTO offer_deal_gate_archive (
+                offer_id, advert_rowid, reason, snapshot_json, archived_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                oid,
+                aid,
+                (reason or "admin_reactivated").strip()[:100],
+                json.dumps(dict(row), ensure_ascii=False),
+                now,
+            ),
+        )
+        conn.execute(
+            "UPDATE advert_offers SET status = 'gate_aborted' WHERE id = ?", (oid,)
+        )
+        conn.execute(
+            "UPDATE euro_adverts SET status = 'فعال' WHERE rowid = ?", (aid,)
+        )
+        conn.execute("DELETE FROM offer_deal_gates WHERE offer_id = ?", (oid,))
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def deal_delivery_enqueue(
+    *,
+    offer_id: int,
+    recipient_telegram_id: int,
+    party: str,
+    tag: str,
+    payload_type: str,
+    payload: dict,
+    dedupe_key: str,
+) -> dict:
+    """Insert once and return the durable delivery row."""
+    import json
+
+    now = int(time.time())
+    key = (dedupe_key or "").strip()
+    if not key:
+        raise ValueError("dedupe_key is required")
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO deal_delivery_queue (
+                offer_id, recipient_telegram_id, party, tag, payload_type,
+                payload_json, dedupe_key, status, attempts, next_attempt_at,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?)
+            """,
+            (
+                int(offer_id),
+                int(recipient_telegram_id),
+                (party or "user").strip().lower(),
+                (tag or "").strip()[:200],
+                (payload_type or "text").strip().lower(),
+                json.dumps(payload or {}, ensure_ascii=False),
+                key[:240],
+                now,
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM deal_delivery_queue WHERE dedupe_key = ?", (key[:240],)
+        ).fetchone()
+        conn.commit()
+        return dict(row)
+
+
+def deal_delivery_due(*, now: int | None = None, limit: int = 50) -> list[dict]:
+    ts = int(now or time.time())
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT * FROM deal_delivery_queue
+            WHERE (
+                status IN ('pending', 'failed') AND next_attempt_at <= ?
+            ) OR (
+                status = 'sending' AND updated_at <= ?
+            )
+            ORDER BY created_at, id LIMIT ?
+            """,
+            (ts, ts - 300, max(1, min(int(limit), 200))),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def deal_delivery_list_for_offer(offer_id: int) -> list[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, recipient_telegram_id, party, tag, payload_type, status,
+                   attempts, next_attempt_at, last_error, telegram_message_id,
+                   created_at, updated_at
+            FROM deal_delivery_queue WHERE offer_id = ? ORDER BY id ASC
+            """,
+            (int(offer_id),),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def deal_delivery_claim(delivery_id: int) -> bool:
+    """Claim one queued delivery so concurrent callbacks cannot both send it."""
+    now = int(time.time())
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            """
+            UPDATE deal_delivery_queue SET status = 'sending', updated_at = ?
+            WHERE id = ? AND (
+                status IN ('pending', 'failed')
+                OR (status = 'sending' AND updated_at <= ?)
+            )
+            """,
+            (now, int(delivery_id), now - 300),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+
+
+def deal_delivery_mark_sent(delivery_id: int, telegram_message_id: int = 0) -> bool:
+    now = int(time.time())
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            """
+            UPDATE deal_delivery_queue
+            SET status = 'sent', telegram_message_id = ?, updated_at = ?
+            WHERE id = ? AND status != 'sent'
+            """,
+            (int(telegram_message_id or 0), now, int(delivery_id)),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+
+
+def deal_delivery_mark_failed(delivery_id: int, error: str) -> None:
+    now = int(time.time())
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT attempts FROM deal_delivery_queue WHERE id = ?", (int(delivery_id),)
+        ).fetchone()
+        attempts = int((row or [0])[0] or 0) + 1
+        delay = min(3600, 30 * (2 ** min(attempts - 1, 7)))
+        conn.execute(
+            """
+            UPDATE deal_delivery_queue
+            SET status = 'failed', attempts = ?, next_attempt_at = ?,
+                last_error = ?, updated_at = ?
+            WHERE id = ? AND status != 'sent'
+            """,
+            (attempts, now + delay, (error or "")[:500], now, int(delivery_id)),
+        )
+        conn.commit()
+
+
+def deal_delivery_defer_rate_limit(
+    delivery_id: int, retry_after_seconds: int, error: str = "rate limited"
+) -> None:
+    """Honor Telegram RetryAfter without counting it as a delivery failure."""
+    now = int(time.time())
+    delay = max(1, min(int(retry_after_seconds or 1), 86400))
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            UPDATE deal_delivery_queue
+            SET status = 'failed', next_attempt_at = ?, last_error = ?, updated_at = ?
+            WHERE id = ? AND status != 'sent'
+            """,
+            (now + delay, (error or "rate limited")[:500], now, int(delivery_id)),
+        )
+        conn.commit()
+
+
+def deal_gate_audit(offer_id: int) -> list[str]:
+    """Return state invariant violations without changing financial facts."""
+    import json
+
+    gate = deal_gate_get(int(offer_id))
+    if not gate:
+        return ["gate_missing"]
+    issues: list[str] = []
+    st = (gate.get("gate_status") or "").strip().lower()
+    if st not in {"pending", "accounts", "completed", "rejected", "closed"}:
+        issues.append("invalid_gate_status")
+    both_yes = all(
+        (gate.get(key) or "").strip().lower() == "yes"
+        for key in ("buyer_response", "seller_response")
+    )
+    both_accounts = all(
+        bool((gate.get(key) or "").strip())
+        for key in ("buyer_accounts_text", "seller_accounts_text")
+    )
+    if st in {"accounts", "completed", "closed"} and not both_yes:
+        issues.append("stage_without_both_confirmations")
+    if st in {"completed", "closed"} and not both_accounts:
+        issues.append("payment_stage_without_both_accounts")
+    try:
+        seller_receipts = json.loads(gate.get("seller_receipt_log") or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        seller_receipts = []
+        issues.append("invalid_seller_receipt_log")
+    try:
+        toman_receipts = json.loads(gate.get("seller_toman_admin_log") or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        toman_receipts = []
+        issues.append("invalid_seller_toman_log")
+    privacy_redacted = int(gate.get("privacy_redacted_at") or 0) > 0
+    if (
+        not privacy_redacted
+        and int(gate.get("seller_toman_close_enabled_at") or 0) > 0
+        and not toman_receipts
+    ):
+        issues.append("seller_close_enabled_without_delivered_receipt")
+    if toman_receipts and not all(
+        not item.get("delivery_key") or int(item.get("delivered_at") or 0) > 0
+        for item in toman_receipts
+    ):
+        issues.append("seller_receipt_missing_delivery_confirmation")
+    if int(gate.get("seller_toman_settled_at") or 0) > 0 and st != "closed":
+        issues.append("seller_settled_but_gate_not_closed")
+    if seller_receipts and int(gate.get("seller_eur_account_sent_at") or 0) <= 0:
+        issues.append("seller_receipt_before_euro_account")
+    with sqlite3.connect(DB_PATH) as conn:
+        offer_row = conn.execute(
+            "SELECT status FROM advert_offers WHERE id = ?", (int(offer_id),)
+        ).fetchone()
+        advert_row = conn.execute(
+            "SELECT status FROM euro_adverts WHERE rowid = ?",
+            (int(gate.get("advert_rowid") or 0),),
+        ).fetchone()
+        now = int(time.time())
+        pending_delivery = conn.execute(
+            """
+            SELECT 1 FROM deal_delivery_queue
+            WHERE offer_id = ? AND (
+                status = 'failed'
+                OR (status = 'sending' AND updated_at <= ?)
+                OR (status = 'pending' AND created_at <= ?)
+            )
+            LIMIT 1
+            """,
+            (int(offer_id), now - 300, now - 300),
+        ).fetchone()
+    if st == "closed":
+        if offer_row and (offer_row[0] or "").strip().lower() != "gate_closed":
+            issues.append("closed_gate_offer_status_mismatch")
+        if advert_row and (advert_row[0] or "").strip() != "بسته":
+            issues.append("closed_gate_advert_status_mismatch")
+    if pending_delivery:
+        issues.append("critical_delivery_pending")
+    return issues
+
+
+def deal_gate_repair_safe(offer_id: int) -> list[str]:
+    """Repair status metadata only; never invent a payment or confirmation."""
+    oid = int(offer_id)
+    before = deal_gate_audit(oid)
+    gate = deal_gate_get(oid)
+    if not gate:
+        return before
+    if "seller_close_enabled_without_delivered_receipt" in before:
+        deal_gate_upsert(
+            offer_id=oid,
+            advert_rowid=int(gate["advert_rowid"]),
+            buyer_telegram_id=int(gate["buyer_telegram_id"]),
+            seller_telegram_id=int(gate["seller_telegram_id"]),
+            seller_toman_close_enabled_at=None,
+        )
+    gate = deal_gate_get(oid) or gate
+    if "seller_settled_but_gate_not_closed" in before:
+        deal_gate_close_atomic(oid, int(gate["advert_rowid"]))
+    elif {
+        "closed_gate_offer_status_mismatch",
+        "closed_gate_advert_status_mismatch",
+    }.intersection(before):
+        deal_gate_close_atomic(oid, int(gate["advert_rowid"]))
+    return deal_gate_audit(oid)
+
+
 def deal_gate_delete(offer_id: int) -> None:
     try:
         oid = int(offer_id)
@@ -3119,6 +3656,158 @@ def deal_gate_list_for_admin(*, limit: int = 25) -> list[dict]:
             (lim,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def deal_gate_list_problems(*, now: int | None = None, limit: int = 50) -> list[dict]:
+    """Passive admin work queue; this function never sends notifications."""
+    ts = int(now or time.time())
+    lim = max(1, min(int(limit), 100))
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT * FROM offer_deal_gates
+            ORDER BY COALESCE(completed_at, started_at, 0) ASC
+            LIMIT 250
+            """
+        ).fetchall()
+    problems: list[dict] = []
+    for row in rows:
+        gate = dict(row)
+        oid = int(gate["offer_id"])
+        issues = deal_gate_audit(oid)
+        status = (gate.get("gate_status") or "").strip().lower()
+        age_from = int(gate.get("completed_at") or gate.get("started_at") or ts)
+        age = max(0, ts - age_from)
+        if status == "pending" and age >= 2 * 3600:
+            issues.append("stuck_pending")
+        elif status == "accounts" and age >= 12 * 3600:
+            issues.append("stuck_accounts")
+        elif status == "completed" and age >= 12 * 3600:
+            issues.append("stuck_completed")
+        if not issues:
+            continue
+        gate["problem_issues"] = list(dict.fromkeys(issues))
+        gate["problem_age_seconds"] = age
+        problems.append(gate)
+        if len(problems) >= lim:
+            break
+    return problems
+
+
+def deal_privacy_redact_expired(
+    *, now: int | None = None, retention_days: int = 180
+) -> int:
+    """Redact financial artifacts from old closed deals while retaining milestones."""
+    import json
+
+    ts = int(now or time.time())
+    days = max(30, int(retention_days))
+    cutoff = ts - days * 86400
+    redacted = 0
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            """
+            UPDATE offer_deal_gates
+            SET buyer_accounts_text = '[redacted]',
+                seller_accounts_text = '[redacted]',
+                buyer_accounts_photo_file_id = NULL,
+                seller_accounts_photo_file_id = NULL,
+                buyer_receipt_log = '[]', seller_receipt_log = '[]',
+                seller_toman_admin_log = '[]',
+                privacy_redacted_at = ?
+            WHERE gate_status = 'closed'
+              AND COALESCE(privacy_redacted_at, 0) = 0
+              AND CAST(COALESCE(
+                    seller_toman_settled_at, completed_at, started_at, 0
+                  ) AS INTEGER) > 0
+              AND CAST(COALESCE(
+                    seller_toman_settled_at, completed_at, started_at, 0
+                  ) AS INTEGER) <= ?
+            """,
+            (ts, cutoff),
+        )
+        redacted += max(0, cur.rowcount)
+        archive_rows = conn.execute(
+            """
+            SELECT id, offer_id, advert_rowid, reason, archived_at
+            FROM offer_deal_gate_archive
+            WHERE archived_at <= ?
+              AND snapshot_json NOT LIKE '%"financial_data"%redacted%'
+            """,
+            (cutoff,),
+        ).fetchall()
+        for row in archive_rows:
+            minimal = json.dumps(
+                {
+                    "offer_id": int(row[1]),
+                    "advert_rowid": int(row[2]),
+                    "reason": row[3],
+                    "archived_at": int(row[4]),
+                    "financial_data": "redacted",
+                },
+                ensure_ascii=False,
+            )
+            conn.execute(
+                "UPDATE offer_deal_gate_archive SET snapshot_json = ? WHERE id = ?",
+                (minimal, int(row[0])),
+            )
+            redacted += 1
+        conn.commit()
+    return redacted
+
+
+def deal_operational_health(*, now: int | None = None) -> dict:
+    """Read-only health snapshot for the admin page."""
+    ts = int(now or time.time())
+    with sqlite3.connect(DB_PATH) as conn:
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        queue = conn.execute(
+            """
+            SELECT
+                SUM(CASE WHEN status IN ('pending','failed','sending') THEN 1 ELSE 0 END),
+                MIN(CASE WHEN status IN ('pending','failed','sending') THEN created_at END),
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)
+            FROM deal_delivery_queue
+            """
+        ).fetchone()
+        problems = len(deal_gate_list_problems(now=ts, limit=100))
+    oldest = int((queue or [0, 0, 0])[1] or 0)
+    return {
+        "database_integrity": integrity,
+        "queue_open": int((queue or [0])[0] or 0),
+        "queue_failed": int((queue or [0, 0, 0])[2] or 0),
+        "oldest_queue_age": max(0, ts - oldest) if oldest else 0,
+        "problem_deals": problems,
+        "last_backup_at": int(get_setting("deal_last_backup_at", "0") or 0),
+        "last_backup_path": get_setting("deal_last_backup_path", "") or "",
+        "last_backup_error": get_setting("deal_last_backup_error", "") or "",
+        "last_offsite_backup_at": int(
+            get_setting("deal_last_offsite_backup_at", "0") or 0
+        ),
+        "last_offsite_backup_error": get_setting(
+            "deal_last_offsite_backup_error", ""
+        ) or "",
+        "last_restore_drill_at": int(
+            get_setting("deal_last_restore_drill_at", "0") or 0
+        ),
+        "last_restore_drill_error": get_setting(
+            "deal_last_restore_drill_error", ""
+        ) or "",
+        "last_reconciliation_at": int(
+            get_setting("deal_last_reconciliation_at", "0") or 0
+        ),
+        "last_reconciliation_issues": int(
+            get_setting("deal_last_reconciliation_issues", "0") or 0
+        ),
+        "last_reconciliation_error": get_setting(
+            "deal_last_reconciliation_error", ""
+        ) or "",
+        "last_privacy_run_at": int(
+            get_setting("deal_last_privacy_run_at", "0") or 0
+        ),
+        "started_at": int(get_setting("bot_process_started_at", "0") or 0),
+    }
 
 
 def deal_gate_list_awaiting_seller_toman_confirm() -> list[dict]:
