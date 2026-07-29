@@ -188,6 +188,7 @@ class AdminFullDealMessageTests(unittest.IsolatedAsyncioTestCase):
 
         sync.assert_awaited_once_with(context, 264)
         self.assertIn("خریدار و فروشنده", query.answer.await_args_list[-1].args[0])
+        self.assertEqual(query.answer.await_count, 1)
 
 
 class DealPartySummarySyncTests(unittest.IsolatedAsyncioTestCase):

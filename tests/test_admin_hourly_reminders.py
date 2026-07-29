@@ -235,6 +235,43 @@ class AdminHourlyReminderTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(replayed)
         bot.send_message.assert_not_awaited()
 
+    async def test_party_message_replay_keeps_only_latest_summary_per_user(self):
+        bot = SimpleNamespace(send_message=AsyncMock(), send_photo=AsyncMock())
+        rows = [
+            {
+                "recipient_telegram_id": 111,
+                "party": "buyer",
+                "tag": "پیام تکمیل معامله + منوی اصلی",
+                "msg_type": "text",
+                "body_html": "old buyer summary",
+            },
+            {
+                "recipient_telegram_id": 222,
+                "party": "seller",
+                "tag": "پیام تکمیل معامله + منوی اصلی",
+                "msg_type": "text",
+                "body_html": "seller summary",
+            },
+            {
+                "recipient_telegram_id": 111,
+                "party": "buyer",
+                "tag": "ویرایش اطلاعات معامله توسط ادمین",
+                "msg_type": "text",
+                "body_html": "current buyer summary",
+            },
+        ]
+        with patch.object(
+            deal_outbound, "bot_outbound_log_list", return_value=rows
+        ):
+            replayed = await deal_outbound.deal_admin_replay_outbound(bot, 7001, 252)
+
+        self.assertTrue(replayed)
+        replay_texts = [call.args[1] for call in bot.send_message.await_args_list[1:]]
+        self.assertEqual(len(replay_texts), 2)
+        self.assertFalse(any("old buyer summary" in text for text in replay_texts))
+        self.assertTrue(any("current buyer summary" in text for text in replay_texts))
+        self.assertTrue(any("seller summary" in text for text in replay_texts))
+
 
 class AdminReminderSchedulerTests(unittest.TestCase):
     def test_quiet_operations_schedule_all_maintenance_jobs(self):

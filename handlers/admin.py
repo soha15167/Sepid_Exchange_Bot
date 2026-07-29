@@ -2437,15 +2437,18 @@ async def admin_dashboard_callback(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     if not query or not query.message:
         return
-    try:
-        await query.answer()
-    except Exception:
-        pass
+    data = query.data or ""
+    # usersync needs to answer only after both Telegram edits finish; answering
+    # here would consume the callback and hide the final success/error popup.
+    if not data.startswith("adm|dgs|usersync|"):
+        try:
+            await query.answer()
+        except Exception:
+            pass
     admin_uid = query.from_user.id
     if not _is_admin(admin_uid):
         return
 
-    data = query.data or ""
     if not data.startswith("adm|"):
         return
 

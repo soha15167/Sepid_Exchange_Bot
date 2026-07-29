@@ -31,6 +31,29 @@ _PARTY_FA = {
     "user": "کاربر",
     "admin": "ادمین",
 }
+_PARTY_SUMMARY_TAGS = {
+    "پیام تکمیل معامله + منوی اصلی",
+    "بروزرسانی اطلاعات معامله توسط ادمین",
+    "ویرایش اطلاعات معامله توسط ادمین",
+}
+
+
+def _collapse_party_summary_revisions(rows: list[dict]) -> list[dict]:
+    """Show only the newest in-place deal-summary revision for each party."""
+    latest_by_recipient: dict[int, int] = {}
+    for index, row in enumerate(rows):
+        if (row.get("tag") or "").strip() not in _PARTY_SUMMARY_TAGS:
+            continue
+        recipient = int(row.get("recipient_telegram_id") or 0)
+        if recipient:
+            latest_by_recipient[recipient] = index
+    return [
+        row
+        for index, row in enumerate(rows)
+        if (row.get("tag") or "").strip() not in _PARTY_SUMMARY_TAGS
+        or latest_by_recipient.get(int(row.get("recipient_telegram_id") or 0))
+        == index
+    ]
 
 
 def party_for_uid(gate: dict | None, uid: int) -> str:
@@ -181,11 +204,11 @@ async def deal_admin_replay_outbound(
     # Internal admin reminders use this table only as a persistent delivery
     # clock. They must not appear in the admin's "messages sent to parties"
     # replay, which is intentionally limited to user-facing deal messages.
-    rows = [
+    rows = _collapse_party_summary_revisions([
         row
         for row in bot_outbound_log_list(offer_id)
         if (row.get("party") or "").strip().lower() != "admin"
-    ]
+    ])
     if not rows:
         return False
     intro = (
