@@ -57,6 +57,9 @@ class BuyerReceiptAutoAccountingTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 self.deal_gate, "sync_deal_admin_notification", new=AsyncMock()
             ),
+            patch.object(
+                self.deal_gate, "_send_deal_receipt_review_preview", new=AsyncMock()
+            ),
             patch("utils.iran_panel_client.post_transaction", post),
         ):
             await self.deal_gate._auto_account_buyer_receipt(
@@ -110,6 +113,7 @@ class BuyerReceiptAutoAccountingTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(post.called)
         self.assertEqual(self.items[0]["accounting_status"], "ready_for_review")
         self.assertEqual(self.items[0]["amount_rial"], 100_000_000)
+        self.assertEqual(self.items[0]["recognized_amount_rial"], 100_500_000)
         self.assertTrue(self.items[0]["fee_adjusted_to_remaining"])
 
     async def test_ambiguous_partial_currency_waits_for_review(self):
@@ -198,6 +202,33 @@ class BuyerReceiptAutoAccountingTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertFalse(post.called)
         self.assertEqual(self.items[0]["accounting_status"], "rejected")
+
+    async def test_preview_shows_receipt_amount_and_separate_submit_amount(self):
+        bot = SimpleNamespace(send_message=AsyncMock())
+        receipt = {
+            "recognized_amount_rial": 100_500_000,
+            "amount_rial": 100_000_000,
+            "bank_name": "ملی",
+            "transfer_type": "پایا",
+            "jdate": "1405/05/01",
+            "recognition_warnings": [],
+        }
+        with (
+            patch.object(self.deal_gate, "ADMIN_IDS", [1]),
+            patch.object(self.deal_gate, "_buyer_dealer_name", return_value="buyer"),
+        ):
+            await self.deal_gate._send_deal_receipt_review_preview(
+                bot, gate=self.gate, receipt_index=0, receipt=receipt
+            )
+        sent = bot.send_message.await_args.kwargs
+        self.assertIn("100,500,000", sent["text"])
+        self.assertIn("100,000,000", sent["text"])
+        callback_data = [
+            button.callback_data
+            for row in sent["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        self.assertEqual(callback_data, ["adm|rcptok|258|0", "adm|rcptno|258|0"])
 
 
 if __name__ == "__main__":

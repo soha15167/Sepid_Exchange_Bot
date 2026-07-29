@@ -2283,7 +2283,8 @@ async def _auto_account_buyer_receipt(
         payload["bank_name"] = _normalize_bank_input(payload.get("bank_name") or "")
         payload = _assess_receipt_payload(payload, raw, "in", source)
 
-        amount_rial = int(payload.get("iran_amount") or 0)
+        recognized_amount_rial = int(payload.get("iran_amount") or 0)
+        amount_rial = recognized_amount_rial
         submitted_total = sum(
             int(item.get("amount_rial") or 0)
             for index, item in enumerate(deal_gate_buyer_receipt_list(oid))
@@ -2307,6 +2308,7 @@ async def _auto_account_buyer_receipt(
                 currency = "rial"
             elif amount_rial * 10 == remaining_before:
                 amount_rial *= 10
+                recognized_amount_rial = amount_rial
                 payload["iran_amount"] = amount_rial
                 currency = "toman_inferred_from_exact_remaining"
 
@@ -2351,6 +2353,7 @@ async def _auto_account_buyer_receipt(
 
         metadata = {
             "amount_rial": amount_rial,
+            "recognized_amount_rial": recognized_amount_rial,
             "bank_name": payload.get("bank_name") or "",
             "transfer_type": payload.get("transfer_type") or "",
             "jdate": payload.get("jdate") or "",
@@ -2381,6 +2384,12 @@ async def _auto_account_buyer_receipt(
             panel_error="",
             **metadata,
         )
+        await _send_deal_receipt_review_preview(
+            context.bot,
+            gate=gate,
+            receipt_index=receipt_index,
+            receipt={**items[receipt_index], **metadata, "accounting_status": "ready_for_review"},
+        )
         _receipt_accounting_log(
             oid,
             "فیش خوانده شد و منتظر تایید ادمین برای ثبت در سایت است",
@@ -2406,6 +2415,72 @@ async def _auto_account_buyer_receipt(
             await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
         except Exception:
             logger.exception("deal_receipt_accounting: admin sync failed offer=%s", oid)
+
+
+async def _send_deal_receipt_review_preview(
+    bot, *, gate: dict, receipt_index: int, receipt: dict
+) -> None:
+    """Send the full Iran-entry draft while preserving the receipt's OCR amount."""
+    oid = int(gate.get("offer_id") or 0)
+    aid = int(gate.get("advert_rowid") or 0)
+    recognized_amount = int(
+        receipt.get("recognized_amount_rial") or receipt.get("amount_rial") or 0
+    )
+    submit_amount = int(receipt.get("amount_rial") or 0)
+    payload = {
+        "iran_amount": recognized_amount,
+        "bank_name": receipt.get("bank_name") or "",
+        "transfer_type": receipt.get("transfer_type") or "",
+        "jdate": receipt.get("jdate") or "",
+        "depositor_name": _buyer_dealer_name(gate),
+        "description": f"آگهی {aid}",
+    }
+    from handlers.iran_panel_sync import _render_draft_html
+
+    text = _render_draft_html("in", payload)
+    if submit_amount != recognized_amount:
+        text += (
+            f"\n{_RTL}ℹ️ <b>مبلغ پیشنهادی ثبت سایت پس از تطبیق معامله:</b> "
+            f"<code>{submit_amount:,}</code> ریال\n"
+            f"{_RTL}<i>مبلغ بالای پیش‌نویس، مبلغ واقعی خوانده‌شده از فیش است.</i>\n"
+        )
+    warnings = receipt.get("recognition_warnings") or []
+    if warnings:
+        text += (
+            f"\n{_RTL}⚠️ <b>کنترل رسید:</b> "
+            + html_module.escape("؛ ".join(map(str, warnings)))
+        )
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ بررسی کردم؛ ثبت در سایت",
+                    callback_data=f"adm|rcptok|{oid}|{int(receipt_index)}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "❌ انصراف",
+                    callback_data=f"adm|rcptno|{oid}|{int(receipt_index)}",
+                )
+            ],
+        ]
+    )
+    for admin_id in sorted({int(value) for value in ADMIN_IDS if int(value) > 0}):
+        try:
+            await bot.send_message(
+                chat_id=admin_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            logger.exception(
+                "deal_receipt_accounting: preview send failed offer=%s admin=%s",
+                oid,
+                admin_id,
+            )
 
 
 async def _handle_admin_receipt_review(
