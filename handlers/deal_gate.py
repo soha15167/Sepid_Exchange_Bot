@@ -74,6 +74,7 @@ from database.db import (
     deal_gate_append_seller_receipt,
     deal_gate_buyer_receipt_list,
     deal_gate_claim_buyer_receipt_submission,
+    deal_gate_has_submitted_buyer_receipt,
     deal_gate_reject_buyer_receipt,
     deal_gate_update_buyer_receipt,
     deal_gate_confirm_seller_receipt_buyer,
@@ -2231,6 +2232,19 @@ async def _auto_account_buyer_receipt(
         "submitted", "submitting", "processing", "ready_for_review", "rejected", "duplicate"
     ):
         return
+    if deal_gate_has_submitted_buyer_receipt(
+        file_unique_id=file_unique_id,
+        exclude_offer_id=oid,
+        exclude_receipt_index=receipt_index,
+    ):
+        deal_gate_update_buyer_receipt(
+            oid,
+            receipt_index,
+            accounting_status="duplicate",
+            recognition_warnings=["این فیش قبلاً در سایت ثبت شده است"],
+        )
+        await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
+        return
     deal_gate_update_buyer_receipt(
         oid, receipt_index, accounting_status="processing", panel_error=""
     )
@@ -2297,6 +2311,12 @@ async def _auto_account_buyer_receipt(
                 currency = "toman_inferred_from_exact_remaining"
 
         fingerprint = _receipt_fingerprint(raw, file_unique_id)
+        submitted_elsewhere = deal_gate_has_submitted_buyer_receipt(
+            file_unique_id=file_unique_id,
+            receipt_fingerprint=fingerprint,
+            exclude_offer_id=oid,
+            exclude_receipt_index=receipt_index,
+        )
         duplicate = any(
             index != receipt_index
             and fingerprint
@@ -2306,7 +2326,7 @@ async def _auto_account_buyer_receipt(
             for index, item in enumerate(deal_gate_buyer_receipt_list(oid))
         )
         warnings = _deal_bound_receipt_warnings(payload)
-        if duplicate:
+        if duplicate or submitted_elsewhere:
             deal_gate_update_buyer_receipt(
                 oid,
                 receipt_index,

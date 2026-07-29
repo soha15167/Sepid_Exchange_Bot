@@ -153,6 +153,47 @@ class DealGateDatabaseTests(unittest.TestCase):
             "submitting",
         )
 
+    def test_submitted_receipt_is_terminal_during_admin_reprocess(self):
+        self._create_gate()
+        db.deal_gate_append_buyer_receipt(
+            101, entry_type="photo", file_id="receipt", file_unique_id="terminal-file"
+        )
+        db.deal_gate_update_buyer_receipt(
+            101, 0, accounting_status="submitted", panel_submitted_at=123
+        )
+        result = db.deal_gate_update_buyer_receipt(
+            101, 0, accounting_status="pending", panel_submitted_at=0
+        )
+        self.assertEqual(result["accounting_status"], "submitted")
+        self.assertEqual(result["panel_submitted_at"], 123)
+
+    def test_same_receipt_cannot_be_claimed_for_two_deals(self):
+        self._create_gate()
+        db.deal_gate_append_buyer_receipt(
+            101, entry_type="photo", file_id="a", file_unique_id="same-file"
+        )
+        db.deal_gate_update_buyer_receipt(
+            101, 0, accounting_status="submitted", amount_rial=100, bank_name="ملی"
+        )
+        db.deal_gate_upsert(
+            offer_id=102, advert_rowid=3197, buyer_telegram_id=10,
+            seller_telegram_id=21, gate_status="completed",
+        )
+        db.deal_gate_append_buyer_receipt(
+            102, entry_type="photo", file_id="b", file_unique_id="same-file"
+        )
+        db.deal_gate_update_buyer_receipt(
+            102, 0, accounting_status="ready_for_review",
+            amount_rial=100, bank_name="ملی",
+        )
+        self.assertTrue(
+            db.deal_gate_has_submitted_buyer_receipt(
+                file_unique_id="same-file", exclude_offer_id=102,
+                exclude_receipt_index=0,
+            )
+        )
+        self.assertIsNone(db.deal_gate_claim_buyer_receipt_submission(102, 0))
+
     def test_delivery_queue_deduplicates_and_retries(self):
         first = db.deal_delivery_enqueue(
             offer_id=101,

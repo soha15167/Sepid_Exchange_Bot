@@ -44,6 +44,11 @@ class BuyerReceiptAutoAccountingTests(unittest.IsolatedAsyncioTestCase):
                 side_effect=self._update,
             ),
             patch.object(
+                self.deal_gate,
+                "deal_gate_has_submitted_buyer_receipt",
+                return_value=False,
+            ),
+            patch.object(
                 self.deal_gate, "_buyer_expected_rial", return_value=expected_rial
             ),
             patch.object(
