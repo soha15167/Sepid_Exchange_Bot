@@ -27,6 +27,7 @@ class BankingExtractionResult:
     sender_name: str = ""
     receiver_name: str = ""
     transfer_type: str = ""
+    description: str = ""
     amount: int | None = None
     date: str = ""
     time: str = ""

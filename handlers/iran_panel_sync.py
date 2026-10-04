@@ -1483,7 +1483,7 @@ def _vision_dict_from_banking(data: dict, mode: str) -> dict:
             if "کارت" in (data.get("raw_text") or "")
             else ""
         ),
-        "description": (data.get("tracking_number") or "").strip(),
+        "description": (data.get("description") or "").strip(),
         "_recognition_source": (data.get("source") or "gemini").strip(),
         "_recognition_score": float(data.get("confidence") or 0),
         "_detected_direction": str(meta.get("detected_direction") or "").strip(),

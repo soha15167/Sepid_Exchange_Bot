@@ -12,7 +12,7 @@ from telegram import Update
 from telegram.constants import ChatType
 from telegram.ext import ContextTypes, ApplicationHandlerStop
 
-from config.settings import ADMIN_IDS
+from config.settings import ADMIN_IDS, DEAL_RECEIPT_REVIEWER_IDS
 from keyboards.menus import (
     CHANNEL_RULES_REPLY_BUTTON_TEXT,
     EXCHANGE_OPTION,
@@ -343,6 +343,23 @@ async def unregistered_user_gate(update: Update, context: ContextTypes.DEFAULT_T
     if not u:
         return
     if u.id in set(ADMIN_IDS or []):
+        return
+    reviewer_ids = set(DEAL_RECEIPT_REVIEWER_IDS or [])
+    reviewer_callback = (
+        update.callback_query
+        and normalize_telegram_callback_data(update.callback_query.data or "").startswith(
+            ("adm|tomset|", "adm|tomamt|", "viewerpay|", "outreceipt|")
+        )
+    )
+    pending_edit = context.user_data.get("deal_rcpt_admin_edit_pending") or {}
+    reviewer_edit_text = (
+        update.message
+        and isinstance(pending_edit, dict)
+        and bool(pending_edit.get("reviewer_amount_edit"))
+        and int(pending_edit.get("actor_id") or 0) == int(u.id)
+    )
+    outgoing_edit = update.message and (context.user_data.get("deal_outgoing_edit") or context.user_data.get("viewer_toman_receipt_pending"))
+    if u.id in reviewer_ids and (reviewer_callback or reviewer_edit_text or outgoing_edit):
         return
     if get_user(u.id) is not None:
         return

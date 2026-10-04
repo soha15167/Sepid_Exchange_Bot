@@ -417,6 +417,11 @@ def ensure_schema() -> None:
             "seller_toman_admin_log",
             "seller_toman_settled_at",
             "seller_toman_close_enabled_at",
+            "viewer_toman_due_at",
+            "viewer_toman_claimed_by",
+            "viewer_toman_claimed_at",
+            "viewer_toman_receipt_log",
+            "viewer_toman_notify_mids",
             "admin_escalation_mids",
             "privacy_redacted_at",
         ):
@@ -2830,6 +2835,11 @@ def deal_gate_upsert(
             "seller_toman_admin_log",
             "seller_toman_settled_at",
             "seller_toman_close_enabled_at",
+            "viewer_toman_due_at",
+            "viewer_toman_claimed_by",
+            "viewer_toman_claimed_at",
+            "viewer_toman_receipt_log",
+            "viewer_toman_notify_mids",
         }
         for key, val in fields.items():
             if key not in allowed:
@@ -2919,9 +2929,6 @@ def deal_gate_update_buyer_receipt(
     allowed = {
         "accounting_status",
         "amount_rial",
-        "recognized_amount_rial",
-        "depositor_name",
-        "description",
         "bank_name",
         "transfer_type",
         "jdate",
@@ -2929,13 +2936,17 @@ def deal_gate_update_buyer_receipt(
         "cumulative_rial",
         "remaining_rial",
         "recognition_source",
+        "ocr_text",
+        "receipt_description",
         "recognition_warnings",
         "receipt_currency",
         "receipt_fingerprint",
         "panel_error",
         "panel_submitted_at",
         "fee_adjusted_to_remaining",
-        "preview_message_ids",
+        "reviewer_received_at",
+        "reviewer_received_by",
+        "reviewer_notify_mids",
     }
     clean = {key: value for key, value in fields.items() if key in allowed}
     if not clean:
@@ -2956,11 +2967,8 @@ def deal_gate_update_buyer_receipt(
         if not isinstance(items, list) or idx < 0 or idx >= len(items):
             return None
         item = items[idx] if isinstance(items[idx], dict) else {}
-        # A successful panel submission is a terminal financial state. Neither
-        # an admin reprocess nor stale application code may turn it into a new
-        # preview or make it eligible for a second submission.
-        if (item.get("accounting_status") or "") == "submitted":
-            return dict(item)
+        if item.get("attachment_removed_at"):
+            return None
         item.update(clean)
         items[idx] = item
         conn.execute(
@@ -2971,58 +2979,56 @@ def deal_gate_update_buyer_receipt(
         return dict(item)
 
 
-def deal_gate_has_submitted_buyer_receipt(
+def deal_gate_confirm_buyer_receipt_received(
+    offer_id: int,
+    receipt_index: int,
+    reviewer_id: int,
     *,
-    file_unique_id: str = "",
-    receipt_fingerprint: str = "",
-    exclude_offer_id: int = 0,
-    exclude_receipt_index: int = -1,
-    include_submitting: bool = False,
-) -> bool:
-    """Check whether the same receipt is already posted (or being posted)."""
+    received_at: int | None = None,
+) -> tuple[dict | None, bool]:
+    """Atomically mark one buyer receipt received; return (item, changed)."""
     import json
 
-    unique_id = (file_unique_id or "").strip()
-    fingerprint = (receipt_fingerprint or "").strip()
-    if not unique_id and not fingerprint:
-        return False
-    terminal = {"submitted"}
-    if include_submitting:
-        terminal.add("submitting")
+    oid, idx, uid = int(offer_id), int(receipt_index), int(reviewer_id)
+    stamp = int(received_at or time.time())
     with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(
-            "SELECT offer_id, buyer_receipt_log FROM offer_deal_gates "
-            "WHERE COALESCE(buyer_receipt_log, '') <> ''"
-        ).fetchall()
-    for offer_id, raw in rows:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT buyer_receipt_log FROM offer_deal_gates WHERE offer_id = ?", (oid,)
+        ).fetchone()
+        if not row:
+            return None, False
         try:
-            items = json.loads(raw or "[]")
+            items = json.loads(row["buyer_receipt_log"] or "[]")
         except (json.JSONDecodeError, TypeError):
-            continue
-        if not isinstance(items, list):
-            continue
-        for index, item in enumerate(items):
-            if not isinstance(item, dict):
-                continue
-            if int(offer_id) == int(exclude_offer_id or 0) and index == int(
-                exclude_receipt_index
-            ):
-                continue
-            if (item.get("accounting_status") or "") not in terminal:
-                continue
-            if unique_id and (item.get("file_unique_id") or "").strip() == unique_id:
-                return True
-            if fingerprint and (
-                item.get("receipt_fingerprint") or ""
-            ).strip() == fingerprint:
-                return True
-    return False
+            return None, False
+        if not isinstance(items, list) or idx < 0 or idx >= len(items):
+            return None, False
+        item = items[idx] if isinstance(items[idx], dict) else {}
+        if item.get("attachment_removed_at"):
+            return None, False
+        if int(item.get("reviewer_received_at") or 0) > 0:
+            return dict(item), False
+        item["reviewer_received_at"] = stamp
+        item["reviewer_received_by"] = uid
+        items[idx] = item
+        conn.execute(
+            "UPDATE offer_deal_gates SET buyer_receipt_log = ? WHERE offer_id = ?",
+            (json.dumps(items, ensure_ascii=False), oid),
+        )
+        conn.commit()
+        return dict(item), True
 
 
 def deal_gate_claim_buyer_receipt_submission(
     offer_id: int, receipt_index: int
 ) -> dict | None:
-    """Atomically claim one reviewed receipt for panel submission."""
+    """Atomically claim one reviewed receipt for panel submission.
+
+    Returning ``None`` means another click already claimed it, it was rejected,
+    or it is not ready. This makes the admin approval idempotent.
+    """
     import json
 
     oid = int(offer_id)
@@ -3031,7 +3037,8 @@ def deal_gate_claim_buyer_receipt_submission(
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT buyer_receipt_log FROM offer_deal_gates WHERE offer_id = ?", (oid,)
+            "SELECT buyer_receipt_log FROM offer_deal_gates WHERE offer_id = ?",
+            (oid,),
         ).fetchone()
         if not row:
             return None
@@ -3042,44 +3049,17 @@ def deal_gate_claim_buyer_receipt_submission(
         if not isinstance(items, list) or idx < 0 or idx >= len(items):
             return None
         item = items[idx] if isinstance(items[idx], dict) else {}
+        if item.get("attachment_removed_at"):
+            return None
         if (item.get("accounting_status") or "") not in {
-            "ready_for_review", "panel_failed"
+            "ready_for_review",
+            "panel_failed",
         }:
             return None
         if int(item.get("amount_rial") or 0) <= 0 or not str(
             item.get("bank_name") or ""
         ).strip():
             return None
-        unique_id = (item.get("file_unique_id") or "").strip()
-        fingerprint = (item.get("receipt_fingerprint") or "").strip()
-        rows = conn.execute(
-            "SELECT offer_id, buyer_receipt_log FROM offer_deal_gates "
-            "WHERE COALESCE(buyer_receipt_log, '') <> ''"
-        ).fetchall()
-        for other_offer_id, raw in rows:
-            try:
-                other_items = json.loads(raw or "[]")
-            except (json.JSONDecodeError, TypeError):
-                continue
-            if not isinstance(other_items, list):
-                continue
-            for other_index, other in enumerate(other_items):
-                if not isinstance(other, dict):
-                    continue
-                if int(other_offer_id) == oid and other_index == idx:
-                    continue
-                if (other.get("accounting_status") or "") not in {
-                    "submitted", "submitting"
-                }:
-                    continue
-                same_file = unique_id and (
-                    other.get("file_unique_id") or ""
-                ).strip() == unique_id
-                same_fingerprint = fingerprint and (
-                    other.get("receipt_fingerprint") or ""
-                ).strip() == fingerprint
-                if same_file or same_fingerprint:
-                    return None
         item["accounting_status"] = "submitting"
         item["panel_error"] = ""
         items[idx] = item
@@ -3116,48 +3096,6 @@ def deal_gate_reject_buyer_receipt(offer_id: int, receipt_index: int) -> dict | 
         }:
             return None
         item.update(accounting_status="rejected", panel_error="")
-        items[idx] = item
-        conn.execute(
-            "UPDATE offer_deal_gates SET buyer_receipt_log = ? WHERE offer_id = ?",
-            (json.dumps(items, ensure_ascii=False), oid),
-        )
-        conn.commit()
-        return dict(item)
-
-
-def deal_gate_reopen_submitted_buyer_receipt(
-    offer_id: int, receipt_index: int, *, verified_absent_at: int
-) -> dict | None:
-    """Reopen a submitted receipt only after an external panel absence check."""
-    import json
-
-    oid, idx = int(offer_id), int(receipt_index)
-    verified_at = int(verified_absent_at or 0)
-    if verified_at <= 0:
-        return None
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute(
-            "SELECT buyer_receipt_log FROM offer_deal_gates WHERE offer_id = ?", (oid,)
-        ).fetchone()
-        if not row:
-            return None
-        try:
-            items = json.loads(row["buyer_receipt_log"] or "[]")
-        except (json.JSONDecodeError, TypeError):
-            return None
-        if not isinstance(items, list) or idx < 0 or idx >= len(items):
-            return None
-        item = items[idx] if isinstance(items[idx], dict) else {}
-        if (item.get("accounting_status") or "") != "submitted":
-            return None
-        item.update(
-            accounting_status="pending",
-            panel_submitted_at=0,
-            panel_error="",
-            panel_absence_verified_at=verified_at,
-        )
         items[idx] = item
         conn.execute(
             "UPDATE offer_deal_gates SET buyer_receipt_log = ? WHERE offer_id = ?",
@@ -3243,6 +3181,8 @@ def deal_gate_confirm_seller_receipt_buyer(
         return False
     if idx < 0 or idx >= len(items):
         return False
+    if items[idx].get("attachment_removed_at"):
+        return False
     if int(items[idx].get("buyer_confirmed_at") or 0) > 0:
         return True
     by = (confirmed_by or "buyer").strip().lower()
@@ -3327,6 +3267,16 @@ def deal_gate_enable_seller_toman_close(offer_id: int) -> int:
     return now
 
 
+def _has_active_seller_receipt(conn, offer_id):
+    import json
+    row = conn.execute('SELECT seller_toman_admin_log FROM offer_deal_gates WHERE offer_id=?', (offer_id,)).fetchone()
+    try:
+        items = json.loads(row[0] or '[]') if row else []
+        return any(isinstance(r, dict) and not r.get('attachment_removed_at') for r in items)
+    except (ValueError, TypeError):
+        return False
+
+
 def deal_gate_mark_seller_toman_settled(
     offer_id: int,
     *,
@@ -3346,6 +3296,9 @@ def deal_gate_mark_seller_toman_settled(
               AND COALESCE(seller_toman_close_enabled_at, 0) > 0
               AND trim(COALESCE(seller_toman_admin_log, '')) NOT IN ('', '[]')
         """ if require_receipt else ""
+        if require_receipt and not _has_active_seller_receipt(conn, oid):
+            conn.rollback()
+            return False
         cur = conn.execute(
             f"""
             UPDATE offer_deal_gates
@@ -3498,6 +3451,9 @@ def deal_gate_settle_and_close_atomic(
             if require_receipt
             else ""
         )
+        if require_receipt and not _has_active_seller_receipt(conn, oid):
+            conn.rollback()
+            return False
         changed = conn.execute(
             f"""
             UPDATE offer_deal_gates
@@ -4133,6 +4089,88 @@ def deal_gate_list_awaiting_admin_toman_receipt() -> list[dict]:
               )
             ORDER BY offer_id ASC
             """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def deal_gate_claim_viewer_toman_payment(offer_id: int, viewer_id: int) -> bool:
+    """Atomically assign the viewer payout task to one reviewer only."""
+    oid, uid = int(offer_id), int(viewer_id)
+    now = int(time.time())
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            """
+            UPDATE offer_deal_gates
+            SET viewer_toman_claimed_by = ?, viewer_toman_claimed_at = ?
+            WHERE offer_id = ?
+              AND COALESCE(viewer_toman_due_at, 0) > 0
+              AND COALESCE(viewer_toman_claimed_by, 0) = 0
+              AND LOWER(TRIM(COALESCE(gate_status, ''))) = 'completed'
+            """,
+            (uid, now, oid),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+
+
+def deal_gate_append_viewer_toman_receipt(
+    offer_id: int,
+    *,
+    viewer_id: int,
+    entry_type: str,
+    text: str = "",
+    file_id: str = "",
+    source_message_id: int = 0,
+) -> list[dict] | None:
+    """Append a receipt only for the viewer that atomically owns this task."""
+    import json
+
+    oid, uid = int(offer_id), int(viewer_id)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT viewer_toman_claimed_by, viewer_toman_receipt_log FROM offer_deal_gates WHERE offer_id = ?",
+            (oid,),
+        ).fetchone()
+        if not row or int(row["viewer_toman_claimed_by"] or 0) != uid:
+            return None
+        try:
+            items = json.loads(row["viewer_toman_receipt_log"] or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            items = []
+        if not isinstance(items, list):
+            items = []
+        items.append({
+            "type": (entry_type or "text").strip()[:20],
+            "text": (text or "").strip()[:4000],
+            "file_id": (file_id or "").strip()[:256],
+            "source_message_id": int(source_message_id or 0),
+            "at": int(time.time()),
+            "viewer_id": uid,
+        })
+        conn.execute(
+            "UPDATE offer_deal_gates SET viewer_toman_receipt_log = ? WHERE offer_id = ?",
+            (json.dumps(items, ensure_ascii=False), oid),
+        )
+        conn.commit()
+    return items
+
+
+def deal_gate_list_due_viewer_toman_payments(now: int | None = None) -> list[dict]:
+    """Open viewer payout tasks whose one-hour delay has elapsed."""
+    ts = int(now if now is not None else time.time())
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT * FROM offer_deal_gates
+            WHERE LOWER(TRIM(COALESCE(gate_status, ''))) = 'completed'
+              AND CAST(COALESCE(viewer_toman_due_at, '0') AS INTEGER) > 0
+              AND CAST(COALESCE(viewer_toman_due_at, '0') AS INTEGER) <= ?
+              AND COALESCE(seller_toman_settled_at, 0) = 0
+            ORDER BY offer_id ASC
+            """,
+            (ts,),
         ).fetchall()
     return [dict(row) for row in rows]
 

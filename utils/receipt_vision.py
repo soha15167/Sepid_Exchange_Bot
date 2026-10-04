@@ -80,7 +80,7 @@ Return ONLY valid JSON:
   "bank_name": "{bank_rule}",
   "dest_bank": "destination bank from text, a recognizable logo, IBAN, or card BIN, or null",{name_fields}
   "transfer_type": "exact Persian transaction type, or unknown",
-  "description": null,
+  "description": "exact value beside بابت, شرح, or توضیحات; null if absent",
   "detected_direction": "in|out|unknown",
   "status": "موفق|ناموفق|نامشخص",
   "currency": "rial|toman|unknown",

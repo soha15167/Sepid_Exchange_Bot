@@ -83,6 +83,9 @@ DEAL_SUPPORT_ADMIN_IDS = _env_int_id_list("DEAL_SUPPORT_ADMIN_ID")
 ADMIN_NOTIFY_CHAT_IDS = _env_int_id_list(
     "DEAL_ADMIN_NOTIFY_CHAT_ID", "ADMIN_NOTIFY_CHAT_ID"
 )
+# Optional trusted users who receive buyer Toman receipts and may confirm that
+# payment arrived. This grants no other admin permissions.
+DEAL_RECEIPT_REVIEWER_IDS = _env_int_id_list("DEAL_RECEIPT_REVIEWER_ID")
 
 # --- Bank cards (admin quick send) / کارت‌های بانکی ---
 # JSON array, example in .env.sepid.example

@@ -83,6 +83,8 @@ Return ONLY valid JSON (no markdown):
 
   "transfer_type": "Persian transaction type visible in image, or unknown",
 
+  "description": "exact value beside بابت, شرح, or توضیحات; empty if absent",
+
   "source_bank": "",
 
   "destination_bank": "",
@@ -117,6 +119,7 @@ Rules:
 
 - amount: copy the transaction amount exactly as printed, NOT a balance, fee,
   tracking number, card number, account number, or reference number.
+- description: copy only the value printed beside «بابت», «شرح», or «توضیحات».
 - currency: use rial for «ریال», toman for «تومان», otherwise unknown.
 - detected_direction describes the account movement shown by the receipt:
   in for incoming/credit/واریز/بستانکار and out for outgoing/debit/برداشت/بدهکار.

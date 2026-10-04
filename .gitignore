@@ -36,6 +36,10 @@ Thumbs.db
 # Logs & runtime
 *.log
 user_data.json
+/logs/
+
+# Local Codex work artifacts
+/.codex-*/
 
 # Local debug / temp
 _test*
