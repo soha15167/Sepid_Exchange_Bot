@@ -9,7 +9,7 @@
 3. استخراج عمومی (regex + منطق پروژه)
 4. اعتبارسنجی (Luhn، شبا MOD97، …)
 5. امتیاز اطمینان
-6. اگر confidence < 85 → **Gemini 2.5 Flash** (با راهنمای OCR)
+6. اگر confidence < 85 → **Gemini 3.6 Flash** (با راهنمای OCR)
 
 ## استفاده در ربات
 
@@ -24,11 +24,18 @@ print(data["amount"], data["confidence"], data["document_type"])
 
 ```env
 GEMINI_API_KEY=...
-BANKING_GEMINI_MODEL=gemini-2.5-flash
+BANKING_GEMINI_MODEL=gemini-3.6-flash
+BANKING_GEMINI_MODEL_FALLBACKS=gemini-3.5-flash-lite,gemini-3.1-flash-lite
 BANKING_LLM_CONFIDENCE_THRESHOLD=85
 BANKING_USE_PADDLE_OCR=1
 BANKING_USE_EASYOCR=0
+BANKING_GOOGLE_VISION_ENABLED=1
+GOOGLE_APPLICATION_CREDENTIALS=/etc/sepid/google-vision.json
 ```
+
+Google Cloud Vision independently reads Persian receipt text while Gemini
+interprets layout and bank logos. When their amounts disagree, the admin draft
+is blocked for review; neither engine silently overwrites the other.
 
 ## API
 

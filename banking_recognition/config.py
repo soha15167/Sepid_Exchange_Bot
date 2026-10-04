@@ -42,13 +42,22 @@ USE_PADDLE_OCR = _env_bool("BANKING_USE_PADDLE_OCR", False)
 USE_EASYOCR = _env_bool("BANKING_USE_EASYOCR", False)
 USE_TESSERACT_FALLBACK = _env_bool("BANKING_USE_TESSERACT", True)
 
+GOOGLE_VISION_ENABLED = _env_bool("BANKING_GOOGLE_VISION_ENABLED", False)
+GOOGLE_VISION_TIMEOUT_SEC = _env_float("BANKING_GOOGLE_VISION_TIMEOUT_SEC", 15.0)
+_google_vision_languages = (
+    os.getenv("BANKING_GOOGLE_VISION_LANGUAGE_HINTS") or "fa,en"
+)
+GOOGLE_VISION_LANGUAGE_HINTS: tuple[str, ...] = tuple(
+    item.strip() for item in _google_vision_languages.split(",") if item.strip()
+)
+
 GEMINI_API_KEY = (
     os.getenv("GEMINI_API_KEY")
     or os.getenv("GOOGLE_API_KEY")
     or os.getenv("BANKING_GEMINI_API_KEY")
     or ""
 ).strip()
-GEMINI_MODEL = (os.getenv("BANKING_GEMINI_MODEL") or "gemini-2.0-flash-lite").strip()
+GEMINI_MODEL = (os.getenv("BANKING_GEMINI_MODEL") or "gemini-3.6-flash").strip()
 GEMINI_TIMEOUT_SEC = _env_float("BANKING_GEMINI_TIMEOUT_SEC", 60.0)
 GEMINI_MAX_RETRIES = _env_int("BANKING_GEMINI_MAX_RETRIES", 3)
 GEMINI_RETRY_BASE_SEC = _env_float("BANKING_GEMINI_RETRY_BASE_SEC", 2.0)
@@ -58,7 +67,7 @@ GEMINI_MODEL_FALLBACKS: tuple[str, ...] = tuple(
     for m in (
         _fallback_raw.split(",")
         if _fallback_raw
-        else ("gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b")
+        else ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
     )
     if m.strip()
 )

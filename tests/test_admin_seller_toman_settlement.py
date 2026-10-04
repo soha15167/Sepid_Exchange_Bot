@@ -8,6 +8,13 @@ from unittest.mock import AsyncMock, patch
 
 
 class TestAdminSellerTomanSettlement(unittest.IsolatedAsyncioTestCase):
+    def test_viewer_payment_displays_real_advert_number(self):
+        from handlers import deal_gate
+
+        body = deal_gate._viewer_toman_body({'offer_id': 525, 'advert_rowid': 3677})
+        self.assertIn('آگهی <b>3677</b>', body)
+        self.assertIn('کد داخلی معامله: <code>525</code>', body)
+
     def test_admin_button_is_scoped_to_the_awaiting_offer(self):
         from handlers import deal_gate
 

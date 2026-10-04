@@ -5,11 +5,19 @@ EN: `/start`, auto registration intro + terms, accept/decline callbacks.
 FA: شروع ربات، نمایش قوانین، پذیرش/رد؛ ورود به ثبت‌نام پس از پذیرش.
 """
 
+import re
+
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
-from config.settings import ADMIN_IDS
-from database.db import get_restriction_block_message, get_user
+from config.settings import ADMIN_IDS, DEAL_RECEIPT_REVIEWER_IDS
+from database.db import (
+    deal_gate_buyer_receipt_list,
+    deal_gate_get,
+    get_advert_offer_joined,
+    get_restriction_block_message,
+    get_user,
+)
 from keyboards.menus import terms_inline_keyboard
 from models.enums import UserState
 from messages import texts
@@ -31,6 +39,9 @@ async def handle_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_data_store.setdefault(user_id, {})
     offer_ad_id = parse_offer_start_payload(list(context.args or []))
+    deal_match = re.fullmatch(
+        r"deal_(\d+)", str((context.args or [""])[0] or ""), re.I
+    )
 
     if user_id not in set(ADMIN_IDS or []):
         block = get_restriction_block_message(user_id)
@@ -50,6 +61,36 @@ async def handle_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
             return
+
+    if deal_match:
+        offer_id = int(deal_match.group(1))
+        is_reviewer = user_id in set(DEAL_RECEIPT_REVIEWER_IDS or [])
+        if user_id not in set(ADMIN_IDS or []) and not is_reviewer:
+            await update.message.reply_text("دسترسی به خلاصهٔ این معامله ندارید.")
+            return
+        gate = deal_gate_get(offer_id)
+        if not gate:
+            await update.message.reply_text("این معامله پیدا نشد یا دیگر در دسترس نیست.")
+            return
+        row = get_advert_offer_joined(offer_id) or {}
+        channel_deal_number = int(
+            row.get("advert_rowid") or gate.get("advert_rowid") or offer_id
+        )
+        receipts = deal_gate_buyer_receipt_list(offer_id)
+        pending = sum(
+            1 for receipt in receipts
+            if not int(receipt.get("reviewer_received_at") or 0)
+            and (receipt.get("accounting_status") or "").strip().lower()
+            not in {"duplicate", "rejected"}
+        )
+        body = (
+            f"<b>خلاصهٔ معامله {channel_deal_number}</b>\n"
+            f"فیش‌های ثبت‌شده: <b>{len(receipts)}</b>\n"
+            f"فیش‌های در انتظار بررسی: <b>{pending}</b>\n\n"
+            "برای بررسی یا تأیید، به عکس فیش‌های ارسالی همین گفتگو برگردید."
+        )
+        await update.message.reply_text(body, parse_mode=ParseMode.HTML)
+        return
 
     if offer_ad_id is not None:
         raw_mids = context.user_data.get("offer_flow_mids")

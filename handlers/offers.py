@@ -2333,29 +2333,93 @@ def _buyer_toman_receipt_admin_line_html(
         card_sent = _buyer_toman_card_delivered(oid, buyer_id)
     if not card_sent and not items:
         return ""
-    photo_items = [r for r in items if (r.get("type") or "") == "photo"]
-    text_items = [
-        r
-        for r in items
-        if (r.get("type") or "") == "text" and (r.get("text") or "").strip()
-    ]
-    if slides_mode and photo_items and text_items:
-        lines = [f"{_RTL}📎 <b>فیش واریز تومان (متن):</b>"]
-        for r in text_items[-2:]:
-            t = (r.get("text") or "").strip()[:120]
-            lines.append(f"{_RTL}  · <code>{html_module.escape(t)}</code>")
-        if int(gate.get("buyer_toman_settled_at") or 0) > 0:
-            lines.append(f"{_RTL}💵 <b>تومان نشست:</b> ✅ تأیید ادمین")
-        elif items or card_sent:
-            lines.append(f"{_RTL}💵 <b>تومان نشست:</b> ⏳ در انتظار تأیید ادمین")
-        return "\n".join(lines) + "\n"
     if not items:
         blk = (
             f"{_RTL}📎 <b>فیش واریز تومان:</b> ⏳ ثبت نشده"
             f"{' (اختیاری — ادمین می‌تواند بدون فیش «تومان نشست» بزند)' if card_sent else ''}\n"
         )
     else:
-        blk = f"{_RTL}📎 <b>فیش واریز تومان:</b> <b>{len(items)}</b> مورد ✅\n"
+        blk = f"{_RTL}📎 <b>فیش واریز تومان:</b> <b>{sum(not r.get('attachment_removed_at') for r in items)}</b> مورد ✅\n"
+    submitted_items = [
+        item for item in items if (item.get("accounting_status") or "") == "submitted"
+    ]
+    review_items = [
+        item
+        for item in items
+        if not item.get("attachment_removed_at") and (item.get("accounting_status") or "") in ("review", "ready_for_review", "panel_failed")
+    ]
+    if submitted_items:
+        submitted_rial = sum(int(item.get("amount_rial") or 0) for item in submitted_items)
+        expected_rial = max(
+            (int(item.get("expected_rial") or 0) for item in items), default=0
+        )
+        blk += (
+            f"{_RTL}🌐 <b>ثبت ورودی سایت:</b> {len(submitted_items)} فیش · "
+            f"<code>{submitted_rial:,}</code> ریال ✅\n"
+        )
+        if expected_rial:
+            remaining = max(0, expected_rial - submitted_rial)
+            blk += (
+                f"{_RTL}🧮 <b>تطبیق مبلغ:</b> "
+                f"<code>{submitted_rial:,}</code> / <code>{expected_rial:,}</code> ریال"
+                f" · مانده <code>{remaining:,}</code>\n"
+            )
+    if review_items:
+        blk += f"{_RTL}⚠️ <b>نیازمند بررسی ثبت سایت:</b> {len(review_items)} فیش\n"
+        latest = review_items[-1]
+        amount = int(latest.get("amount_rial") or 0)
+        bank = html_module.escape(str(latest.get("bank_name") or "نامشخص"))
+        transfer = html_module.escape(str(latest.get("transfer_type") or "نامشخص"))
+        jdate = html_module.escape(str(latest.get("jdate") or "نامشخص"))
+        if amount > 0:
+            blk += (
+                f"{_RTL}🔎 <b>پیش‌نمایش:</b> <code>{amount:,}</code> ریال · "
+                f"بانک {bank} · {transfer} · {jdate}\n"
+            )
+        warnings = latest.get("recognition_warnings") or []
+        if warnings:
+            blk += f"{_RTL}⚠️ <b>هشدار OCR:</b> {html_module.escape('؛ '.join(map(str, warnings)))}\n"
+        if (latest.get("accounting_status") or "") in {"ready_for_review", "panel_failed"}:
+            blk += f"{_RTL}⏳ <b>در سایت ثبت نشده؛ منتظر تایید ادمین است.</b>\n"
+    active_review_entries = [
+        (receipt_index, item)
+        for receipt_index, item in enumerate(items)
+        if not item.get("attachment_removed_at") and (item.get("accounting_status") or "").strip().lower()
+        not in {"duplicate", "rejected"}
+    ]
+    active_review_items = [item for _, item in active_review_entries]
+    reviewer_confirmed = sum(
+        1 for item in active_review_items if int(item.get("reviewer_received_at") or 0)
+    )
+    if active_review_items:
+        receipt_total = sum(
+            max(0, int(item.get("amount_rial") or 0)) for item in active_review_items
+        )
+        expected_total = max(
+            (int(item.get("expected_rial") or 0) for item in active_review_items),
+            default=0,
+        )
+        blk += (
+            f"{_RTL}👁 <b>بررسی دریافت:</b> {reviewer_confirmed}/{len(active_review_items)} فیش"
+        )
+        if expected_total:
+            blk += (
+                f" · جمع <code>{receipt_total:,}</code> / "
+                f"<code>{expected_total:,}</code> ریال"
+            )
+        blk += "\n"
+        for receipt_index, item in active_review_entries:
+            item_amount = int(item.get("amount_rial") or 0)
+            received = int(item.get("reviewer_received_at") or 0) > 0
+            amount_text = (
+                f"<code>{item_amount:,}</code> ریال"
+                if item_amount > 0
+                else "مبلغ نامشخص"
+            )
+            status_text = "✅ دریافت تأیید شد" if received else "⏳ دریافت تأیید نشده"
+            blk += (
+                f"{_RTL}  • <b>فیش {receipt_index + 1}:</b> {amount_text} · {status_text}\n"
+            )
     if int(gate.get("buyer_toman_settled_at") or 0) > 0:
         blk += f"{_RTL}💵 <b>تومان نشست:</b> ✅ تأیید ادمین\n"
     elif items or card_sent:
@@ -2374,6 +2438,8 @@ def _buyer_toman_receipt_admin_line_html(
             lines.append(f"{_RTL}  · <code>{html_module.escape(t)}</code>")
         elif (r.get("type") or "") == "photo" and not slides_mode:
             lines.append(photo_lbl)
+        elif (r.get("type") or "") == "document":
+            lines.append(f"{_RTL}  · 📄 فایل PDF فیش")
     return "\n".join(lines) + "\n"
 
 
@@ -2455,6 +2521,15 @@ def seller_euro_receipt_slide_caption_html(
     return f"{_RTL}📎 <b>فیش واریز یورو (فروشنده)</b>"
 
 
+def _viewer_toman_receipts_for_display(gate: dict | None) -> list[dict]:
+    import json
+    try:
+        items = json.loads((gate or {}).get("viewer_toman_receipt_log") or "[]")
+    except (TypeError, ValueError):
+        return []
+    return [r for r in items if isinstance(r, dict) and not r.get("attachment_removed_at")] if isinstance(items, list) else []
+
+
 def _seller_toman_admin_receipt_line_html(
     gate: dict | None, *, embed_photos: bool = False, slides_mode: bool = False
 ) -> str:
@@ -2464,7 +2539,9 @@ def _seller_toman_admin_receipt_line_html(
     if not gate:
         return ""
     oid = int(gate.get("offer_id") or 0)
-    items = deal_gate_seller_toman_admin_list(oid) if oid else []
+    items = [r for r in (deal_gate_seller_toman_admin_list(oid) if oid else []) if not r.get("attachment_removed_at")]
+    delivered_files = {r.get("file_id") for r in items if r.get("file_id")}
+    items += [r for r in _viewer_toman_receipts_for_display(gate) if not r.get("file_id") or r["file_id"] not in delivered_files]
     photo_items = [r for r in items if (r.get("type") or "") == "photo"]
     text_items = [
         r
@@ -2509,6 +2586,7 @@ def _seller_euro_receipts_all_confirmed(gate: dict | None) -> bool:
         return False
     oid = int(gate.get("offer_id") or 0)
     items = deal_gate_seller_receipt_list(oid) if oid else []
+    items = [r for r in items if not r.get("attachment_removed_at")]
     if not items:
         return False
     return all(int(r.get("buyer_confirmed_at") or 0) > 0 for r in items)
@@ -2583,7 +2661,11 @@ def _deal_admin_steps_checklist_html(gate: dict | None) -> str:
     seller_rcpt_ok = bool(seller_rcpts)
     euro_confirmed = _seller_euro_receipts_all_confirmed(gate)
     stom_items = deal_gate_seller_toman_admin_list(oid) if oid else []
-    stom_ok = bool(stom_items)
+    viewer_sent = bool(_viewer_toman_receipts_for_display(gate)) and (
+        _outbound_delivered_to_user(oid, seller_id, "فیش تومان از بررسی‌کننده")
+        or _outbound_delivered_to_user(oid, seller_id, "فیش تومان بازیابی‌شده بررسی‌کننده")
+    )
+    stom_ok = any(not r.get("attachment_removed_at") for r in stom_items) or viewer_sent
     seller_toman_settled = int(gate.get("seller_toman_settled_at") or 0) > 0
     deal_closed = (gate.get("gate_status") or "").strip().lower() == "closed"
     deal_finished = deal_closed or seller_toman_settled
@@ -2597,7 +2679,7 @@ def _deal_admin_steps_checklist_html(gate: dict | None) -> str:
         ("ارسال حساب یورو خریدار به فروشنده", eur_account_sent),
         ("ارسال فیش یورو توسط فروشنده", seller_rcpt_ok),
         ("تأیید نشست یورو (خریدار/ادمین)", euro_confirmed),
-        ("ارسال فیش تومان به فروشنده (ادمین)", stom_ok),
+        ("ارسال فیش تومان به فروشنده (ادمین/بررسی‌کننده)", stom_ok),
         ("پایان معامله (تأیید فروشنده)", deal_finished),
     ]
 

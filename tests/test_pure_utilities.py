@@ -51,8 +51,9 @@ class ReceiptAmountTests(unittest.TestCase):
     def test_parses_persian_rial_amount(self):
         self.assertEqual(parse_rial_amount_text("۵۸,۸۰۰,۰۰۰"), 58_800_000)
 
-    def test_corrects_one_extra_ocr_zero(self):
-        self.assertEqual(normalize_transfer_amount(588_000_000), 58_800_000)
+    def test_never_changes_explicit_rial_magnitude(self):
+        self.assertEqual(normalize_transfer_amount(588_000_000), 588_000_000)
+        self.assertEqual(normalize_transfer_amount(204_750_000), 204_750_000)
 
     def test_rejects_card_like_number(self):
         self.assertEqual(normalize_transfer_amount(6_037_990_000_000_006), 0)

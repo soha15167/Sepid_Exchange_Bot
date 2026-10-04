@@ -13,14 +13,16 @@ from banking_recognition.storage.log_db import log_processing
 logger = logging.getLogger(__name__)
 
 
-async def process_image_for_receipt(image_path: str) -> dict[str, Any]:
+async def process_image_for_receipt(
+    image_path: str, *, mode: str = ""
+) -> dict[str, Any]:
     """مسیر رسید پنل: Gemini قبل از OCR سنگین."""
     runner = (
         run_pipeline_gemini_first
         if GEMINI_FIRST_FOR_RECEIPTS
         else run_pipeline
     )
-    result = await runner(image_path)
+    result = await runner(image_path, mode=mode)
     out = result.to_telegram_dict()
     try:
         log_processing(

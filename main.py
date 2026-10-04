@@ -503,6 +503,45 @@ def _setup_admin_toman_receipt_reminder_job(application: Application) -> None:
     logger.info("Admin Toman receipt reminders: check every 5m (1h interval)")
 
 
+def _setup_buyer_receipt_reviewer_reminder_job(application: Application) -> None:
+    """Check often; the receipt log enforces a quiet three-hour cadence."""
+    from handlers.deal_gate import run_buyer_receipt_reviewer_reminder_sweep
+
+    if not application.job_queue:
+        return
+
+    async def _sweep(context):
+        count = await run_buyer_receipt_reviewer_reminder_sweep(context.bot)
+        if count:
+            logger.info("buyer_receipt_reviewer_reminders: sent %s", count)
+
+    application.job_queue.run_repeating(
+        _sweep,
+        interval=600,
+        first=120,
+        name="buyer_receipt_reviewer_reminders",
+    )
+    logger.info("Buyer receipt reviewer reminders: check every 10m (3h interval)")
+
+
+def _setup_viewer_toman_payment_job(application: Application) -> None:
+    """Durable one-hour post-EUR viewer payment prompt, including restarts."""
+    from handlers.deal_gate import run_viewer_toman_payment_sweep
+
+    if not application.job_queue:
+        return
+
+    async def _sweep(context):
+        count = await run_viewer_toman_payment_sweep(context.bot)
+        if count:
+            logger.info("viewer_toman_payment_prompts: sent %s", count)
+
+    application.job_queue.run_repeating(
+        _sweep, interval=300, first=90, name="viewer_toman_payment_sweep"
+    )
+    logger.info("Viewer Toman payment prompts: check every 5m (after 1h EUR confirmation)")
+
+
 def _setup_deal_delivery_retry_job(application: Application) -> None:
     """Retry critical deal deliveries quietly; dedupe keys prevent repeated notices."""
     from handlers.deal_gate import run_deal_delivery_retry_sweep
@@ -802,7 +841,9 @@ def main():
     # ورود مرحله‌ای اطلاعات یورو / معاوضه
     _private_text = filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND
     _iran_fill_text = filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND
-    _iran_txn = filters.ChatType.PRIVATE & ~filters.COMMAND
+    # Receipt media is handled once in group 5. Group 7 is text-only so an
+    # early image-read failure cannot process and notify for the same file twice.
+    _iran_txn = filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND
     _iran_receipt_media = (
         filters.ChatType.PRIVATE
         & (filters.PHOTO | filters.Document.IMAGE)
@@ -835,7 +876,13 @@ def main():
     application.add_handler(MessageHandler(_iran_txn, iran_panel_sync_router), group=7)
     # Admin panel: run in later group to avoid hijacking normal flows
     application.add_handler(CallbackQueryHandler(iran_panel_tx_callback, pattern=r"^tx\|"))
-    application.add_handler(CallbackQueryHandler(deal_gate_callback, pattern=r"^(deal\||adm\|dg\|)"))
+    from handlers.deal_outgoing import callback as outgoing_receipt_callback
+    application.add_handler(CallbackQueryHandler(outgoing_receipt_callback, pattern=r"^outreceipt\|"))
+    from handlers.receipt_management import callback as receipt_management_callback
+    from handlers.receipt_amount_edit import callback as receipt_amount_edit_callback
+    application.add_handler(CallbackQueryHandler(receipt_amount_edit_callback, pattern=r"^adm\|tomamt\|"))
+    application.add_handler(CallbackQueryHandler(receipt_management_callback, pattern=r"^receipts\|"))
+    application.add_handler(CallbackQueryHandler(deal_gate_callback, pattern=r"^(viewerpay\||deal\||adm\|(dg|rcptok|rcptno)\|)"))
     application.add_handler(MessageHandler(_private_text, admin_router), group=8)
 
     # تایید نهایی آگهی
@@ -956,6 +1003,8 @@ def main():
         _setup_daily_admin_report_job(app)
         _setup_seller_stom_reminder_job(app)
         _setup_admin_toman_receipt_reminder_job(app)
+        _setup_buyer_receipt_reviewer_reminder_job(app)
+        _setup_viewer_toman_payment_job(app)
         _setup_deal_delivery_retry_job(app)
         _setup_deal_operations_jobs(app)
         try:
