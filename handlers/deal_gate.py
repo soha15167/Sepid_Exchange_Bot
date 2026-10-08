@@ -1617,6 +1617,10 @@ async def _sync_deal_admin_notification_locked(
 
 def _first_unconfirmed_seller_euro_index(offer_id: int) -> int | None:
     for i, r in enumerate(deal_gate_seller_receipt_list(offer_id)):
+        # Archived receipts keep their positions so existing buttons stay safe.
+        # They must not block confirmation of later, active EUR receipts.
+        if r.get("attachment_removed_at"):
+            continue
         if not int(r.get("buyer_confirmed_at") or 0):
             return i
     return None
@@ -1718,15 +1722,6 @@ def deal_admin_party_proxy_rows(
                         "❌ رد خریدار",
                         callback_data=f"adm|pxy|{oid}|bno",
                     ),
-                ]
-            )
-        elif status == "submitted":
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        "🔄 بررسی سایت و بازخوانی فیش",
-                        callback_data=f"adm|rcptchk|{oid}|{receipt_index}",
-                    )
                 ]
             )
         if sr != "yes":
@@ -4633,6 +4628,15 @@ async def deal_admin_euro_settled_callback(
     gate = deal_gate_get(oid)
     if not gate or not _deal_gate_allows_admin_payment(gate):
         await _expire_stale_deal_button(q, "معامله در این مرحله نیست")
+        return
+    items = deal_gate_seller_receipt_list(oid)
+    if 0 <= ridx < len(items) and items[ridx].get("attachment_removed_at"):
+        await _expire_stale_deal_button(
+            q, "این فیش حذف شده است؛ از پیام جدید معامله دوباره تأیید کنید."
+        )
+        await sync_deal_admin_notification(
+            context.bot, oid, deal_complete=True, text_only=True
+        )
         return
     if not await _admin_sensitive_confirmation(
         context,
