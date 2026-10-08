@@ -3201,6 +3201,53 @@ def deal_gate_confirm_seller_receipt_buyer(
     return True
 
 
+def deal_gate_seller_receipts_revision(items: list[dict]) -> str:
+    """Identify the exact active receipts an admin has reviewed."""
+    import hashlib
+    import json
+
+    snapshot = [
+        [index, {key: value for key, value in item.items()
+                 if key not in {"buyer_confirmed_at", "confirmed_by"}}]
+        for index, item in enumerate(items)
+        if not item.get("attachment_removed_at")
+    ]
+    return hashlib.sha256(
+        json.dumps(snapshot, sort_keys=True, ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+
+
+def deal_gate_confirm_all_seller_receipts_admin(
+    offer_id: int, *, expected_revision: str
+) -> bool:
+    """Atomically confirm the reviewed EUR receipts of one completed deal."""
+    import json
+    from contextlib import closing
+
+    with closing(sqlite3.connect(DB_PATH, timeout=20)) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT gate_status, seller_receipt_log FROM offer_deal_gates WHERE offer_id = ?",
+            (int(offer_id),),
+        ).fetchone()
+        if not row or (row[0] or "").strip().lower() != "completed":
+            return False
+        items = _deal_gate_seller_receipt_list_raw({"seller_receipt_log": row[1]})
+        active = [item for item in items if not item.get("attachment_removed_at")]
+        if not active or deal_gate_seller_receipts_revision(items) != expected_revision:
+            return False
+        now = int(time.time())
+        for item in active:
+            if not int(item.get("buyer_confirmed_at") or 0):
+                item["buyer_confirmed_at"] = now
+                item["confirmed_by"] = "admin"
+        conn.execute(
+            "UPDATE offer_deal_gates SET seller_receipt_log = ? WHERE offer_id = ?",
+            (json.dumps(items, ensure_ascii=False), int(offer_id)),
+        )
+    return True
+
+
 def _deal_gate_seller_toman_admin_list_raw(gate: dict | None) -> list:
     import json
 

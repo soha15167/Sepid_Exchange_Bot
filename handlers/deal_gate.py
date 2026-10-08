@@ -81,6 +81,8 @@ from database.db import (
     deal_gate_reject_buyer_receipt,
     deal_gate_update_buyer_receipt,
     deal_gate_confirm_seller_receipt_buyer,
+    deal_gate_confirm_all_seller_receipts_admin,
+    deal_gate_seller_receipts_revision,
     deal_gate_claim_viewer_toman_payment,
     deal_gate_seller_receipt_list,
     deal_gate_seller_toman_admin_list,
@@ -1852,8 +1854,8 @@ def deal_admin_payment_only_rows(
         rows.append(
             [
                 InlineKeyboardButton(
-                    "✅ یورو نشست (ادمین)",
-                    callback_data=f"adm|eurcfm|{oid}|{uidx}",
+                    "✅ دریافت کامل یورو (ادمین)",
+                    callback_data=f"adm|eurcfm|{oid}|all",
                 )
             ]
         )
@@ -4519,9 +4521,10 @@ async def _apply_euro_settled(
     context: ContextTypes.DEFAULT_TYPE,
     *,
     offer_id: int,
-    receipt_index: int,
+    receipt_index: int | None,
     confirmed_by: str,
     answer_query=None,
+    expected_revision: str | None = None,
 ) -> None:
     gate = deal_gate_get(offer_id)
     if not gate:
@@ -4529,7 +4532,7 @@ async def _apply_euro_settled(
             await _expire_stale_deal_button(answer_query, "معامله پیدا نشد")
         return
     items = deal_gate_seller_receipt_list(offer_id)
-    if 0 <= receipt_index < len(items) and items[receipt_index].get("attachment_removed_at"):
+    if receipt_index is not None and 0 <= receipt_index < len(items) and items[receipt_index].get("attachment_removed_at"):
         if answer_query:
             await _expire_stale_deal_button(answer_query, "این فیش توسط ادمین حذف شده است")
         return
@@ -4537,12 +4540,24 @@ async def _apply_euro_settled(
         if answer_query:
             await _expire_stale_deal_button(answer_query, "فیشی ثبت نشده")
         return
-    if not deal_gate_confirm_seller_receipt_buyer(
-        offer_id, receipt_index, confirmed_by=confirmed_by
-    ):
+    if receipt_index is None:
+        confirmed = confirmed_by == "admin" and bool(expected_revision) and (
+            deal_gate_confirm_all_seller_receipts_admin(
+                offer_id, expected_revision=expected_revision
+            )
+        )
+    else:
+        confirmed = deal_gate_confirm_seller_receipt_buyer(
+            offer_id, receipt_index, confirmed_by=confirmed_by
+        )
+    if not confirmed:
         if answer_query:
             await _expire_stale_deal_button(
-                answer_query, "این تأیید قبلاً استفاده شده یا دیگر معتبر نیست."
+                answer_query, "فیش‌ها یا وضعیت معامله تغییر کرده است؛ از پیام جدید دوباره تأیید کنید."
+            )
+        if confirmed_by == "admin":
+            await sync_deal_admin_notification(
+                context.bot, offer_id, deal_complete=True, text_only=True
             )
         return
     gate = deal_gate_get(offer_id) or gate
@@ -4566,7 +4581,11 @@ async def _apply_euro_settled(
         _log(offer_id, "پرداخت تومان توسط بررسی‌کننده‌ها برای یک ساعت دیگر زمان‌بندی شد")
     role = "buyer" if confirmed_by == "buyer" else "admin"
     who = "خریدار" if confirmed_by == "buyer" else "ادمین"
-    _log(offer_id, "تأیید شد: یورو نشست", from_role=role)
+    _log(
+        offer_id,
+        "تأیید شد: دریافت کامل یورو" if receipt_index is None else "تأیید شد: یورو نشست",
+        from_role=role,
+    )
     seller_id = int(gate.get("seller_telegram_id") or 0)
     if seller_id:
         from utils.deal_milestones import notify_euro_settled_seller
@@ -4591,7 +4610,10 @@ async def _apply_euro_settled(
     )
     if answer_query:
         try:
-            await answer_query.answer("✅ یورو نشست ثبت شد", show_alert=True)
+            await answer_query.answer(
+                "✅ دریافت کامل یورو ثبت شد" if receipt_index is None else "✅ یورو نشست ثبت شد",
+                show_alert=True,
+            )
         except Exception:
             pass
         try:
@@ -4611,7 +4633,7 @@ async def _apply_euro_settled(
 async def deal_admin_euro_settled_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """ادمین: تأیید یورو نشست به‌جای خریدار."""
+    """Admin confirms the entire EUR settlement; legacy buttons remain per receipt."""
     q = update.callback_query
     if not q or not q.from_user:
         return
@@ -4622,7 +4644,7 @@ async def deal_admin_euro_settled_callback(
         return
     try:
         oid = int(parts[2])
-        ridx = int(parts[3])
+        ridx = None if parts[3] == "all" else int(parts[3])
     except (TypeError, ValueError):
         return
     gate = deal_gate_get(oid)
@@ -4630,7 +4652,7 @@ async def deal_admin_euro_settled_callback(
         await _expire_stale_deal_button(q, "معامله در این مرحله نیست")
         return
     items = deal_gate_seller_receipt_list(oid)
-    if 0 <= ridx < len(items) and items[ridx].get("attachment_removed_at"):
+    if ridx is not None and 0 <= ridx < len(items) and items[ridx].get("attachment_removed_at"):
         await _expire_stale_deal_button(
             q, "این فیش حذف شده است؛ از پیام جدید معامله دوباره تأیید کنید."
         )
@@ -4638,15 +4660,26 @@ async def deal_admin_euro_settled_callback(
             context.bot, oid, deal_complete=True, text_only=True
         )
         return
+    revision = deal_gate_seller_receipts_revision(items) if ridx is None else None
+    if ridx is None and _first_unconfirmed_seller_euro_index(oid) is None:
+        await _expire_stale_deal_button(q, "فیش یوروی تأییدنشده‌ای وجود ندارد.")
+        await sync_deal_admin_notification(
+            context.bot, oid, deal_complete=True, text_only=True
+        )
+        return
     if not await _admin_sensitive_confirmation(
         context,
         q,
-        action=f"euro_settled:{ridx}",
+        action=f"euro_settled:all:{revision}" if ridx is None else f"euro_settled:{ridx}",
         offer_id=oid,
-        confirm_data=f"adm|eurcfm|{oid}|{ridx}|yes",
-        prompt="✅ تأیید نهایی دریافت یورو",
+        confirm_data=f"adm|eurcfm|{oid}|all|yes" if ridx is None else f"adm|eurcfm|{oid}|{ridx}|yes",
+        prompt="✅ تأیید نهایی دریافت کامل یورو" if ridx is None else "✅ تأیید نهایی دریافت یورو",
         is_confirmation=len(parts) == 5 and parts[4] == "yes",
     ):
+        if ridx is None and len(parts) == 5 and parts[4] == "yes":
+            await sync_deal_admin_notification(
+                context.bot, oid, deal_complete=True, text_only=True
+            )
         return
     await _apply_euro_settled(
         context,
@@ -4654,6 +4687,7 @@ async def deal_admin_euro_settled_callback(
         receipt_index=ridx,
         confirmed_by="admin",
         answer_query=q,
+        expected_revision=revision,
     )
 
 
