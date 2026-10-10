@@ -43,7 +43,7 @@ flowchart TB
     subgraph phase2 ["Buyer Toman | تومان خریدار"]
         G --> H["Card to buyer"]
         H --> I["Buyer receipts (optional)"]
-        I --> J["Toman settled (admin)"]
+        I --> J["Toman settled (reviewer or admin)"]
     end
 
     subgraph phase3 ["Seller Euro | یورو فروشنده"]
@@ -61,6 +61,10 @@ flowchart TB
 ```
 
 **FA:** ادمین می‌تواند «تومان نشست» را بدون فیش خریدار هم بزند. پایان معامله با تأیید فروشنده (`deal|stomcfm|`) یا بستن دستی ادمین (`adm|dg|close|`) انجام می‌شود.
+
+**Party confirmations:** Either configured receipt reviewer can advance the Toman step once all active receipts are confirmed, their total exactly matches the deal, and their accounting submissions succeed. A failed submission or EUR-account delivery keeps reviewer continuation controls available. Delivery failures preserve the recorded settlement; retrying does not submit income again.
+
+The buyer's explicit full-EUR button atomically confirms the current active receipt set and schedules the viewer payout without another admin confirmation. Its receipt revision expires when receipts change. Existing per-receipt buttons first display the explicit full-EUR confirmation; archived receipts cannot be confirmed.
 
 ---
 
@@ -115,7 +119,7 @@ flowchart TB
 |-------|------------|---------|----------|
 | Buyer | Toman receipt | فیش تومان | `deal\|rcpt\|{oid}\|go` / `cancel` |
 | Seller | Euro receipt | فیش یورو | `deal\|srcpt\|{oid}\|go` / `cancel` |
-| Buyer | Euro landed | یورو نشست | `deal\|eurset\|{oid}\|{idx}` |
+| Buyer | Full Euro receipt | دریافت کامل یورو | `deal\|eurset\|{oid}\|all\|{revision}` |
 | Seller | Toman received + close | تومان نشست — پایان | `deal\|stomcfm\|{oid}` |
 
 **FA:** پس از `stom`، پیام ادمین بنر **«منتظر تأیید فروشنده»** نشان می‌دهد. اگر فروشنده ظرف ۸ ساعت نزند، یادآوری ارسال می‌شود و **هر ۸ ساعت** تکرار می‌شود. وقتی فروشنده می‌بندد، ادمین‌ها اعلان جدا می‌گیرند.
@@ -128,7 +132,7 @@ flowchart TB
 |--------|----|----|
 | `buyer_toman_card_sent_at` | Card sent to buyer timestamp | زمان ارسال کارت |
 | `buyer_receipt_log` | JSON buyer toman receipts | فیش تومان خریدار |
-| `buyer_toman_settled_at` | Admin confirmed toman settled | تومان نشست |
+| `buyer_toman_settled_at` | Reviewer or admin confirmed toman settled | تومان نشست |
 | `seller_eur_account_sent_at` | EUR account sent to seller | حساب یورو به فروشنده |
 | `seller_receipt_log` | JSON euro receipts + `buyer_confirmed_at` | فیش یورو + تأیید |
 | `seller_toman_admin_log` | JSON admin toman receipts to seller | فیش تومان به فروشنده |

@@ -189,7 +189,7 @@ class ReceiptReviewerTests(unittest.IsolatedAsyncioTestCase):
         bot.send_photo.assert_awaited_once()
         self.assertEqual(bot.send_photo.await_args.args[:2], (7001, "telegram-file"))
         button = bot.send_photo.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
-        self.assertEqual(button.callback_data, "adm|tomset|41|2")
+        self.assertEqual(button.callback_data, "adm|tomset|41|2|120000000")
         self.assertIn("۱۲۰٬۰۰۰٬۰۰۰", bot.send_photo.await_args.kwargs["caption"])
         update_receipt.assert_called_once_with(
             41, 2, reviewer_notify_mids={"7001": 55}
@@ -258,6 +258,7 @@ class ReceiptReviewerTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(deal_gate, "deal_gate_upsert"),
             patch.object(deal_gate, "_admin_sensitive_confirmation", new=AsyncMock()) as confirm,
+            patch.object(deal_gate, "_submit_confirmed_buyer_receipts_to_iran", new=AsyncMock(return_value=(True, ""))),
             patch.object(
                 deal_gate,
                 "_send_buyer_eur_account_to_seller",
@@ -338,8 +339,11 @@ class ReceiptReviewerTests(unittest.IsolatedAsyncioTestCase):
             "reviewer_notify_mids": {"7001": 51, "7002": 52},
         }
         bot = AsyncMock()
-        with patch.object(
-            deal_gate, "get_advert_offer_joined", return_value={"seq_in_advert": 9}
+        with (
+            patch.object(deal_gate, "get_advert_offer_joined", return_value={"seq_in_advert": 9}),
+            patch.object(deal_gate, "deal_gate_get", return_value={
+                "buyer_toman_settled_at": "100", "seller_eur_account_sent_at": "100",
+            }),
         ):
             await deal_gate._sync_buyer_receipt_reviewer_messages(
                 bot, offer_id=41, receipt_index=0, receipt=receipt
@@ -357,6 +361,7 @@ class ReceiptReviewerTests(unittest.IsolatedAsyncioTestCase):
         receipt = {
             "type": "text",
             "text": "شماره پیگیری ۱۲۳۴۵۶",
+            "receipt_description": "شماره پیگیری ۱۲۳۴۵۶",
             "amount_rial": 80_000_000,
             "reviewer_received_at": 100,
             "reviewer_notify_mids": {"7001": 61, "7002": 62},
@@ -374,7 +379,7 @@ class ReceiptReviewerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("شماره پیگیری ۱۲۳۴۵۶", call.kwargs["text"])
             self.assertIn("مبلغ دریافت‌شده", call.kwargs["text"])
 
-    async def test_confirmation_is_broadcast_once_to_all_admins_and_reviewers(self):
+    async def test_confirmation_is_broadcast_once_to_configured_reviewers(self):
         from handlers import deal_gate, offers
 
         bot = AsyncMock()
@@ -390,9 +395,9 @@ class ReceiptReviewerTests(unittest.IsolatedAsyncioTestCase):
                 bot, offer_id=41, receipt_index=0, receipt=receipt
             )
 
-        self.assertEqual(bot.send_message.await_count, 3)
+        self.assertEqual(bot.send_message.await_count, 2)
         recipients = {call.args[0] for call in bot.send_message.await_args_list}
-        self.assertEqual(recipients, {7001, 7002, 8001})
+        self.assertEqual(recipients, {7001, 7002})
         self.assertIn("مبلغ دریافت‌شده", bot.send_message.await_args.args[1])
 
     def test_admin_buyer_section_lists_received_state_for_each_receipt(self):

@@ -82,6 +82,7 @@ from database.db import (
     deal_gate_update_buyer_receipt,
     deal_gate_confirm_seller_receipt_buyer,
     deal_gate_confirm_all_seller_receipts_admin,
+    deal_gate_confirm_all_seller_receipts,
     deal_gate_seller_receipts_revision,
     deal_gate_claim_viewer_toman_payment,
     deal_gate_seller_receipt_list,
@@ -2001,13 +2002,13 @@ def _seller_euro_receipt_prompt_keyboard(offer_id: int) -> InlineKeyboardMarkup:
 
 def _buyer_euro_settled_keyboard(offer_id: int, receipt_index: int) -> InlineKeyboardMarkup:
     oid = int(offer_id)
-    idx = int(receipt_index)
+    revision = deal_gate_seller_receipts_revision(deal_gate_seller_receipt_list(oid))
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    "✅ یورو نشست",
-                    callback_data=f"deal|eurset|{oid}|{idx}",
+                    "✅ کل یوروی معامله را دریافت کردم",
+                    callback_data=f"deal|eurset|{oid}|all|{revision[:24]}",
                 )
             ],
         ]
@@ -2073,7 +2074,7 @@ def _buyer_toman_received_reviewer_keyboard(
 ) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton(
-            "✅ دریافت شد",
+            "🔄 ادامهٔ ثبت دریافت تومان" if receipt and receipt.get("reviewer_received_at") else "✅ دریافت شد",
             callback_data=f"adm|tomset|{int(offer_id)}|{int(receipt_index)}" + (f"|{int(receipt.get('amount_rial') or 0)}" if receipt is not None else ''),
         )], [InlineKeyboardButton("✏️ اصلاح مبلغ (ریال)", callback_data=f"adm|tomamt|{int(offer_id)}|{int(receipt_index)}")]]
     )
@@ -2172,9 +2173,13 @@ async def _sync_buyer_receipt_reviewer_messages(
         confirmed=bool(int(receipt.get("reviewer_received_at") or 0)),
     )
     confirmed = bool(int(receipt.get("reviewer_received_at") or 0))
+    gate = deal_gate_get(int(offer_id)) or {}
+    finished = (
+        int(gate.get("buyer_toman_settled_at") or 0) > 0
+        and int(gate.get("seller_eur_account_sent_at") or 0) > 0
+    )
     markup = (
-        None
-        if confirmed
+        None if confirmed and finished
         else _buyer_toman_received_reviewer_keyboard(offer_id, receipt_index, receipt)
     )
     media_type = (receipt.get("type") or "text").strip().lower()
@@ -2309,24 +2314,22 @@ async def _confirm_and_announce_buyer_receipt(
     )
     if not receipt:
         return None, False
-    await _sync_buyer_receipt_reviewer_messages(
-        bot,
-        offer_id=int(offer_id),
-        receipt_index=int(receipt_index),
-        receipt=receipt,
-    )
-    if changed:
-        delivered_to = await _broadcast_buyer_receipt_confirmation(
+    try:
+        await _sync_buyer_receipt_reviewer_messages(
             bot,
             offer_id=int(offer_id),
             receipt_index=int(receipt_index),
             receipt=receipt,
         )
-        await _delete_replaced_buyer_receipt_messages(
-            bot,
-            receipt=receipt,
-            delivered_to=delivered_to,
-        )
+        if changed:
+            await _broadcast_buyer_receipt_confirmation(
+                bot,
+                offer_id=int(offer_id),
+                receipt_index=int(receipt_index),
+                receipt=receipt,
+            )
+    except Exception:
+        logger.exception("Receipt notification failed after confirmation offer=%s", offer_id)
     return receipt, changed
 
 
@@ -3212,8 +3215,8 @@ async def _notify_buyer_euro_receipt_confirm(
     body = (
         f"{_RTL}📎 <b>رسید واریز یورو</b>\n\n"
         f"{_RTL}پیشنهاد <b>{seq}</b>\n\n"
-        f"{_RTL}لطفاً بررسی کنید مبلغ به <b>حساب شما</b> نشسته باشد.\n"
-        f"{_RTL}در صورت تأیید، دکمهٔ زیر را بزنید."
+        f"{_RTL}پس از دریافت <b>کل مبلغ یوروی معامله</b> در حساب خود، دکمهٔ زیر را بزنید.\n"
+        f"{_RTL}این دکمه دریافت کامل یورو را برای همهٔ فیش‌های فعلی این معامله ثبت می‌کند."
     )
     kb = _buyer_euro_settled_keyboard(offer_id, receipt_index)
     try:
@@ -4280,6 +4283,9 @@ async def _deal_admin_toman_settled_callback_locked(
         await refresh_admin_deal_markup(context.bot, oid)
         return
     if int(gate.get("buyer_toman_settled_at") or 0) > 0:
+        if not int(gate.get("seller_eur_account_sent_at") or 0):
+            await _complete_buyer_toman_settlement(context, gate, q, is_reviewer=is_reviewer)
+            return
         await q.answer("این پرداخت قبلاً دریافت‌شده ثبت شده است.", show_alert=True)
         try:
             await q.message.edit_reply_markup(reply_markup=None)
@@ -4320,6 +4326,10 @@ async def _deal_admin_toman_settled_callback_locked(
                 show_alert=True,
             )
             return
+        try:
+            await q.answer("در حال ثبت دریافت وجه…")
+        except TelegramError:
+            pass
         receipt, newly_confirmed = await _confirm_and_announce_buyer_receipt(
             context.bot,
             offer_id=oid,
@@ -4330,7 +4340,9 @@ async def _deal_admin_toman_settled_callback_locked(
             await q.answer("ثبت تأیید فیش ناموفق بود؛ دوباره تلاش کنید.", show_alert=True)
             return
         try:
-            await q.message.edit_reply_markup(reply_markup=None)
+            await q.message.edit_reply_markup(
+                reply_markup=_buyer_toman_received_reviewer_keyboard(oid, receipt_index, receipt)
+            )
         except Exception:
             pass
         receipts = deal_gate_buyer_receipt_list(oid)
@@ -4343,7 +4355,10 @@ async def _deal_admin_toman_settled_callback_locked(
                 f"بررسی‌کننده {uid} دریافت فیش {receipt_index + 1} را تأیید کرد",
                 from_role="admin",
             )
-            await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
+            try:
+                await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
+            except Exception:
+                logger.exception("Admin refresh failed after reviewer confirmation offer=%s", oid)
         if unreadable_count:
             await q.answer(
                 f"این فیش تأیید شد؛ مبلغ {unreadable_count} فیش هنوز قابل تطبیق نیست.",
@@ -4406,11 +4421,18 @@ async def _deal_admin_toman_settled_callback_locked(
                     from_role="admin",
                 )
         if admin_receipts:
-            await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
+            try:
+                await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
+            except Exception:
+                logger.exception("Admin refresh failed after Toman confirmation offer=%s", oid)
     # The confirmation is the sole accounting authorization.  Submit before
     # releasing the EUR-account step, and keep the deal pending if Iran-panel
     # accounting fails so the same confirmation can safely be retried.
     gate = deal_gate_get(oid) or gate
+    try:
+        await q.answer("دریافت ثبت شد؛ در حال تکمیل مرحلهٔ بعد…")
+    except TelegramError:
+        pass
     accounting_ok, accounting_message = await _submit_confirmed_buyer_receipts_to_iran(
         context, gate=gate
     )
@@ -4421,7 +4443,11 @@ async def _deal_admin_toman_settled_callback_locked(
             await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
         except Exception:
             logger.exception("Could not refresh admin deal after failed settlement offer=%s", oid)
-        await q.answer(accounting_message, show_alert=True)
+        retry_hint = (
+            " از دکمهٔ ادامهٔ ثبت دوباره تلاش کنید."
+            if is_reviewer else " از دکمهٔ تومان نشست دوباره تلاش کنید."
+        )
+        await q.answer(accounting_message + retry_hint, show_alert=True)
         return
     now = int(time.time())
     upsert_kw: dict = {
@@ -4437,23 +4463,38 @@ async def _deal_admin_toman_settled_callback_locked(
     gate = deal_gate_get(oid) or gate
     actor = "بررسی‌کنندهٔ فیش" if is_reviewer else "ادمین"
     _log(oid, f"{actor} تأیید کرد: تومان نشست", from_role="admin")
-    ok = await _send_buyer_eur_account_to_seller(context, oid, gate, q=q)
-    if not ok:
-        deal_gate_upsert(
-            offer_id=oid,
-            advert_rowid=int(gate["advert_rowid"]),
-            buyer_telegram_id=int(gate["buyer_telegram_id"]),
-            seller_telegram_id=int(gate["seller_telegram_id"]),
-            buyer_toman_settled_at=None,
-        )
-        await refresh_admin_deal_markup(context.bot, oid)
+    await _complete_buyer_toman_settlement(context, gate, q, is_reviewer=is_reviewer)
+
+
+async def _complete_buyer_toman_settlement(
+    context, gate: dict, q, *, is_reviewer: bool
+) -> None:
+    """Continue a recorded settlement without requiring another financial approval."""
+    oid = int(gate["offer_id"])
+    if not await _send_buyer_eur_account_to_seller(context, oid, gate, q=q):
+        # Money stays confirmed even when Telegram or an account is unavailable.
+        # Reviewers retain their continuation controls and can retry delivery.
         return
     gate = deal_gate_get(oid) or gate
     from utils.deal_milestones import notify_toman_settled_buyer
 
-    await notify_toman_settled_buyer(context.bot, offer_id=oid, gate=gate)
-    await _refresh_admin_deal_after_payment_step(context.bot, oid, update_text=True)
-    await q.answer("✅ تومان نشست — حساب یورو برای فروشنده ارسال شد", show_alert=True)
+    try:
+        await notify_toman_settled_buyer(context.bot, offer_id=oid, gate=gate)
+        await _refresh_admin_deal_after_payment_step(context.bot, oid, update_text=True)
+    except Exception:
+        logger.exception("Toman settlement notification failed offer=%s", oid)
+    for index, receipt in enumerate(deal_gate_buyer_receipt_list(oid)):
+        if receipt.get("reviewer_received_at") and not receipt.get("attachment_removed_at"):
+            try:
+                await _sync_buyer_receipt_reviewer_messages(
+                    context.bot, offer_id=oid, receipt_index=index, receipt=receipt
+                )
+            except Exception:
+                logger.exception("Reviewer controls refresh failed offer=%s", oid)
+    try:
+        await q.answer("✅ تومان نشست — حساب یورو برای فروشنده ارسال شد", show_alert=True)
+    except TelegramError:
+        pass
     try:
         await q.message.edit_reply_markup(
             reply_markup=(
@@ -4541,11 +4582,19 @@ async def _apply_euro_settled(
             await _expire_stale_deal_button(answer_query, "فیشی ثبت نشده")
         return
     if receipt_index is None:
-        confirmed = confirmed_by == "admin" and bool(expected_revision) and (
-            deal_gate_confirm_all_seller_receipts_admin(
-                offer_id, expected_revision=expected_revision
+        if confirmed_by == "admin":
+            confirmed = bool(expected_revision) and (
+                deal_gate_confirm_all_seller_receipts_admin(
+                    offer_id, expected_revision=expected_revision
+                )
             )
-        )
+        else:
+            confirmed = bool(expected_revision) and bool(answer_query) and (
+                deal_gate_confirm_all_seller_receipts(
+                    offer_id, expected_revision=expected_revision,
+                    confirmed_by=confirmed_by, buyer_telegram_id=answer_query.from_user.id,
+                )
+            )
     else:
         confirmed = deal_gate_confirm_seller_receipt_buyer(
             offer_id, receipt_index, confirmed_by=confirmed_by
@@ -4605,9 +4654,12 @@ async def _apply_euro_settled(
                 offer_id,
                 e,
             )
-    await sync_deal_admin_notification(
-        context.bot, offer_id, deal_complete=True, text_only=True
-    )
+    try:
+        await sync_deal_admin_notification(
+            context.bot, offer_id, deal_complete=True, text_only=True
+        )
+    except Exception:
+        logger.exception("Admin message refresh failed after EUR confirmation offer=%s", offer_id)
     if answer_query:
         try:
             await answer_query.answer(
@@ -7493,7 +7545,8 @@ async def _handle_buyer_euro_settled_callback(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     offer_id: int,
-    receipt_index: int,
+    receipt_index: int | None,
+    expected_revision: str | None = None,
 ) -> None:
     q = update.callback_query
     if not q or not q.from_user:
@@ -7511,12 +7564,34 @@ async def _handle_buyer_euro_settled_callback(
             q, "این تأیید منقضی شده است؛ وضعیت معامله تغییر کرده."
         )
         return
+    items = deal_gate_seller_receipt_list(offer_id)
+    active = [item for item in items if not item.get("attachment_removed_at")]
+    if not active or (receipt_index is not None and (
+        receipt_index < 0 or receipt_index >= len(items)
+        or items[receipt_index].get("attachment_removed_at")
+    )):
+        await _expire_stale_deal_button(q, "این فیش دیگر فعال نیست.")
+        return
+    revision = deal_gate_seller_receipts_revision(items)
+    if receipt_index is not None or expected_revision != revision[:24]:
+        # Legacy per-receipt buttons explicitly ask for full receipt before
+        # changing the meaning of the buyer's confirmation.
+        await q.message.edit_reply_markup(
+            reply_markup=_buyer_euro_settled_keyboard(offer_id, 0)
+        )
+        await q.answer(
+            "اگر کل یوروی معامله را دریافت کرده‌اید، دکمهٔ تأیید دریافت کامل را بزنید."
+            if receipt_index is not None else "فیش‌ها تغییر کرده‌اند؛ پس از بررسی دوباره تأیید کنید.",
+            show_alert=True,
+        )
+        return
     await _apply_euro_settled(
         context,
         offer_id=offer_id,
-        receipt_index=receipt_index,
+        receipt_index=None,
         confirmed_by="buyer",
         answer_query=q,
+        expected_revision=revision,
     )
 
 
@@ -8043,11 +8118,12 @@ async def deal_gate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
     elif parts[0] == "deal" and parts[1] == "eurset" and len(parts) >= 4:
         try:
-            ridx = int(parts[3])
+            ridx = None if parts[3] == "all" else int(parts[3])
         except (TypeError, ValueError):
             return
         await _handle_buyer_euro_settled_callback(
-            update, context, callback_offer_id, ridx
+            update, context, callback_offer_id, ridx,
+            expected_revision=parts[4] if len(parts) == 5 else None,
         )
     elif parts[0] == "deal" and parts[1] == "stomcfm" and len(parts) >= 3:
         await _handle_seller_toman_settled_callback(

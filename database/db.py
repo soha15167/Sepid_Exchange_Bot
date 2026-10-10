@@ -3220,17 +3220,33 @@ def deal_gate_seller_receipts_revision(items: list[dict]) -> str:
 def deal_gate_confirm_all_seller_receipts_admin(
     offer_id: int, *, expected_revision: str
 ) -> bool:
+    return deal_gate_confirm_all_seller_receipts(
+        offer_id, expected_revision=expected_revision, confirmed_by="admin"
+    )
+
+
+def deal_gate_confirm_all_seller_receipts(
+    offer_id: int, *, expected_revision: str, confirmed_by: str,
+    buyer_telegram_id: int | None = None,
+) -> bool:
     """Atomically confirm the reviewed EUR receipts of one completed deal."""
     import json
     from contextlib import closing
 
+    if confirmed_by not in {"buyer", "admin"}:
+        return False
     with closing(sqlite3.connect(DB_PATH, timeout=20)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT gate_status, seller_receipt_log FROM offer_deal_gates WHERE offer_id = ?",
+            "SELECT gate_status, seller_receipt_log, buyer_telegram_id "
+            "FROM offer_deal_gates WHERE offer_id = ?",
             (int(offer_id),),
         ).fetchone()
         if not row or (row[0] or "").strip().lower() != "completed":
+            return False
+        if confirmed_by == "buyer" and (
+            int(buyer_telegram_id or 0) <= 0 or int(buyer_telegram_id or 0) != int(row[2] or 0)
+        ):
             return False
         items = _deal_gate_seller_receipt_list_raw({"seller_receipt_log": row[1]})
         active = [item for item in items if not item.get("attachment_removed_at")]
@@ -3240,7 +3256,7 @@ def deal_gate_confirm_all_seller_receipts_admin(
         for item in active:
             if not int(item.get("buyer_confirmed_at") or 0):
                 item["buyer_confirmed_at"] = now
-                item["confirmed_by"] = "admin"
+                item["confirmed_by"] = confirmed_by
         conn.execute(
             "UPDATE offer_deal_gates SET seller_receipt_log = ? WHERE offer_id = ?",
             (json.dumps(items, ensure_ascii=False), int(offer_id)),
