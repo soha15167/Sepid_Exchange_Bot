@@ -74,6 +74,8 @@ The buyer's explicit full-EUR button atomically confirms the current active rece
 
 **FA:** با هر به‌روزرسانی، پیام قبلی + آلبوم حذف و نسخهٔ جدید پایین چت ارسال می‌شود. شناسهٔ پیام‌ها در `admin_notify_mids` و `admin_notify_photo_mids` ذخیره می‌شود (شامل `album`, `by_fid`, `mode`).
 
+Hourly admin reminders resend this same full deal card and its current actions instead of adding a separate reminder. Only admins whose reminder is due receive a replacement. The old card is removed after successful delivery, and legacy standalone reminders are cleaned up. Failed deliveries keep the previous card and remain eligible for retry.
+
 **Scripts:**
 
 | Script | EN | FA |

@@ -1398,7 +1398,9 @@ async def sync_deal_admin_notification(
     text_only: bool = False,
     force_album_rebuild: bool = False,
     resend_fresh: bool = True,
-) -> None:
+    recipient_ids: list[int] | None = None,
+    reminder_only: bool = False,
+) -> dict[int, int]:
     """
     ارسال یا به‌روزرسانی پیام ادمین برای معامله.
     resend_fresh=True (پیش‌فرض): پیام قبلی + آلبوم حذف و نسخهٔ جدید پایین چت ارسال می‌شود.
@@ -1407,11 +1409,13 @@ async def sync_deal_admin_notification(
     oid = int(offer_id)
     lock = _admin_sync_locks.setdefault(oid, asyncio.Lock())
     async with lock:
-        await _sync_deal_admin_notification_locked(
+        return await _sync_deal_admin_notification_locked(
             bot,
             oid,
             deal_complete=deal_complete,
             resend_fresh=resend_fresh,
+            recipient_ids=recipient_ids,
+            reminder_only=reminder_only,
         )
 
 
@@ -1421,7 +1425,9 @@ async def _sync_deal_admin_notification_locked(
     *,
     deal_complete: bool = False,
     resend_fresh: bool = True,
-) -> None:
+    recipient_ids: list[int] | None = None,
+    reminder_only: bool = False,
+) -> dict[int, int]:
     from handlers.offers import (
         _deal_admin_recipient_ids,
         _post_acceptance_admin_message_html,
@@ -1430,10 +1436,14 @@ async def _sync_deal_admin_notification_locked(
     gate = deal_gate_get(offer_id)
     row = get_advert_offer_joined(offer_id)
     if not gate or not row:
-        return
+        return {}
+    if reminder_only:
+        if not _gate_awaiting_admin_toman_receipt(gate):
+            return {}
+        deal_complete = (gate.get("gate_status") or "").strip().lower() == "completed"
     advert = get_euro_advert_by_rowid(int(row["advert_rowid"]))
     if not advert:
-        return
+        return {}
 
     oid = int(offer_id)
     seq = int(row.get("seq_in_advert") or oid)
@@ -1497,11 +1507,12 @@ async def _sync_deal_admin_notification_locked(
     for status, count in outgoing_summary(oid):
         admin_html += f"\nخروجی سایت: {outgoing_states.get(status, status)} ({count})"
     recipients = _deal_admin_recipient_ids()
+    if recipient_ids is not None:
+        requested = set(recipient_ids)
+        recipients = [cid for cid in recipients if cid in requested]
     if not recipients:
         logger.warning("deal_admin_sync: no recipients offer=%s", oid)
-        return
-
-    await _purge_legacy_admin_photo_replies(bot, gate, recipients)
+        return {}
 
     stored = _parse_admin_notify_mids(gate)
     updated = dict(stored)
@@ -1520,6 +1531,7 @@ async def _sync_deal_admin_notification_locked(
     album_stored = _parse_admin_album_mids(gate)
     by_fid_stored = _parse_admin_photo_reply_by_fid(gate)
     album_payload_updated: dict[int, dict[str, list]] = {}
+    delivered: dict[int, int] = {}
 
     for chat_id in recipients:
         cid = int(chat_id)
@@ -1528,54 +1540,57 @@ async def _sync_deal_admin_notification_locked(
             or album_stored.get(cid)
             or by_fid_stored.get(cid)
         )
-        if resend_fresh and had_prior:
-            await _purge_admin_deal_messages_for_chat(bot, chat_id=cid, gate=gate)
-
-        if album_slides:
-            new_mid, new_album, new_fids, new_by_fid = (
-                await _sync_admin_text_and_album_reply(
+        new_mid = None
+        new_album = []
+        try:
+            if album_slides:
+                new_mid = await _edit_or_send_admin_notification(
+                    bot, chat_id=cid, old_mid=None, admin_html=admin_html,
+                    photo_fids=[], reply_markup=reply_markup, plain=plain,
+                    log_offer_id=oid,
+                )
+                if not new_mid:
+                    continue
+                new_album, new_by_fid = await _send_admin_slides_media_group(
+                    bot, chat_id=cid, text_mid=int(new_mid),
+                    slides=album_slides, log_offer_id=oid,
+                )
+                new_fids = [(slide[0] or "").strip() for slide in album_slides if (slide[0] or "").strip()]
+                if len(new_album) != len(new_fids):
+                    for message_id in [int(new_mid), *new_album]:
+                        await _delete_message_safe(bot, cid, message_id)
+                    logger.warning("deal_admin_sync: incomplete replacement album offer=%s chat=%s", oid, cid)
+                    continue
+                album_payload = {
+                    "album": new_album,
+                    "fids": new_fids,
+                    "by_fid": new_by_fid,
+                    "mode": "media_group",
+                }
+            else:
+                new_mid = await _edit_or_send_admin_notification(
                     bot,
                     chat_id=cid,
                     old_mid=None,
-                    old_album_mids=[],
-                    stored_fids=[],
-                    stored_by_fid={},
                     admin_html=admin_html,
-                    slides=album_slides,
+                    photo_fids=photo_fids,
                     reply_markup=reply_markup,
                     plain=plain,
                     log_offer_id=oid,
-                    supersede_text_mids=[],
-                    force_rebuild=True,
                 )
-            )
-            album_payload_updated[cid] = {
-                "album": new_album,
-                "fids": new_fids,
-                "by_fid": new_by_fid,
-                "mode": "media_group",
-            }
-        else:
-            new_mid = await _edit_or_send_admin_notification(
-                bot,
-                chat_id=cid,
-                old_mid=None,
-                admin_html=admin_html,
-                photo_fids=photo_fids,
-                reply_markup=reply_markup,
-                plain=plain,
-                log_offer_id=oid,
-            )
-            new_album = []
-            new_fids = []
-            new_by_fid = {}
-            album_payload_updated[cid] = {
-                "album": [],
-                "fids": [],
-                "mode": "media_group",
-            }
+                new_album = []
+                album_payload = {"album": [], "fids": [], "mode": "media_group"}
+        except Exception:
+            logger.exception("deal_admin_sync: replacement failed offer=%s chat=%s", oid, cid)
+            for message_id in ([int(new_mid)] if new_mid else []) + new_album:
+                await _delete_message_safe(bot, cid, message_id)
+            continue
         if new_mid:
+            if resend_fresh and had_prior:
+                await _purge_admin_deal_messages_for_chat(bot, chat_id=cid, gate=gate)
             updated[chat_id] = int(new_mid)
+            delivered[cid] = int(new_mid)
+            album_payload_updated[cid] = album_payload
             logger.info(
                 "deal_admin_sync: %s offer=%s chat_id=%s mid=%s album=%s slides=%s",
                 "resent" if had_prior and resend_fresh else "sent",
@@ -1609,6 +1624,7 @@ async def _sync_deal_admin_notification_locked(
             seller_telegram_id=seller_id,
             **upsert_fields,
         )
+    return delivered
 
 
 # =============================================================================
@@ -5921,7 +5937,7 @@ async def run_admin_toman_receipt_reminder_sweep(
     *,
     now: int | None = None,
 ) -> int:
-    """Send hourly Persian reminders until the Toman receipt reaches seller."""
+    """Move the original deal card to the bottom of each due admin's chat."""
     from handlers.offers import _deal_admin_recipient_ids
     from utils.deal_outbound import deal_bot_log_text
 
@@ -5931,45 +5947,48 @@ async def run_admin_toman_receipt_reminder_sweep(
         return 0
     for gate in deal_gate_list_awaiting_admin_toman_receipt():
         oid = int(gate.get("offer_id") or 0)
-        row = get_advert_offer_joined(oid) or {}
-        advert_id = int(gate.get("advert_rowid") or row.get("advert_rowid") or 0)
-        offer_seq = int(row.get("seq_in_advert") or oid)
-        stage = _admin_toman_reminder_stage(gate)
-        next_action = _admin_toman_reminder_next_action(gate)
-        body = (
-            f"{_RTL}⏰ <b>یادآوری ساعتی ادمین</b>\n\n"
-            f"{_RTL}آگهی <b>{advert_id}</b> · پیشنهاد <b>{offer_seq}</b>\n"
-            f"{_RTL}کد معامله <code>{oid}</code>\n"
-            f"{_RTL}مرحله فعلی: <b>{stage}</b>\n\n"
-            f"{_RTL}اقدام بعدی: <b>{next_action}</b>\n\n"
-            f"{_RTL}لطفاً این مرحله را پیگیری کنید.\n"
-            f"{_RTL}<i>این یادآوری پس از ارسال موفق فیش تومان به فروشنده متوقف می‌شود.</i>"
-        )
-        keyboard = _admin_toman_reminder_keyboard(oid, gate)
-        for admin_id in admin_ids:
-            if not _admin_toman_reminder_due(gate, admin_id, now=now):
-                continue
-            _last_sent_at, previous_message_id = _last_admin_toman_reminder_delivery(
-                oid, int(admin_id)
+        due_admins = [
+            int(admin_id) for admin_id in admin_ids
+            if _admin_toman_reminder_due(gate, admin_id, now=now)
+        ]
+        if not due_admins:
+            continue
+        previous_reminders = {
+            admin_id: {
+                int(row.get("telegram_message_id") or 0)
+                for row in bot_outbound_log_list(oid)
+                if int(row.get("recipient_telegram_id") or 0) == admin_id
+                and (row.get("party") or "").strip().lower() == "admin"
+                and (row.get("tag") or "").strip() == _ADMIN_TOMAN_REMINDER_TAG
+                and int(row.get("telegram_message_id") or 0) > 0
+            }
+            for admin_id in due_admins
+        }
+        try:
+            delivered = await sync_deal_admin_notification(
+                bot, oid,
+                deal_complete=(gate.get("gate_status") or "").strip().lower() == "completed",
+                resend_fresh=True,
+                recipient_ids=due_admins,
+                reminder_only=True,
             )
+        except Exception:
+            logger.exception("admin_toman_reminder: deal refresh failed offer=%s", oid)
+            continue
+        for admin_id in due_admins:
+            new_message_id = int(delivered.get(admin_id) or 0)
+            if new_message_id <= 0:
+                continue
             try:
-                sent_message = await bot.send_message(
-                    chat_id=int(admin_id),
-                    text=body,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=keyboard,
-                    disable_web_page_preview=True,
-                )
-                new_message_id = int(getattr(sent_message, "message_id", 0) or 0)
                 deal_bot_log_text(
                     oid,
                     int(admin_id),
                     "admin",
                     _ADMIN_TOMAN_REMINDER_TAG,
-                    body,
+                    "بازفرستادن پیام اصلی معامله برای یادآوری",
                     telegram_message_id=new_message_id,
                 )
-                if previous_message_id > 0 and previous_message_id != new_message_id:
+                for previous_message_id in previous_reminders[admin_id] - {new_message_id}:
                     try:
                         await bot.delete_message(
                             chat_id=int(admin_id),
@@ -5987,7 +6006,7 @@ async def run_admin_toman_receipt_reminder_sweep(
                 sent += 1
             except Exception as exc:
                 logger.warning(
-                    "admin_toman_reminder: send failed admin=%s offer=%s: %s",
+                    "admin_toman_reminder: refresh tracking failed admin=%s offer=%s: %s",
                     admin_id,
                     oid,
                     exc,
