@@ -26,7 +26,7 @@ def edit_buyer_amount(offer_id, index, expected, amount, actor):
         if index < 0 or index >= len(items):
             return None
         item = items[index]
-        if fingerprint(item) != expected or item.get('attachment_removed_at') or item.get('accounting_status') in {'submitted','submitting','panel_failed','duplicate','rejected'}:
+        if fingerprint(item) != expected or item.get('attachment_removed_at') or item.get('accounting_status') in {'submitted','submitting','panel_failed','panel_unknown','duplicate','rejected'}:
             return None
         stamp = int(time.time())
         item.setdefault('amount_edit_history', []).append({'actor': actor, 'at': stamp, 'old': item.get('amount_rial'), 'new': amount})
@@ -51,7 +51,7 @@ def edit_buyer_accounting_fields(offer_id, index, expected, bank_name, transfer_
         if index < 0 or index >= len(items):
             return None
         item = items[index]
-        if fingerprint(item) != expected or item.get('attachment_removed_at') or item.get('accounting_status') in {'submitted', 'submitting', 'duplicate', 'rejected'}:
+        if fingerprint(item) != expected or item.get('attachment_removed_at') or item.get('accounting_status') in {'submitted', 'submitting', 'panel_failed', 'panel_unknown', 'duplicate', 'rejected'}:
             return None
         stamp = int(time.time())
         item.setdefault('accounting_field_edit_history', []).append({

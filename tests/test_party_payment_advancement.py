@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import asyncio
 import tempfile
 import unittest
 from contextlib import ExitStack
@@ -47,10 +48,12 @@ class PartyPaymentAdvancementTests(unittest.IsolatedAsyncioTestCase):
         self.release = self.stack.enter_context(patch.object(flow, "_send_buyer_eur_account_to_seller", new=AsyncMock(side_effect=self._deliver_account)))
         self.admin_confirm = self.stack.enter_context(patch.object(flow, "_admin_sensitive_confirmation", new=AsyncMock()))
         flow._buyer_toman_settlement_locks.clear()
+        flow._buyer_receipt_copy_locks.clear()
 
     def tearDown(self):
         self.stack.close()
         flow._buyer_toman_settlement_locks.clear()
+        flow._buyer_receipt_copy_locks.clear()
         gc.collect()
         self.tmp.cleanup()
 
@@ -155,7 +158,9 @@ class PartyPaymentAdvancementTests(unittest.IsolatedAsyncioTestCase):
         self._toman(100, oid=102)
         await self._click_toman(0)
         self.release.assert_not_awaited()
-        self.post.assert_not_called()
+        self.post.assert_called_once()
+        self.assertEqual(self.post.call_args.kwargs["payload"]["iran_amount"], 40)
+        self.assertEqual(db.deal_gate_buyer_receipt_list(101)[0]["accounting_status"], "submitted")
         await self._click_toman(1, uid=7002)
         self.assertGreater(int(db.deal_gate_get(101)["buyer_toman_settled_at"]), 0)
         self.assertEqual(int(db.deal_gate_get(101)["seller_eur_account_sent_at"]), 200)
@@ -167,7 +172,7 @@ class PartyPaymentAdvancementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.post.call_count, 2)
         self.release.assert_awaited_once()
 
-    async def test_panel_failure_keeps_retry_button_and_reviewer_can_finish(self):
+    async def test_unknown_panel_result_keeps_payment_and_never_resubmits(self):
         self._toman()
         self.post.side_effect = [(False, "unavailable"), (True, "ok")]
         q = await self._click_toman()
@@ -176,9 +181,15 @@ class PartyPaymentAdvancementTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(db.deal_gate_get(101)["buyer_toman_settled_at"])
         self.assertIsNotNone(q.message.edit_reply_markup.await_args.kwargs["reply_markup"])
         await self._click_toman(uid=7002)
+        self.assertFalse(db.deal_gate_get(101)["buyer_toman_settled_at"])
+        self.assertEqual(db.deal_gate_buyer_receipt_list(101)[0]["accounting_status"], "panel_unknown")
+        self.post.assert_called_once()
+        # A verified external outcome can unlock delivery without another POST.
+        db.deal_gate_update_buyer_receipt(101, 0, accounting_status="submitted")
+        await self._click_toman(uid=7002)
         self.assertGreater(int(db.deal_gate_get(101)["buyer_toman_settled_at"]), 0)
         self.admin_confirm.assert_not_awaited()
-        self.broadcast.assert_awaited_once()
+        self.broadcast.assert_not_awaited()
 
     async def test_confirmed_reviewer_copies_keep_controls_until_account_is_delivered(self):
         self._toman()
@@ -220,8 +231,117 @@ class PartyPaymentAdvancementTests(unittest.IsolatedAsyncioTestCase):
                 self._toman(amount, status=status)
                 await self._click_toman()
                 self.assertFalse(db.deal_gate_get(101)["buyer_toman_settled_at"])
-        self.post.assert_not_called()
+        self.assertEqual(self.post.call_count, 2)
         self.release.assert_not_awaited()
+
+    async def test_admin_received_confirmation_automatically_registers_income(self):
+        self._toman()
+        self.admin_confirm.return_value = True
+        q, update = self._query("adm|tomset|101|yes", 9001)
+        await flow.deal_admin_toman_settled_callback(update, self.context)
+        self.post.assert_called_once()
+        self.assertEqual(self.post.call_args.kwargs["payload"]["iran_type"], "ورودی")
+        self.assertEqual(db.deal_gate_buyer_receipt_list(101)[0]["accounting_status"], "submitted")
+        self.admin_confirm.assert_awaited_once()
+        self.release.assert_awaited_once()
+
+    def test_db_submission_claim_requires_received_money_and_live_deal(self):
+        self._toman()
+        self.assertIsNone(db.deal_gate_claim_buyer_receipt_submission(101, 0))
+        db.deal_gate_confirm_buyer_receipt_received(101, 0, 7001)
+        db.deal_gate_upsert(offer_id=101, advert_rowid=4101, buyer_telegram_id=10, seller_telegram_id=20, gate_status="closed")
+        self.assertIsNone(db.deal_gate_claim_buyer_receipt_submission(101, 0))
+
+    async def test_registered_installment_cannot_be_rebooked_by_reupload_or_amount_edit(self):
+        from database import receipt_management
+        self._toman(40)
+        await self._click_toman()
+        receipt = db.deal_gate_buyer_receipt_list(101)[0]
+        self.assertIsNone(receipt_management.edit_buyer_amount(101, 0, receipt_management.fingerprint(receipt), 50, 9001))
+        await self._click_toman(uid=7002)
+        self.post.assert_called_once()
+
+    async def test_concurrent_reviewers_register_one_installment_once(self):
+        self._toman(40)
+        await asyncio.gather(self._click_toman(uid=7001), self._click_toman(uid=7002))
+        self.post.assert_called_once()
+        self.assertEqual(db.deal_gate_buyer_receipt_list(101)[0]["accounting_status"], "submitted")
+        self.release.assert_not_awaited()
+
+    async def test_metadata_completion_registers_already_received_money_without_new_confirmation(self):
+        from handlers import receipt_management as management
+        self._toman(40)
+        db.deal_gate_update_buyer_receipt(101, 0, jdate="")
+        await self._click_toman()
+        self.post.assert_not_called()
+        receipt = db.deal_gate_buyer_receipt_list(101)[0]
+        self.context.user_data[management._FIELDS_KEY] = {
+            "offer_id": 101, "index": 0, "actor_id": 9001,
+            "expected": receipt_management.fingerprint(receipt),
+        }
+        message = SimpleNamespace(text="test | normal | 1405/07/20", reply_text=AsyncMock())
+        update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=9001))
+        with patch.object(management, "allowed", return_value=True):
+            self.assertTrue(await management.message(update, self.context))
+        current = db.deal_gate_buyer_receipt_list(101)[0]
+        self.assertEqual(current["reviewer_received_at"], receipt["reviewer_received_at"])
+        self.assertEqual(current["accounting_status"], "submitted")
+        self.post.assert_called_once()
+        self.admin_confirm.assert_not_awaited()
+        self.release.assert_not_awaited()
+
+    async def test_metadata_completion_cannot_book_unreceived_money(self):
+        from handlers import receipt_management as management
+        self._toman(40)
+        receipt = db.deal_gate_buyer_receipt_list(101)[0]
+        self.context.user_data[management._FIELDS_KEY] = {
+            "offer_id": 101, "index": 0, "actor_id": 9001,
+            "expected": receipt_management.fingerprint(receipt),
+        }
+        message = SimpleNamespace(text="test | normal | 1405/07/20", reply_text=AsyncMock())
+        with patch.object(management, "allowed", return_value=True):
+            await management.message(SimpleNamespace(message=message, effective_user=SimpleNamespace(id=9001)), self.context)
+        self.post.assert_not_called()
+        self.assertFalse(db.deal_gate_buyer_receipt_list(101)[0].get("reviewer_received_at"))
+
+    async def test_unknown_submission_cannot_be_reset_by_amount_or_metadata_edit(self):
+        self._toman()
+        self.post.return_value = (False, "timeout")
+        await self._click_toman()
+        receipt = db.deal_gate_buyer_receipt_list(101)[0]
+        expected = receipt_management.fingerprint(receipt)
+        self.assertIsNone(receipt_management.edit_buyer_amount(101, 0, expected, 50, 9001))
+        self.assertIsNone(receipt_management.edit_buyer_accounting_fields(101, 0, expected, "test", "normal", "1405/07/20", 9001))
+        self.assertIsNone(db.deal_gate_claim_buyer_receipt_submission(101, 0))
+        await self._click_toman()
+        self.post.assert_called_once()
+
+    async def test_legacy_failed_submission_is_not_blindly_retried_or_reset(self):
+        self._toman()
+        db.deal_gate_confirm_buyer_receipt_received(101, 0, 7001)
+        db.deal_gate_update_buyer_receipt(101, 0, accounting_status="panel_failed")
+        await self._click_toman()
+        receipt = db.deal_gate_buyer_receipt_list(101)[0]
+        expected = receipt_management.fingerprint(receipt)
+        self.assertIsNone(db.deal_gate_claim_buyer_receipt_submission(101, 0))
+        self.assertIsNone(receipt_management.edit_buyer_accounting_fields(101, 0, expected, "test", "normal", "1405/07/20", 9001))
+        self.post.assert_not_called()
+
+    async def test_human_click_recovers_unknown_delivery_before_stale_amount_validation(self):
+        self._toman()
+        db.deal_gate_update_buyer_receipt(101, 0, reviewer_notify_mids={"7002": 601},
+            reviewer_notify_delivery={"7001": {"status": "unknown", "at": 1}})
+        q, update = self._query("adm|tomset|101|0|0", 7001)
+        q.message.message_id, q.message.chat_id = 501, 7001
+        await flow.deal_admin_toman_settled_callback(update, self.context)
+        current = db.deal_gate_buyer_receipt_list(101)[0]
+        self.assertEqual(current["reviewer_notify_mids"]["7001"], 501)
+        self.assertEqual(current["reviewer_notify_delivery"]["7001"]["status"], "delivered")
+        self.assertFalse(current.get("reviewer_received_at"))
+        self.post.assert_not_called()
+        q.data = "adm|tomset|101|0|100"
+        await flow.deal_admin_toman_settled_callback(update, self.context)
+        self.post.assert_called_once()
 
     async def test_stale_amount_and_unauthorized_actor_cannot_confirm(self):
         self._toman()

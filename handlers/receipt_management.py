@@ -93,7 +93,7 @@ async def _callback(update, context):
                     continue
                 if kind == 'buyer':
                     rows.append([Button(f'✏️ مبلغ فیش خریدار — {idx + 1}', callback_data=f'adm|tomamt|{oid}|{idx}')])
-                    if item.get('accounting_status') not in {'submitted', 'submitting', 'duplicate', 'rejected'}:
+                    if item.get('accounting_status') not in {'submitted', 'submitting', 'panel_failed', 'panel_unknown', 'duplicate', 'rejected'}:
                         rows.append([Button(f'✏️ مشخصات حسابداری فیش خریدار — {idx + 1}', callback_data=f'receipts|fields|{oid}|{idx}')])
                 rows.append([Button(f'🗑 {LABELS[kind]} — {idx + 1}', callback_data=f'receipts|view|{oid}|{kind}|{idx}')])
         rows.append([Button('⬅️ بازگشت به معامله / بستن', callback_data=f'receipts|close|{oid}')])
@@ -104,7 +104,7 @@ async def _callback(update, context):
             idx = int(parts[3])
             items = json.loads(gate.get(KINDS['buyer']) or '[]')
             item = items[idx]
-            if idx < 0 or item.get('attachment_removed_at') or item.get('accounting_status') in {'submitted', 'submitting', 'duplicate', 'rejected'}:
+            if idx < 0 or item.get('attachment_removed_at') or item.get('accounting_status') in {'submitted', 'submitting', 'panel_failed', 'panel_unknown', 'duplicate', 'rejected'}:
                 raise ValueError()
         except (IndexError, ValueError):
             await q.answer('این فیش قابل ویرایش نیست.', show_alert=True)
@@ -173,12 +173,30 @@ async def message(update, context):
     if len(values) != 3 or not all(values):
         await update.message.reply_text('قالب درست نیست: نام بانک | نوع انتقال | تاریخ')
         return True
-    item = edit_buyer_accounting_fields(pending['offer_id'], pending['index'], pending['expected'], *values, pending['actor_id'])
+    from handlers import deal_gate
+    oid, index = pending['offer_id'], pending['index']
+    accounting_ok, accounting_message = False, ''
+    async with deal_gate._buyer_toman_settlement_locks.setdefault(oid, asyncio.Lock()):
+        item = edit_buyer_accounting_fields(oid, index, pending['expected'], *values, pending['actor_id'])
+        if item and int(item.get('reviewer_received_at') or 0):
+            accounting_ok, accounting_message = await deal_gate._submit_confirmed_buyer_receipts_to_iran(
+                context, gate=deal_gate_get(oid), receipt_index=index
+            )
     context.user_data.pop(_FIELDS_KEY, None)
     if not item:
         await update.message.reply_text('فیش تغییر کرده یا قابل ویرایش نیست؛ دوباره از مدیریت فیش‌ها شروع کنید.')
         return True
-    from handlers.deal_gate import sync_deal_admin_notification
-    await sync_deal_admin_notification(context.bot, pending['offer_id'], deal_complete=True)
-    await update.message.reply_text('✅ مشخصات ثبت شد. اکنون «تومان نشست» را دوباره تأیید کنید.')
+    if accounting_ok:
+        await deal_gate.reconcile_received_buyer_receipts(context, oid)
+    await deal_gate._sync_buyer_receipt_reviewer_messages(
+        context.bot, offer_id=oid, receipt_index=index,
+        receipt=deal_gate.deal_gate_buyer_receipt_list(oid)[index],
+    )
+    await deal_gate.sync_deal_admin_notification(context.bot, oid, deal_complete=True)
+    if int(item.get('reviewer_received_at') or 0):
+        await update.message.reply_text(
+            '✅ مشخصات تکمیل و فیش خودکار در سایت ثبت شد.' if accounting_ok else accounting_message
+        )
+    else:
+        await update.message.reply_text('✅ مشخصات تکمیل شد؛ پس از تأیید دریافت وجه، فیش خودکار در سایت ثبت می‌شود.')
     return True

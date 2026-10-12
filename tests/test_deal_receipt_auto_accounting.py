@@ -190,7 +190,7 @@ class BuyerReceiptAutoAccountingTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(adjusted)
         self.assertEqual(amount, 102_000_000)
 
-    async def test_admin_approval_posts_once_and_marks_submitted(self):
+    async def test_stale_site_approval_cannot_book_before_money_is_received(self):
         self.items[0].update(
             accounting_status="ready_for_review",
             amount_rial=100_000_000,
@@ -217,8 +217,8 @@ class BuyerReceiptAutoAccountingTests(unittest.IsolatedAsyncioTestCase):
             await self.deal_gate._handle_admin_receipt_review(
                 update, context, offer_id=258, receipt_index=0, approve=True
             )
-        self.assertEqual(post.call_count, 1)
-        self.assertEqual(self.items[0]["accounting_status"], "submitted")
+        post.assert_not_called()
+        self.assertEqual(self.items[0]["accounting_status"], "ready_for_review")
 
     async def test_admin_rejection_never_posts(self):
         self.items[0]["accounting_status"] = "ready_for_review"

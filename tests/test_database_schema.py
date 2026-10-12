@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from database import db
@@ -27,7 +28,7 @@ CRITICAL_TABLES = {
 
 
 def _schema_snapshot(path: Path) -> list[tuple[str, str, str]]:
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn:
         return conn.execute(
             """
             SELECT type, name, COALESCE(sql, '')
@@ -47,7 +48,7 @@ class DatabaseSchemaTests(unittest.TestCase):
                 db.DB_PATH = str(path)
                 db.ensure_schema()
                 first = _schema_snapshot(path)
-                with sqlite3.connect(path) as conn:
+                with closing(sqlite3.connect(path)) as conn:
                     first_cutoff = conn.execute(
                         """
                         SELECT value FROM settings
@@ -69,7 +70,7 @@ class DatabaseSchemaTests(unittest.TestCase):
                 CRITICAL_TABLES.issubset(tables),
                 f"missing critical tables: {sorted(CRITICAL_TABLES - tables)}",
             )
-            with sqlite3.connect(path) as conn:
+            with closing(sqlite3.connect(path)) as conn:
                 self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
                 settings = dict(conn.execute("SELECT key, value FROM settings"))
                 self.assertEqual(

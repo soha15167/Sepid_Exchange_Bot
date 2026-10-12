@@ -1503,7 +1503,7 @@ async def _sync_deal_admin_notification_locked(
             f" · فیش‌ها: <b>{len(viewer_receipts) if isinstance(viewer_receipts, list) else 0}</b>"
         )
     from database.outgoing_receipts import summary as outgoing_summary
-    outgoing_states = {'draft': 'در انتظار تأیید', 'submitting': 'در حال ثبت', 'submitted': 'ثبت شد', 'skipped': 'ثبت نشود', 'unknown': 'نیازمند بررسی سایت'}
+    outgoing_states = {'draft': 'نیازمند تکمیل مشخصات', 'submitting': 'در حال ثبت خودکار', 'submitted': 'ثبت شد', 'skipped': 'ثبت نشد', 'unknown': 'نیازمند بررسی سایت'}
     for status, count in outgoing_summary(oid):
         admin_html += f"\nخروجی سایت: {outgoing_states.get(status, status)} ({count})"
     recipients = _deal_admin_recipient_ids()
@@ -2090,7 +2090,7 @@ def _buyer_toman_received_reviewer_keyboard(
 ) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton(
-            "🔄 ادامهٔ ثبت دریافت تومان" if receipt and receipt.get("reviewer_received_at") else "✅ دریافت شد",
+            "🔄 ادامهٔ معامله" if receipt and receipt.get("reviewer_received_at") else "✅ دریافت شد",
             callback_data=f"adm|tomset|{int(offer_id)}|{int(receipt_index)}" + (f"|{int(receipt.get('amount_rial') or 0)}" if receipt is not None else ''),
         )], [InlineKeyboardButton("✏️ اصلاح مبلغ (ریال)", callback_data=f"adm|tomamt|{int(offer_id)}|{int(receipt_index)}")]]
     )
@@ -2167,6 +2167,13 @@ def _buyer_receipt_reviewer_body(
         )
     if confirmed:
         body += f"\n{_RTL}این فیش دریافت شده و در جمع پرداخت معامله محاسبه شد."
+        accounting_status = (receipt.get("accounting_status") or "").strip().lower()
+        if accounting_status == "submitted":
+            body += f"\n{_RTL}🌐 ورودی سایت: خودکار ثبت شد."
+        elif accounting_status in {"panel_unknown", "submitting"}:
+            body += f"\n{_RTL}🌐 نتیجهٔ ثبت سایت در حال بررسی است؛ ثبت تکراری انجام نمی‌شود."
+        else:
+            body += f"\n{_RTL}🌐 ثبت سایت پس از تکمیل مشخصات فیش خودکار انجام می‌شود."
     else:
         body += (
             f"\n{_RTL}پس از بررسی و اطمینان از دریافت وجه، دکمهٔ <b>دریافت شد</b> را بزنید.\n"
@@ -2175,10 +2182,151 @@ def _buyer_receipt_reviewer_body(
     return body
 
 
-async def _sync_buyer_receipt_reviewer_messages(
+_buyer_receipt_copy_locks: dict[tuple[int, int], asyncio.Lock] = {}
+
+
+def _buyer_receipt_copy_markup(
+    offer_id: int, receipt_index: int, receipt: dict
+) -> InlineKeyboardMarkup | None:
+    gate = deal_gate_get(int(offer_id)) or {}
+    finished = (
+        int(gate.get("buyer_toman_settled_at") or 0) > 0
+        and int(gate.get("seller_eur_account_sent_at") or 0) > 0
+    )
+    if int(receipt.get("reviewer_received_at") or 0) and finished:
+        return None
+    return _buyer_toman_received_reviewer_keyboard(offer_id, receipt_index, receipt)
+
+
+async def _send_buyer_receipt_reviewer_copy(
+    bot, *, chat_id: int, offer_id: int, receipt_index: int, receipt: dict
+) -> int:
+    body = _buyer_receipt_reviewer_body(
+        offer_id=offer_id,
+        receipt_index=receipt_index,
+        receipt=receipt,
+        confirmed=bool(int(receipt.get("reviewer_received_at") or 0)),
+    )
+    markup = _buyer_receipt_copy_markup(offer_id, receipt_index, receipt)
+    media_type = (receipt.get("type") or "text").strip().lower()
+    file_id = (receipt.get("file_id") or "").strip()
+    if media_type in {"photo", "document"} and file_id:
+        sender = bot.send_photo if media_type == "photo" else bot.send_document
+        sent = await sender(
+            int(chat_id), file_id, caption=_photo_caption_html(body),
+            parse_mode=ParseMode.HTML, reply_markup=markup,
+        )
+    else:
+        sent = await bot.send_message(
+            int(chat_id), body, parse_mode=ParseMode.HTML,
+            reply_markup=markup, disable_web_page_preview=True,
+        )
+    return int(getattr(sent, "message_id", 0) or 0)
+
+
+def _buyer_receipt_copy_delivery_status(receipt: dict, chat_id: int) -> str:
+    deliveries = receipt.get("reviewer_notify_delivery") or {}
+    entry = deliveries.get(str(int(chat_id))) if isinstance(deliveries, dict) else None
+    return str(entry.get("status") or "") if isinstance(entry, dict) else ""
+
+
+def _set_buyer_receipt_copy_delivery(
+    *, offer_id: int, receipt_index: int, chat_id: int, status: str,
+    expected_status: str | None = None,
+) -> dict | None:
+    items = deal_gate_buyer_receipt_list(int(offer_id))
+    if not 0 <= int(receipt_index) < len(items):
+        return None
+    receipt = items[int(receipt_index)]
+    if receipt.get("attachment_removed_at"):
+        return None
+    if expected_status is not None and _buyer_receipt_copy_delivery_status(receipt, chat_id) != expected_status:
+        return receipt
+    current = receipt.get("reviewer_notify_delivery") or {}
+    deliveries = dict(current) if isinstance(current, dict) else {}
+    deliveries[str(int(chat_id))] = {"status": status, "at": int(time.time())}
+    return deal_gate_update_buyer_receipt(
+        int(offer_id), int(receipt_index), reviewer_notify_delivery=deliveries
+    )
+
+
+async def _track_buyer_receipt_reviewer_copy(
+    bot, *, chat_id: int, message_id: int, offer_id: int, receipt_index: int
+) -> bool:
+    items = deal_gate_buyer_receipt_list(int(offer_id))
+    if not 0 <= int(receipt_index) < len(items):
+        await _delete_message_safe(bot, int(chat_id), int(message_id))
+        return False
+    receipt = items[int(receipt_index)]
+    if receipt.get("attachment_removed_at"):
+        await _delete_message_safe(bot, int(chat_id), int(message_id))
+        return False
+    existing = receipt.get("reviewer_notify_mids") or {}
+    mids = dict(existing) if isinstance(existing, dict) else {}
+    mids[str(int(chat_id))] = int(message_id)
+    current = receipt.get("reviewer_notify_delivery") or {}
+    deliveries = dict(current) if isinstance(current, dict) else {}
+    deliveries[str(int(chat_id))] = {
+        "status": "delivered", "at": int(time.time()), "message_id": int(message_id),
+    }
+    try:
+        updated = deal_gate_update_buyer_receipt(
+            int(offer_id), int(receipt_index), reviewer_notify_mids=mids,
+            reviewer_notify_delivery=deliveries,
+        )
+    except Exception:
+        await _delete_message_safe(bot, int(chat_id), int(message_id))
+        raise
+    if not updated:
+        await _delete_message_safe(bot, int(chat_id), int(message_id))
+        return False
+    return True
+
+
+async def _deliver_buyer_receipt_reviewer_copy(
+    bot, *, chat_id: int, offer_id: int, receipt_index: int
+) -> None:
+    items = deal_gate_buyer_receipt_list(int(offer_id))
+    if not 0 <= int(receipt_index) < len(items):
+        return
+    receipt = items[int(receipt_index)]
+    if receipt.get("attachment_removed_at") or _buyer_receipt_copy_delivery_status(receipt, chat_id) in {"sending", "unknown"}:
+        return
+    receipt = _set_buyer_receipt_copy_delivery(
+        offer_id=offer_id, receipt_index=receipt_index, chat_id=chat_id, status="sending"
+    )
+    if not receipt:
+        return
+    try:
+        new_mid = await _send_buyer_receipt_reviewer_copy(
+            bot, chat_id=chat_id, offer_id=offer_id,
+            receipt_index=receipt_index, receipt=receipt,
+        )
+        if new_mid > 0 and await _track_buyer_receipt_reviewer_copy(
+            bot, chat_id=chat_id, message_id=new_mid,
+            offer_id=offer_id, receipt_index=receipt_index,
+        ):
+            return
+    except Exception:
+        _set_buyer_receipt_copy_delivery(
+            offer_id=offer_id, receipt_index=receipt_index, chat_id=chat_id,
+            status="unknown", expected_status="sending",
+        )
+        raise
+    _set_buyer_receipt_copy_delivery(
+        offer_id=offer_id, receipt_index=receipt_index, chat_id=chat_id,
+        status="unknown", expected_status="sending",
+    )
+
+
+async def _sync_buyer_receipt_reviewer_messages_locked(
     bot, *, offer_id: int, receipt_index: int, receipt: dict
 ) -> None:
-    """Update all reviewer copies of one receipt and remove stale buttons."""
+    items = deal_gate_buyer_receipt_list(int(offer_id))
+    if 0 <= int(receipt_index) < len(items):
+        receipt = items[int(receipt_index)]
+    if receipt.get("attachment_removed_at"):
+        return
     mids = receipt.get("reviewer_notify_mids") or {}
     if not isinstance(mids, dict):
         return
@@ -2188,18 +2336,9 @@ async def _sync_buyer_receipt_reviewer_messages(
         receipt=receipt,
         confirmed=bool(int(receipt.get("reviewer_received_at") or 0)),
     )
-    confirmed = bool(int(receipt.get("reviewer_received_at") or 0))
-    gate = deal_gate_get(int(offer_id)) or {}
-    finished = (
-        int(gate.get("buyer_toman_settled_at") or 0) > 0
-        and int(gate.get("seller_eur_account_sent_at") or 0) > 0
-    )
-    markup = (
-        None if confirmed and finished
-        else _buyer_toman_received_reviewer_keyboard(offer_id, receipt_index, receipt)
-    )
+    markup = _buyer_receipt_copy_markup(offer_id, receipt_index, receipt)
     media_type = (receipt.get("type") or "text").strip().lower()
-    for chat_id, message_id in mids.items():
+    for chat_id, message_id in list(mids.items()):
         try:
             if media_type in {"photo", "document"}:
                 await bot.edit_message_caption(
@@ -2219,6 +2358,8 @@ async def _sync_buyer_receipt_reviewer_messages(
                     reply_markup=markup,
                 )
         except Exception as exc:
+            if isinstance(exc, BadRequest) and "message is not modified" in str(exc).lower():
+                continue
             logger.warning(
                 "deal_buyer_receipt: reviewer message sync failed "
                 "chat=%s offer=%s receipt=%s: %s",
@@ -2227,17 +2368,31 @@ async def _sync_buyer_receipt_reviewer_messages(
                 receipt_index,
                 exc,
             )
-            if 'message to edit not found' in str(exc).lower():
+            if isinstance(exc, BadRequest) and "message to edit not found" in str(exc).lower():
                 try:
-                    if media_type in {'photo', 'document'} and receipt.get('file_id'):
-                        sender = bot.send_photo if media_type == 'photo' else bot.send_document
-                        replacement = await sender(int(chat_id), receipt['file_id'], caption=_photo_caption_html(body), parse_mode=ParseMode.HTML, reply_markup=markup)
-                    else:
-                        replacement = await bot.send_message(int(chat_id), body, parse_mode=ParseMode.HTML, reply_markup=markup)
-                    mids[chat_id] = int(replacement.message_id)
-                    deal_gate_update_buyer_receipt(offer_id, receipt_index, reviewer_notify_mids=mids)
+                    current = deal_gate_buyer_receipt_list(int(offer_id))
+                    if not 0 <= int(receipt_index) < len(current):
+                        continue
+                    fresh = current[int(receipt_index)]
+                    if fresh.get("attachment_removed_at"):
+                        continue
+                    await _deliver_buyer_receipt_reviewer_copy(
+                        bot, chat_id=int(chat_id), offer_id=offer_id,
+                        receipt_index=receipt_index,
+                    )
                 except Exception:
-                    logger.exception('Reviewer receipt replacement failed offer=%s', offer_id)
+                    logger.exception("Reviewer receipt replacement failed offer=%s", offer_id)
+
+
+async def _sync_buyer_receipt_reviewer_messages(
+    bot, *, offer_id: int, receipt_index: int, receipt: dict
+) -> None:
+    """Edit the canonical receipt copies; recreate only definitely deleted ones."""
+    key = (int(offer_id), int(receipt_index))
+    async with _buyer_receipt_copy_locks.setdefault(key, asyncio.Lock()):
+        await _sync_buyer_receipt_reviewer_messages_locked(
+            bot, offer_id=offer_id, receipt_index=receipt_index, receipt=receipt
+        )
 
 
 async def _broadcast_buyer_receipt_confirmation(
@@ -2321,7 +2476,7 @@ async def _delete_replaced_buyer_receipt_messages(
 async def _confirm_and_announce_buyer_receipt(
     bot, *, offer_id: int, receipt_index: int, reviewer_id: int
 ) -> tuple[dict | None, bool]:
-    """Persist one confirmation, synchronize copies, and broadcast it once."""
+    """Persist one confirmation and update the existing receipt copies in place."""
     items = deal_gate_buyer_receipt_list(int(offer_id))
     if 0 <= int(receipt_index) < len(items) and items[int(receipt_index)].get("attachment_removed_at"):
         return None, False
@@ -2337,13 +2492,6 @@ async def _confirm_and_announce_buyer_receipt(
             receipt_index=int(receipt_index),
             receipt=receipt,
         )
-        if changed:
-            await _broadcast_buyer_receipt_confirmation(
-                bot,
-                offer_id=int(offer_id),
-                receipt_index=int(receipt_index),
-                receipt=receipt,
-            )
     except Exception:
         logger.exception("Receipt notification failed after confirmation offer=%s", offer_id)
     return receipt, changed
@@ -2497,60 +2645,45 @@ async def _notify_buyer_toman_receipt_reviewers(
     bot, *, offer_id: int, gate: dict, receipt_index: int, entry_type: str,
     text: str = "", file_id: str = "",
 ) -> None:
-    """Send a private receipt copy to narrowly-authorized payment reviewers."""
+    """Keep one tracked receipt copy for each authorized payment reviewer."""
     reviewer_ids = {
         int(value) for value in (DEAL_RECEIPT_REVIEWER_IDS or []) if int(value) > 0
     } - {int(value) for value in (ADMIN_IDS or [])}
     if not reviewer_ids:
         return
-    receipts = deal_gate_buyer_receipt_list(int(offer_id))
-    receipt = (
-        receipts[int(receipt_index)]
-        if 0 <= int(receipt_index) < len(receipts)
-        else {"type": entry_type, "text": text, "file_id": file_id}
-    )
-    body = _buyer_receipt_reviewer_body(
-        offer_id=offer_id,
-        receipt_index=receipt_index,
-        receipt=receipt,
-        confirmed=False,
-    )
-    markup = _buyer_toman_received_reviewer_keyboard(offer_id, receipt_index, receipt)
-    for reviewer_id in reviewer_ids:
-        try:
-            sent = None
-            if entry_type == "document" and file_id:
-                sent = await bot.send_document(
-                    reviewer_id, file_id, caption=_photo_caption_html(body),
-                    parse_mode=ParseMode.HTML, reply_markup=markup,
-                )
-            elif entry_type == "photo" and file_id:
-                sent = await bot.send_photo(
-                    reviewer_id, file_id, caption=_photo_caption_html(body),
-                    parse_mode=ParseMode.HTML, reply_markup=markup,
-                )
-            else:
-                sent = await bot.send_message(
-                    reviewer_id, body, parse_mode=ParseMode.HTML,
-                    reply_markup=markup, disable_web_page_preview=True,
-                )
-            if sent and int(getattr(sent, "message_id", 0) or 0) > 0:
+    key = (int(offer_id), int(receipt_index))
+    async with _buyer_receipt_copy_locks.setdefault(key, asyncio.Lock()):
+        receipts = deal_gate_buyer_receipt_list(int(offer_id))
+        if not 0 <= int(receipt_index) < len(receipts):
+            return
+        receipt = receipts[int(receipt_index)]
+        if receipt.get("attachment_removed_at"):
+            return
+        await _sync_buyer_receipt_reviewer_messages_locked(
+            bot, offer_id=offer_id, receipt_index=receipt_index, receipt=receipt
+        )
+        for reviewer_id in reviewer_ids:
+            try:
                 current = deal_gate_buyer_receipt_list(int(offer_id))
-                if 0 <= int(receipt_index) < len(current):
-                    mids = current[int(receipt_index)].get("reviewer_notify_mids") or {}
-                    if not isinstance(mids, dict):
-                        mids = {}
-                    mids[str(int(reviewer_id))] = int(sent.message_id)
-                    deal_gate_update_buyer_receipt(
-                        int(offer_id),
-                        int(receipt_index),
-                        reviewer_notify_mids=mids,
-                    )
-        except Exception as exc:
-            logger.warning(
-                "deal_buyer_receipt: reviewer notify failed reviewer=%s offer=%s: %s",
-                reviewer_id, offer_id, exc,
-            )
+                if not 0 <= int(receipt_index) < len(current):
+                    return
+                receipt = current[int(receipt_index)]
+                if receipt.get("attachment_removed_at"):
+                    return
+                mids = receipt.get("reviewer_notify_mids") or {}
+                if isinstance(mids, dict) and int(
+                    mids.get(str(reviewer_id)) or mids.get(reviewer_id) or 0
+                ) > 0:
+                    continue
+                await _deliver_buyer_receipt_reviewer_copy(
+                    bot, chat_id=reviewer_id, offer_id=offer_id,
+                    receipt_index=receipt_index,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "deal_buyer_receipt: reviewer notify failed reviewer=%s offer=%s: %s",
+                    reviewer_id, offer_id, exc,
+                )
 
 
 def _deal_gate_allows_party_receipts(gate: dict | None) -> bool:
@@ -2761,6 +2894,8 @@ async def _auto_account_buyer_receipt(
         "ready_for_review",
         "rejected",
         "duplicate",
+        "panel_failed",
+        "panel_unknown",
     ):
         return
     deal_gate_update_buyer_receipt(
@@ -2817,6 +2952,7 @@ async def _auto_account_buyer_receipt(
                 "submitting",
                 "submitted",
                 "panel_failed",
+                "panel_unknown",
             }
         )
         remaining_before = max(0, expected_rial - recognized_total)
@@ -2852,6 +2988,7 @@ async def _auto_account_buyer_receipt(
                 "submitted",
                 "processing",
                 "panel_failed",
+                "panel_unknown",
             )
             for index, item in enumerate(deal_gate_buyer_receipt_list(oid))
         )
@@ -2914,7 +3051,7 @@ async def _auto_account_buyer_receipt(
         )
         _receipt_accounting_log(
             oid,
-            "فیش خوانده شد و منتظر تایید ادمین برای ثبت در سایت است",
+            "فیش آماده است؛ پس از تأیید دریافت توسط ویور یا ادمین، ورودی خودکار ثبت می‌شود",
             from_role="system",
         )
     except Exception as exc:
@@ -2987,35 +3124,41 @@ async def _handle_admin_receipt_review(
 
 
 async def _submit_confirmed_buyer_receipts_to_iran(
-    context: ContextTypes.DEFAULT_TYPE, *, gate: dict
+    context: ContextTypes.DEFAULT_TYPE, *, gate: dict, receipt_index: int | None = None
 ) -> tuple[bool, str]:
     """Submit each confirmed buyer receipt once as an Iran-panel income."""
     oid = int(gate.get("offer_id") or 0)
     receipts = deal_gate_buyer_receipt_list(oid)
     submitted = 0
-    for receipt_index, receipt in enumerate(receipts):
+    if receipt_index is not None and not 0 <= receipt_index < len(receipts):
+        return False, "فیش پیدا نشد."
+    for index, receipt in enumerate(receipts):
+        if receipt_index is not None and index != receipt_index:
+            continue
         status = (receipt.get("accounting_status") or "").strip().lower()
         if receipt.get("attachment_removed_at") or status in {"duplicate", "rejected", "submitted"}:
             continue
         if not int(receipt.get("reviewer_received_at") or 0):
             return False, "همهٔ فیش‌ها هنوز تأیید دریافت نشده‌اند."
+        if status in {"panel_unknown", "panel_failed", "submitting"}:
+            return False, "نتیجهٔ ثبت این فیش در سایت نیازمند بررسی است؛ برای جلوگیری از ثبت تکراری دوباره ارسال نشد."
         missing = [label for key, label in (('bank_name', 'بانک مبدأ'), ('transfer_type', 'نوع انتقال'), ('jdate', 'تاریخ')) if not receipt.get(key)]
         if int(receipt.get('amount_rial') or 0) <= 0:
             missing.append('مبلغ')
         if missing:
             return (
                 False,
-                f"فیش {receipt_index + 1}: اطلاعات ناقص — "
+                f"فیش {index + 1}: اطلاعات ناقص — "
                 + '، '.join(missing)
-                + ". از «مدیریت فیش‌ها» فیش کامل را دوباره ارسال کنید.",
+                + ". مشخصات را از «مدیریت فیش‌ها» تکمیل کنید؛ ثبت خودکار انجام می‌شود.",
             )
-        item = deal_gate_claim_buyer_receipt_submission(oid, receipt_index)
+        item = deal_gate_claim_buyer_receipt_submission(oid, index)
         if not item:
             refreshed = deal_gate_buyer_receipt_list(oid)
-            current = refreshed[receipt_index] if receipt_index < len(refreshed) else {}
+            current = refreshed[index] if index < len(refreshed) else {}
             if (current.get("accounting_status") or "").strip().lower() == "submitted":
                 continue
-            return False, f"فیش {receipt_index + 1} برای ثبت حسابداری آماده نیست؛ وضعیت: {current.get('accounting_status') or 'نامشخص'}."
+            return False, f"فیش {index + 1} برای ثبت حسابداری آماده نیست؛ وضعیت: {current.get('accounting_status') or 'نامشخص'}."
         payload = {
             "iran_amount": int(item.get("amount_rial") or 0),
             "bank_name": item.get("bank_name") or "",
@@ -3037,27 +3180,27 @@ async def _submit_confirmed_buyer_receipts_to_iran(
             # Do not let an integration failure reach the global handler,
             # which only has enough context to display the generic retry
             # message.  The settlement remains pending and can be retried.
-            logger.exception("Iran-panel income submission failed offer=%s receipt=%s", oid, receipt_index)
+            logger.exception("Iran-panel income submission failed offer=%s receipt=%s", oid, index)
             deal_gate_update_buyer_receipt(
-                oid, receipt_index, accounting_status="panel_failed",
+                oid, index, accounting_status="panel_unknown",
                 panel_error="submission_exception",
             )
             _receipt_accounting_log(
                 oid, "ارتباط با سایت حسابداری هنگام تأیید تومان ناموفق بود",
                 from_role="system",
             )
-            return False, "ارتباط با سایت حسابداری ناموفق بود؛ وضعیت پرداخت تغییر نکرد. دوباره تلاش کنید."
+            return False, "نتیجهٔ ثبت سایت نامشخص است؛ دریافت وجه محفوظ است و ثبت دوباره انجام نمی‌شود."
         if not ok:
             deal_gate_update_buyer_receipt(
-                oid, receipt_index, accounting_status="panel_failed",
+                oid, index, accounting_status="panel_unknown",
                 panel_error=str(panel_message)[:300],
             )
             _receipt_accounting_log(
                 oid, "ثبت سایت پس از تأیید دریافت تومان ناموفق بود", from_role="system"
             )
-            return False, "ثبت فیش در سایت ایران ناموفق بود؛ دوباره تلاش کنید."
+            return False, "نتیجهٔ ثبت سایت نامشخص است؛ دریافت وجه محفوظ است و ثبت دوباره انجام نمی‌شود."
         deal_gate_update_buyer_receipt(
-            oid, receipt_index, accounting_status="submitted",
+            oid, index, accounting_status="submitted",
             panel_submitted_at=int(time.time()), panel_error="",
         )
         submitted += 1
@@ -4322,6 +4465,20 @@ async def _deal_admin_toman_settled_callback_locked(
         if selected.get('attachment_removed_at'):
             await q.answer('این فیش حذف شده است.', show_alert=True)
             return
+        delivery = selected.get("reviewer_notify_delivery") or {}
+        state = delivery.get(str(uid)) if isinstance(delivery, dict) else None
+        clicked_mid = int(getattr(q.message, "message_id", 0) or 0)
+        if (
+            isinstance(state, dict) and state.get("status") in {"sending", "unknown"}
+            and clicked_mid > 0 and int(getattr(q.message, "chat_id", 0) or 0) == uid
+        ):
+            async with _buyer_receipt_copy_locks.setdefault((oid, receipt_index), asyncio.Lock()):
+                current = deal_gate_buyer_receipt_list(oid)[receipt_index]
+                mids = dict(current.get("reviewer_notify_mids") or {})
+                states = dict(current.get("reviewer_notify_delivery") or {})
+                mids[str(uid)] = clicked_mid
+                states[str(uid)] = {"status": "delivered", "at": int(time.time()), "message_id": clicked_mid}
+                deal_gate_update_buyer_receipt(oid, receipt_index, reviewer_notify_mids=mids, reviewer_notify_delivery=states)
         if (len(parts) == 5 and parts[4] != str(int(selected.get('amount_rial') or 0))) or (len(parts) == 4 and selected.get('amount_edit_history')):
             await q.answer('مبلغ تغییر کرده است؛ پیام به‌روز را بررسی کنید.', show_alert=True)
             await _sync_buyer_receipt_reviewer_messages(context.bot, offer_id=oid, receipt_index=receipt_index, receipt=selected)
@@ -4361,6 +4518,23 @@ async def _deal_admin_toman_settled_callback_locked(
             )
         except Exception:
             pass
+        accounting_ok, accounting_message = await _submit_confirmed_buyer_receipts_to_iran(
+            context, gate=deal_gate_get(oid) or gate, receipt_index=receipt_index
+        )
+        if not accounting_ok:
+            try:
+                await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
+            except Exception:
+                logger.exception("Admin refresh failed after receipt accounting offer=%s", oid)
+            await q.answer(accounting_message, show_alert=True)
+            return
+        try:
+            await _sync_buyer_receipt_reviewer_messages(
+                context.bot, offer_id=oid, receipt_index=receipt_index,
+                receipt=deal_gate_buyer_receipt_list(oid)[receipt_index],
+            )
+        except Exception:
+            logger.exception("Receipt status refresh failed after accounting offer=%s", oid)
         receipts = deal_gate_buyer_receipt_list(oid)
         expected_rial, sent_rial, pending_count, unreadable_count = (
             _buyer_toman_reviewer_totals(gate, receipts)
@@ -4371,10 +4545,11 @@ async def _deal_admin_toman_settled_callback_locked(
                 f"بررسی‌کننده {uid} دریافت فیش {receipt_index + 1} را تأیید کرد",
                 from_role="admin",
             )
-            try:
-                await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
-            except Exception:
-                logger.exception("Admin refresh failed after reviewer confirmation offer=%s", oid)
+            if pending_count or unreadable_count or expected_rial <= 0 or sent_rial != expected_rial:
+                try:
+                    await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
+                except Exception:
+                    logger.exception("Admin refresh failed after reviewer confirmation offer=%s", oid)
         if unreadable_count:
             await q.answer(
                 f"این فیش تأیید شد؛ مبلغ {unreadable_count} فیش هنوز قابل تطبیق نیست.",
@@ -4459,11 +4634,7 @@ async def _deal_admin_toman_settled_callback_locked(
             await sync_deal_admin_notification(context.bot, oid, deal_complete=True)
         except Exception:
             logger.exception("Could not refresh admin deal after failed settlement offer=%s", oid)
-        retry_hint = (
-            " از دکمهٔ ادامهٔ ثبت دوباره تلاش کنید."
-            if is_reviewer else " از دکمهٔ تومان نشست دوباره تلاش کنید."
-        )
-        await q.answer(accounting_message + retry_hint, show_alert=True)
+        await q.answer(accounting_message, show_alert=True)
         return
     now = int(time.time())
     upsert_kw: dict = {

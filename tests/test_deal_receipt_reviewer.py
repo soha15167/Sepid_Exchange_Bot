@@ -168,13 +168,20 @@ class ReceiptReviewerTests(unittest.IsolatedAsyncioTestCase):
         bot = SimpleNamespace(
             send_photo=AsyncMock(return_value=SimpleNamespace(message_id=55))
         )
-        receipts = [{}, {}, {"type": "photo", "amount_rial": 120_000_000}]
+        receipts = [{}, {}, {
+            "type": "photo", "file_id": "telegram-file", "amount_rial": 120_000_000,
+        }]
+
+        def persist_receipt(_oid, index, **fields):
+            receipts[index].update(fields)
+            return dict(receipts[index])
+
         with (
             patch.object(deal_gate, "DEAL_RECEIPT_REVIEWER_IDS", [7001, 7002]),
             patch.object(deal_gate, "ADMIN_IDS", [7002]),
             patch.object(deal_gate, "get_advert_offer_joined", return_value={"seq_in_advert": 9}),
             patch.object(deal_gate, "deal_gate_buyer_receipt_list", return_value=receipts),
-            patch.object(deal_gate, "deal_gate_update_buyer_receipt") as update_receipt,
+            patch.object(deal_gate, "deal_gate_update_buyer_receipt", side_effect=persist_receipt) as update_receipt,
         ):
             await deal_gate._notify_buyer_toman_receipt_reviewers(
                 bot,
@@ -191,9 +198,12 @@ class ReceiptReviewerTests(unittest.IsolatedAsyncioTestCase):
         button = bot.send_photo.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
         self.assertEqual(button.callback_data, "adm|tomset|41|2|120000000")
         self.assertIn("۱۲۰٬۰۰۰٬۰۰۰", bot.send_photo.await_args.kwargs["caption"])
-        update_receipt.assert_called_once_with(
-            41, 2, reviewer_notify_mids={"7001": 55}
-        )
+        self.assertEqual(update_receipt.call_count, 2)
+        first = update_receipt.call_args_list[0]
+        self.assertEqual(first.kwargs["reviewer_notify_delivery"]["7001"]["status"], "sending")
+        tracked = update_receipt.call_args_list[1]
+        self.assertEqual(tracked.kwargs["reviewer_notify_mids"], {"7001": 55})
+        self.assertEqual(tracked.kwargs["reviewer_notify_delivery"]["7001"]["status"], "delivered")
 
     def test_multi_receipt_totals_exclude_duplicate_and_rejected_uploads(self):
         from handlers import deal_gate

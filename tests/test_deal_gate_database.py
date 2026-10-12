@@ -139,11 +139,14 @@ class DealGateDatabaseTests(unittest.TestCase):
 
     def test_reviewed_receipt_can_be_claimed_only_once(self):
         self._create_gate()
+        db.deal_gate_upsert(offer_id=101, advert_rowid=3196, buyer_telegram_id=10,
+            seller_telegram_id=20, gate_status="completed")
         db.deal_gate_append_buyer_receipt(101, entry_type="photo", file_id="receipt")
         db.deal_gate_update_buyer_receipt(
             101, 0, accounting_status="ready_for_review",
             amount_rial=100_000_000, bank_name="ملی",
         )
+        db.deal_gate_confirm_buyer_receipt_received(101, 0, 7001)
         first = db.deal_gate_claim_buyer_receipt_submission(101, 0)
         second = db.deal_gate_claim_buyer_receipt_submission(101, 0)
         self.assertIsNotNone(first)

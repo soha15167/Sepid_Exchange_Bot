@@ -2947,6 +2947,7 @@ def deal_gate_update_buyer_receipt(
         "reviewer_received_at",
         "reviewer_received_by",
         "reviewer_notify_mids",
+        "reviewer_notify_delivery",
     }
     clean = {key: value for key, value in fields.items() if key in allowed}
     if not clean:
@@ -3030,17 +3031,18 @@ def deal_gate_claim_buyer_receipt_submission(
     or it is not ready. This makes the admin approval idempotent.
     """
     import json
+    from contextlib import closing
 
     oid = int(offer_id)
     idx = int(receipt_index)
-    with sqlite3.connect(DB_PATH) as conn:
+    with closing(sqlite3.connect(DB_PATH, timeout=20)) as conn, conn:
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT buyer_receipt_log FROM offer_deal_gates WHERE offer_id = ?",
+            "SELECT buyer_receipt_log, gate_status FROM offer_deal_gates WHERE offer_id = ?",
             (oid,),
         ).fetchone()
-        if not row:
+        if not row or (row["gate_status"] or "").strip().lower() != "completed":
             return None
         try:
             items = json.loads(row["buyer_receipt_log"] or "[]")
@@ -3051,9 +3053,10 @@ def deal_gate_claim_buyer_receipt_submission(
         item = items[idx] if isinstance(items[idx], dict) else {}
         if item.get("attachment_removed_at"):
             return None
+        if not int(item.get("reviewer_received_at") or 0):
+            return None
         if (item.get("accounting_status") or "") not in {
             "ready_for_review",
-            "panel_failed",
         }:
             return None
         if int(item.get("amount_rial") or 0) <= 0 or not str(

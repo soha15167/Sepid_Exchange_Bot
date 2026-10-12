@@ -30,7 +30,7 @@ async def callback(update, context):
             raise ValueError()
         item = items[index]
         gate = deal_gate_get(oid)
-        if not gate or int(gate.get('buyer_toman_settled_at') or 0) > 0 or item.get('attachment_removed_at') or item.get('accounting_status') in {'submitted','submitting','panel_failed','duplicate','rejected'}:
+        if not gate or int(gate.get('buyer_toman_settled_at') or 0) > 0 or item.get('attachment_removed_at') or item.get('accounting_status') in {'submitted','submitting','panel_failed','panel_unknown','duplicate','rejected'}:
             raise ValueError()
     except (IndexError, ValueError):
         await q.answer('فیش حذف/ثبت شده یا نیازمند بررسی حسابداری است؛ ویرایش مستقیم مجاز نیست.', show_alert=True)

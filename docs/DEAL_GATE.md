@@ -64,6 +64,10 @@ flowchart TB
 
 **Party confirmations:** Either configured receipt reviewer can advance the Toman step once all active receipts are confirmed, their total exactly matches the deal, and their accounting submissions succeed. A failed submission or EUR-account delivery keeps reviewer continuation controls available. Delivery failures preserve the recorded settlement; retrying does not submit income again.
 
+Each received Toman installment is registered automatically as income immediately after its reviewer confirmation. Full-deal amount checks still control EUR-account delivery. An admin's received-payment confirmation registers the active confirmed receipts automatically as well. Completing metadata for already received money also triggers registration, without another received-payment or site approval. Uncertain submissions, including legacy `panel_failed`, cannot be blindly retried or reset through amount/metadata edits.
+
+Reviewer receipt copies are edited in place on confirmation and site registration. Re-uploading the same receipt reuses the same tracked copy. Missing messages are replaced only after a definite not-found response; uncertain deliveries are retained so retries cannot create untracked copies.
+
 The buyer's explicit full-EUR button atomically confirms the current active receipt set and schedules the viewer payout without another admin confirmation. Its receipt revision expires when receipts change. Existing per-receipt buttons first display the explicit full-EUR confirmation; archived receipts cannot be confirmed.
 
 ---

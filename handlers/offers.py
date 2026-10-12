@@ -2333,6 +2333,11 @@ def _buyer_toman_receipt_admin_line_html(
         card_sent = _buyer_toman_card_delivered(oid, buyer_id)
     if not card_sent and not items:
         return ""
+    photo_items = [r for r in items if (r.get("type") or "") == "photo"]
+    text_items = [
+        r for r in items
+        if (r.get("type") or "") == "text" and (r.get("text") or "").strip()
+    ]
     if not items:
         blk = (
             f"{_RTL}📎 <b>فیش واریز تومان:</b> ⏳ ثبت نشده"
@@ -2346,7 +2351,7 @@ def _buyer_toman_receipt_admin_line_html(
     review_items = [
         item
         for item in items
-        if not item.get("attachment_removed_at") and (item.get("accounting_status") or "") in ("review", "ready_for_review", "panel_failed")
+        if not item.get("attachment_removed_at") and (item.get("accounting_status") or "") in ("review", "ready_for_review", "panel_failed", "panel_unknown")
     ]
     if submitted_items:
         submitted_rial = sum(int(item.get("amount_rial") or 0) for item in submitted_items)
@@ -2367,7 +2372,7 @@ def _buyer_toman_receipt_admin_line_html(
     if review_items:
         blk += f"{_RTL}⚠️ <b>نیازمند بررسی ثبت سایت:</b> {len(review_items)} فیش\n"
         latest = review_items[-1]
-        amount = int(latest.get("amount_rial") or 0)
+        amount = int(latest.get("recognized_amount_rial") or latest.get("amount_rial") or 0)
         bank = html_module.escape(str(latest.get("bank_name") or "نامشخص"))
         transfer = html_module.escape(str(latest.get("transfer_type") or "نامشخص"))
         jdate = html_module.escape(str(latest.get("jdate") or "نامشخص"))
@@ -2379,8 +2384,12 @@ def _buyer_toman_receipt_admin_line_html(
         warnings = latest.get("recognition_warnings") or []
         if warnings:
             blk += f"{_RTL}⚠️ <b>هشدار OCR:</b> {html_module.escape('؛ '.join(map(str, warnings)))}\n"
-        if (latest.get("accounting_status") or "") in {"ready_for_review", "panel_failed"}:
-            blk += f"{_RTL}⏳ <b>در سایت ثبت نشده؛ منتظر تایید ادمین است.</b>\n"
+        if (latest.get("accounting_status") or "") == "panel_unknown":
+            blk += f"{_RTL}⚠️ <b>نتیجهٔ ثبت سایت نامشخص است؛ ثبت دوباره انجام نمی‌شود.</b>\n"
+        elif int(latest.get("reviewer_received_at") or 0):
+            blk += f"{_RTL}⏳ <b>دریافت تأیید شده؛ ثبت خودکار سایت در حال پیگیری است.</b>\n"
+        elif (latest.get("accounting_status") or "") in {"ready_for_review", "panel_failed"}:
+            blk += f"{_RTL}⏳ <b>پس از تأیید دریافت توسط ویور یا ادمین، خودکار در سایت ثبت می‌شود.</b>\n"
     active_review_entries = [
         (receipt_index, item)
         for receipt_index, item in enumerate(items)
@@ -2421,9 +2430,9 @@ def _buyer_toman_receipt_admin_line_html(
                 f"{_RTL}  • <b>فیش {receipt_index + 1}:</b> {amount_text} · {status_text}\n"
             )
     if int(gate.get("buyer_toman_settled_at") or 0) > 0:
-        blk += f"{_RTL}💵 <b>تومان نشست:</b> ✅ تأیید ادمین\n"
+        blk += f"{_RTL}💵 <b>تومان نشست:</b> ✅ دریافت تأیید شد\n"
     elif items or card_sent:
-        blk += f"{_RTL}💵 <b>تومان نشست:</b> ⏳ در انتظار تأیید ادمین\n"
+        blk += f"{_RTL}💵 <b>تومان نشست:</b> ⏳ در انتظار تکمیل دریافت\n"
     if not items:
         return blk
     lines = [blk.rstrip("\n")]
