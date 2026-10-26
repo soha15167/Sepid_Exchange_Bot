@@ -3027,8 +3027,9 @@ def deal_gate_claim_buyer_receipt_submission(
 ) -> dict | None:
     """Atomically claim one reviewed receipt for panel submission.
 
-    Returning ``None`` means another click already claimed it, it was rejected,
-    or it is not ready. This makes the admin approval idempotent.
+    Received money can still need bookkeeping after settlement or deal closure.
+    Returning ``None`` means another worker already claimed it, the deal or
+    receipt is ineligible, or its previous submission outcome is uncertain.
     """
     import json
     from contextlib import closing
@@ -3039,10 +3040,16 @@ def deal_gate_claim_buyer_receipt_submission(
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT buyer_receipt_log, gate_status FROM offer_deal_gates WHERE offer_id = ?",
+            "SELECT buyer_receipt_log, gate_status, buyer_toman_settled_at "
+            "FROM offer_deal_gates WHERE offer_id = ?",
             (oid,),
         ).fetchone()
-        if not row or (row["gate_status"] or "").strip().lower() != "completed":
+        if not row:
+            return None
+        stage = (row["gate_status"] or "").strip().lower()
+        if stage != "completed" and not (
+            stage == "closed" and int(row["buyer_toman_settled_at"] or 0) > 0
+        ):
             return None
         try:
             items = json.loads(row["buyer_receipt_log"] or "[]")
@@ -3053,7 +3060,7 @@ def deal_gate_claim_buyer_receipt_submission(
         item = items[idx] if isinstance(items[idx], dict) else {}
         if item.get("attachment_removed_at"):
             return None
-        if not int(item.get("reviewer_received_at") or 0):
+        if int(item.get("reviewer_received_at") or 0) <= 0:
             return None
         if (item.get("accounting_status") or "") not in {
             "ready_for_review",
@@ -3072,6 +3079,72 @@ def deal_gate_claim_buyer_receipt_submission(
         )
         conn.commit()
         return dict(item)
+
+
+def deal_gate_buyer_receipt_accounting_batch(
+    *, after_offer_id: int = 0, limit: int = 50
+) -> tuple[list[dict], int]:
+    """Scan a bounded page for received payments needing bookkeeping or repair.
+
+    Retain the returned cursor between sweeps; zero means the end was reached.
+    Advancing past ineligible receipts prevents an incomplete old deal from
+    starving later ones. Uncertain submissions qualify only when their payment
+    milestone needs repair; callers must still use the atomic submission claim.
+    """
+    import json
+
+    lim = max(1, min(int(limit), 100))
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT * FROM offer_deal_gates
+            WHERE offer_id > ?
+              AND (
+                LOWER(TRIM(gate_status)) = 'completed'
+                OR (
+                    LOWER(TRIM(gate_status)) = 'closed'
+                    AND CAST(COALESCE(buyer_toman_settled_at, 0) AS INTEGER) > 0
+                )
+              )
+            ORDER BY offer_id ASC
+            LIMIT ?
+            """,
+            (max(0, int(after_offer_id)), lim),
+        ).fetchall()
+    gates: list[dict] = []
+    for row in rows:
+        stage = (row["gate_status"] or "").strip().lower()
+        settled = int(row["buyer_toman_settled_at"] or 0) > 0
+        if (
+            stage == "completed" and settled
+            and int(row["seller_eur_account_sent_at"] or 0) <= 0
+        ):
+            gates.append(dict(row))
+            continue
+        try:
+            receipts = json.loads(row["buyer_receipt_log"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(receipts, list):
+            continue
+        for receipt in receipts:
+            if (
+                isinstance(receipt, dict)
+                and not receipt.get("attachment_removed_at")
+                and int(receipt.get("reviewer_received_at") or 0) > 0
+                and (receipt.get("accounting_status") or "").strip().lower()
+                not in {"duplicate", "rejected"}
+                and (
+                    (stage == "completed" and not settled)
+                    or (receipt.get("accounting_status") or "").strip().lower()
+                    in {"review", "ready_for_review"}
+                )
+            ):
+                gates.append(dict(row))
+                break
+    next_cursor = int(rows[-1]["offer_id"]) if len(rows) == lim else 0
+    return gates, next_cursor
 
 
 def deal_gate_reject_buyer_receipt(offer_id: int, receipt_index: int) -> dict | None:
@@ -4159,18 +4232,30 @@ def deal_gate_list_awaiting_admin_toman_receipt() -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def _viewer_toman_euro_confirmed(gate: dict) -> bool:
+    items = _deal_gate_seller_receipt_list_raw(gate)
+    active = [item for item in items if isinstance(item, dict) and not item.get("attachment_removed_at")]
+    return bool(active) and all(int(item.get("buyer_confirmed_at") or 0) > 0 for item in active)
+
+
 def deal_gate_claim_viewer_toman_payment(offer_id: int, viewer_id: int) -> bool:
     """Atomically assign the viewer payout task to one reviewer only."""
     oid, uid = int(offer_id), int(viewer_id)
     now = int(time.time())
     with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM offer_deal_gates WHERE offer_id = ?", (oid,)).fetchone()
+        if not row or not _viewer_toman_euro_confirmed(dict(row)):
+            return False
         cur = conn.execute(
             """
             UPDATE offer_deal_gates
             SET viewer_toman_claimed_by = ?, viewer_toman_claimed_at = ?
             WHERE offer_id = ?
-              AND COALESCE(viewer_toman_due_at, 0) > 0
-              AND COALESCE(viewer_toman_claimed_by, 0) = 0
+              AND CAST(COALESCE(viewer_toman_due_at, 0) AS INTEGER) > 0
+              AND CAST(COALESCE(viewer_toman_claimed_by, 0) AS INTEGER) = 0
+              AND CAST(COALESCE(seller_toman_settled_at, 0) AS INTEGER) = 0
               AND LOWER(TRIM(COALESCE(gate_status, ''))) = 'completed'
             """,
             (uid, now, oid),
@@ -4194,11 +4279,17 @@ def deal_gate_append_viewer_toman_receipt(
     oid, uid = int(offer_id), int(viewer_id)
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT viewer_toman_claimed_by, viewer_toman_receipt_log FROM offer_deal_gates WHERE offer_id = ?",
+            "SELECT viewer_toman_claimed_by, viewer_toman_receipt_log, gate_status, "
+            "seller_toman_settled_at FROM offer_deal_gates WHERE offer_id = ?",
             (oid,),
         ).fetchone()
-        if not row or int(row["viewer_toman_claimed_by"] or 0) != uid:
+        if (
+            not row or int(row["viewer_toman_claimed_by"] or 0) != uid
+            or (row["gate_status"] or "").strip().lower() != "completed"
+            or int(row["seller_toman_settled_at"] or 0) > 0
+        ):
             return None
         try:
             items = json.loads(row["viewer_toman_receipt_log"] or "[]")
@@ -4238,7 +4329,7 @@ def deal_gate_list_due_viewer_toman_payments(now: int | None = None) -> list[dic
             """,
             (ts,),
         ).fetchall()
-    return [dict(row) for row in rows]
+    return [dict(row) for row in rows if _viewer_toman_euro_confirmed(dict(row))]
 
 
 def deal_gate_lookup_for_admin(

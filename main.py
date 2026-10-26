@@ -562,6 +562,23 @@ def _setup_deal_delivery_retry_job(application: Application) -> None:
     )
 
 
+def _setup_received_buyer_receipt_job(application: Application) -> None:
+    """Ledger latency must not delay critical Telegram delivery retries."""
+    from handlers.deal_gate import run_received_buyer_receipt_sweep
+
+    if not application.job_queue:
+        return
+
+    async def _sweep(context):
+        recovered = await run_received_buyer_receipt_sweep(context.bot)
+        if recovered:
+            logger.info("received_buyer_receipt_sweep: updated %s deals", recovered)
+
+    application.job_queue.run_repeating(
+        _sweep, interval=60, first=30, name="received_buyer_receipt_sweep"
+    )
+
+
 def _setup_deal_operations_jobs(application: Application) -> None:
     """Verified backups and privacy cleanup run quietly in the background."""
     if not application.job_queue:
@@ -1006,6 +1023,7 @@ def main():
         _setup_buyer_receipt_reviewer_reminder_job(app)
         _setup_viewer_toman_payment_job(app)
         _setup_deal_delivery_retry_job(app)
+        _setup_received_buyer_receipt_job(app)
         _setup_deal_operations_jobs(app)
         try:
             await _set_bot_command_menus(app.bot)

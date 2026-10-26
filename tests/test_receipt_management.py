@@ -102,14 +102,19 @@ class ReceiptManagementTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ok)
         claim.assert_not_called()
 
-    async def test_removal_reconciliation_advances_only_already_submitted_receipts(self):
-        gate = dict(offer_id=553, advert_rowid=3685, buyer_telegram_id=1, seller_telegram_id=2, gate_status='completed')
+    async def test_removal_reconciliation_uses_received_amount_independently_of_bookkeeping(self):
+        gate = dict(offer_id=553, advert_rowid=3685, buyer_telegram_id=1, seller_telegram_id=2,
+                    gate_status='completed', buyer_toman_card_sent_at=100)
         items = [dict(amount_rial=1000, accounting_status='submitted', reviewer_received_at=123), dict(attachment_removed_at=123)]
         context = SimpleNamespace(bot=AsyncMock())
-        with patch.object(deal_gate, 'deal_gate_get', return_value=gate), patch.object(deal_gate, 'deal_gate_buyer_receipt_list', return_value=items), patch.object(deal_gate, '_buyer_expected_rial', return_value=1000), patch.object(deal_gate, '_send_buyer_eur_account_to_seller', new_callable=AsyncMock, return_value=True) as send, patch.object(deal_gate, 'deal_gate_upsert') as save, patch.object(deal_gate, '_log'), patch('utils.deal_milestones.notify_toman_settled_buyer', new_callable=AsyncMock):
+        with patch.object(deal_gate, 'deal_gate_get', return_value=gate), patch.object(deal_gate, 'deal_gate_buyer_receipt_list', return_value=items), patch.object(deal_gate, '_buyer_expected_rial', return_value=1000), patch.object(deal_gate, '_send_buyer_eur_account_to_seller', new_callable=AsyncMock, return_value=True) as send, patch.object(deal_gate, 'deal_gate_upsert') as save, patch.object(deal_gate, '_log'), patch('utils.deal_milestones.notify_toman_settled_buyer', new_callable=AsyncMock), patch.object(deal_gate, '_refresh_admin_deal_after_payment_step', new_callable=AsyncMock), patch.object(deal_gate, '_sync_buyer_receipt_reviewer_messages', new_callable=AsyncMock):
             self.assertTrue(await deal_gate.reconcile_received_buyer_receipts(context, 553))
             self.assertTrue(save.call_args.kwargs['buyer_toman_settled_at'])
             send.reset_mock()
             items[0]['accounting_status'] = 'ready_for_review'
+            self.assertTrue(await deal_gate.reconcile_received_buyer_receipts(context, 553))
+            send.assert_awaited_once()
+            send.reset_mock()
+            items[0]['reviewer_received_at'] = 0
             self.assertFalse(await deal_gate.reconcile_received_buyer_receipts(context, 553))
             send.assert_not_awaited()

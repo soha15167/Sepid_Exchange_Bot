@@ -2387,7 +2387,18 @@ def _buyer_toman_receipt_admin_line_html(
         if (latest.get("accounting_status") or "") == "panel_unknown":
             blk += f"{_RTL}⚠️ <b>نتیجهٔ ثبت سایت نامشخص است؛ ثبت دوباره انجام نمی‌شود.</b>\n"
         elif int(latest.get("reviewer_received_at") or 0):
-            blk += f"{_RTL}⏳ <b>دریافت تأیید شده؛ ثبت خودکار سایت در حال پیگیری است.</b>\n"
+            missing_fields = [
+                label for key, label in (
+                    ("bank_name", "بانک"), ("transfer_type", "نوع انتقال"), ("jdate", "تاریخ")
+                ) if not str(latest.get(key) or "").strip()
+            ]
+            if missing_fields:
+                blk += (
+                    f"{_RTL}⏳ <b>دریافت تأیید شده؛ برای ثبت سایت، "
+                    f"{'، '.join(missing_fields)} را در «مدیریت فیش‌ها» تکمیل کنید.</b>\n"
+                )
+            else:
+                blk += f"{_RTL}⏳ <b>دریافت تأیید شده؛ ثبت خودکار سایت در حال پیگیری است.</b>\n"
         elif (latest.get("accounting_status") or "") in {"ready_for_review", "panel_failed"}:
             blk += f"{_RTL}⏳ <b>پس از تأیید دریافت توسط ویور یا ادمین، خودکار در سایت ثبت می‌شود.</b>\n"
     active_review_entries = [
@@ -2684,7 +2695,7 @@ def _deal_admin_steps_checklist_html(gate: dict | None) -> str:
         ("ارسال اطلاعات حساب توسط طرفین", accounts_ok),
         ("ارسال کارت واریز تومان به خریدار", card_sent),
         ("واریز تومان و ارسال فیش توسط خریدار", buyer_rcpt_ok),
-        ("تأیید نشست تومان (ادمین)", toman_settled),
+        ("تأیید نشست تومان (بررسی‌کننده/ادمین)", toman_settled),
         ("ارسال حساب یورو خریدار به فروشنده", eur_account_sent),
         ("ارسال فیش یورو توسط فروشنده", seller_rcpt_ok),
         ("تأیید نشست یورو (خریدار/ادمین)", euro_confirmed),

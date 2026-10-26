@@ -38,20 +38,26 @@ def edit_buyer_amount(offer_id, index, expected, amount, actor):
 
 
 def edit_buyer_accounting_fields(offer_id, index, expected, bank_name, transfer_type, jdate, actor):
-    """Correct receipt metadata before settlement; never submits or settles money."""
+    """Correct bookkeeping metadata without changing received-money milestones."""
     values = (str(bank_name or '').strip(), str(transfer_type or '').strip(), str(jdate or '').strip())
     if not all(values) or any(len(value) > 120 for value in values):
         return None
     with closing(sqlite3.connect(db.DB_PATH, timeout=20)) as conn, conn:
         conn.execute('BEGIN IMMEDIATE')
         row = conn.execute('SELECT buyer_receipt_log,buyer_toman_settled_at,gate_status FROM offer_deal_gates WHERE offer_id=?', (offer_id,)).fetchone()
-        if not row or int(row[1] or 0) > 0 or row[2] != 'completed':
+        if not row:
+            return None
+        settled = int(row[1] or 0) > 0
+        stage = (row[2] or '').strip().lower()
+        if stage != 'completed' and not (stage == 'closed' and settled):
             return None
         items = json.loads(row[0] or '[]')
         if index < 0 or index >= len(items):
             return None
         item = items[index]
         if fingerprint(item) != expected or item.get('attachment_removed_at') or item.get('accounting_status') in {'submitted', 'submitting', 'panel_failed', 'panel_unknown', 'duplicate', 'rejected'}:
+            return None
+        if settled and int(item.get('reviewer_received_at') or 0) <= 0:
             return None
         stamp = int(time.time())
         item.setdefault('accounting_field_edit_history', []).append({

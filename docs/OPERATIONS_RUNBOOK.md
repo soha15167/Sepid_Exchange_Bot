@@ -29,6 +29,24 @@ then start the bot. Never restore a database merely to roll back Python code.
 
 ## Monitoring
 
+### Received payments and pending bookkeeping
+
+A reviewer confirming every active buyer receipt for the exact required total
+advances the Toman settlement and EUR account delivery. An explicit admin
+settlement can also advance the deal. Missing OCR metadata or an unavailable Iran
+ledger does not undo received money or hold the next payment step.
+
+A separate minute-based job recovers previously confirmed payments, retries missing
+EUR account delivery, and processes ready bookkeeping in bounded pages. Slow ledger
+requests do not delay the critical Telegram delivery retry job. Pending bank/type/date
+fields remain visible on the deal card and can be
+completed through receipt management after settlement or closure. Confirmed amounts
+remain immutable. An unknown, in-flight, or legacy failed ledger submission is never
+blindly posted again; verify its external outcome before reconciliation.
+
+EUR receipt notifications to the buyer are durable. Payout claims recheck the current
+EUR confirmations, and stale viewer uploads cannot add payments to closed deals.
+
 Install `deploy/sepid-ops-check.service` and `.timer`. Exit `0` means healthy;
 exit `2` means a stale/missing backup, database problem, failed delivery, or a
 delivery stuck for more than one hour. This produces no Telegram notification.
