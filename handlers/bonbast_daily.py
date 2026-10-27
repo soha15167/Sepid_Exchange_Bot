@@ -2,7 +2,7 @@
 handlers/bonbast_daily.py — Daily Bonbast post / پست روزانهٔ نرخ بن‌بست
 
 EN: Scheduled job posts formatted rates to BONBAST_CHANNEL_ID (or ADVERT_CHANNEL_ID) at Iran time.
-FA: هر روز ساعت تنظیم‌شده (پیش‌فرض ۱۲ ظهر تهران) نرخ ارز در کانال هدف منتشر می‌شود.
+FA: هر روز ساعت تنظیم‌شده (پیش‌فرض ۱۲ ظهر تهران) ارز، طلا و سکه در یک پیام منتشر می‌شود.
 """
 
 from __future__ import annotations

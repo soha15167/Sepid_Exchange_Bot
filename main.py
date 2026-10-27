@@ -731,8 +731,11 @@ async def admin_post_bonbast_rates_cmd(update: Update, context: ContextTypes.DEF
 
     status = await update.message.reply_text("⏳ در حال دریافت نرخ از bonbast…")
     try:
-        await post_bonbast_rates_now(context.bot)
-        await status.edit_text("✅ نرخ ارز در کانال منتشر شد.")
+        ok = await post_bonbast_rates_now(context.bot)
+        await status.edit_text(
+            "✅ نرخ ارز، طلا و سکه در یک پیام در کانال منتشر شد."
+            if ok else "❌ دریافت یا ارسال نرخ بن‌بست انجام نشد؛ تنظیم کانال و دسترسی به منبع را بررسی کنید."
+        )
     except Exception as exc:
         await status.edit_text(f"❌ خطا در دریافت/ارسال نرخ: {exc}")
 

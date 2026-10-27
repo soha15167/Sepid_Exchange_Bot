@@ -84,7 +84,7 @@ Almost the entire project is **Python 3.10+**. There is no separate web frontend
 | Offers | Gate, rate, country, negotiation | پیشنهاد، نرخ، مذاکره |
 | Deal Gate | Final OK, accounts, receipts, settlement | تأیید نهایی، حساب، فیش، نشست |
 | Admin | Users, ads, deals, bank cards, message log | کاربران، آگهی، معامله، کارت |
-| Bonbast | Daily rate post (optional) | نرخ روزانه بن‌بست |
+| Bonbast | One daily post with currencies, gold, and coins (optional) | پیام روزانهٔ یکپارچهٔ ارز، طلا و سکهٔ بن‌بست |
 | Iran panel | `/txin` `/txout` sync (admin) | همگام تراکنش |
 
 ---

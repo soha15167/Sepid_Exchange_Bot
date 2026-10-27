@@ -2656,11 +2656,11 @@ async def admin_dashboard_callback(update: Update, context: ContextTypes.DEFAULT
         try:
             ok = await post_bonbast_rates_now(context.bot)
             if ok:
-                msg = "✅ نرخ ارز در کانال منتشر شد."
+                msg = "✅ نرخ ارز، طلا و سکه در یک پیام در کانال منتشر شد."
             else:
                 msg = (
-                    "❌ کانال برای پست نرخ تنظیم نشده.\n"
-                    "در `.env` مقدار `ADVERT_CHANNEL_ID` یا `BONBAST_CHANNEL_ID` را بررسی کنید."
+                    "❌ دریافت یا ارسال نرخ بن‌بست انجام نشد.\n"
+                    "تنظیم کانال و دسترسی به منبع را بررسی کنید."
                 )
         except Exception as exc:
             msg = f"❌ خطا در دریافت/ارسال نرخ: {exc}"
